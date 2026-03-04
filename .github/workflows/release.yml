@@ -31,6 +31,11 @@ jobs:
           SHA_OCTAL=$(printf '%o' "0x${SHORT_SHA}")
           VERSION="0.${COUNT}.9${SHA_OCTAL}"
           TAG="v${VERSION}"
+          if [ "${GITHUB_REPOSITORY}" != "boldsoftware/shelley" ]; then
+            OWNER_SLUG=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
+            OWNER_SLUG=$(echo "${OWNER_SLUG}" | sed -E 's/^-+|-+$//g')
+            TAG="v${VERSION}-${OWNER_SLUG}"
+          fi
 
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT

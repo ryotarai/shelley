@@ -275,6 +275,10 @@ func extractSHAFromTag(tag string) string {
 	if len(tag) < 3 || tag[0] != 'v' {
 		return ""
 	}
+	// Remove any semver suffix first so dots in suffix don't interfere.
+	if i := strings.IndexAny(tag, "-+"); i >= 0 {
+		tag = tag[:i]
+	}
 
 	// Find the last dot
 	lastDot := -1
