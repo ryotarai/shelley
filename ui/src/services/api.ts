@@ -9,9 +9,10 @@ import {
   VersionInfo,
   CommitInfo,
 } from "../types";
+import { withBasePath } from "./paths";
 
 class ApiService {
-  private baseUrl = "/api";
+  private baseUrl = withBasePath("/api");
 
   private postHeaders = {
     "Content-Type": "application/json",
@@ -274,7 +275,9 @@ class ApiService {
 
   // Version check APIs
   async checkVersion(forceRefresh = false): Promise<VersionInfo> {
-    const url = forceRefresh ? "/version-check?refresh=true" : "/version-check";
+    const url = forceRefresh
+      ? withBasePath("/version-check?refresh=true")
+      : withBasePath("/version-check");
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to check version: ${response.statusText}`);
@@ -284,7 +287,7 @@ class ApiService {
 
   async getChangelog(currentTag: string, latestTag: string): Promise<CommitInfo[]> {
     const params = new URLSearchParams({ current: currentTag, latest: latestTag });
-    const response = await fetch(`/version-changelog?${params}`);
+    const response = await fetch(withBasePath(`/version-changelog?${params}`));
     if (!response.ok) {
       throw new Error(`Failed to get changelog: ${response.statusText}`);
     }
@@ -292,7 +295,7 @@ class ApiService {
   }
 
   async upgrade(restart: boolean = false): Promise<{ status: string; message: string }> {
-    const url = restart ? "/upgrade?restart=true" : "/upgrade";
+    const url = restart ? withBasePath("/upgrade?restart=true") : withBasePath("/upgrade");
     const response = await fetch(url, {
       method: "POST",
       headers: { "X-Shelley-Request": "1" },
@@ -305,7 +308,7 @@ class ApiService {
   }
 
   async exit(): Promise<{ status: string; message: string }> {
-    const response = await fetch("/exit", {
+    const response = await fetch(withBasePath("/exit"), {
       method: "POST",
     });
     if (!response.ok) {
@@ -315,7 +318,7 @@ class ApiService {
   }
 
   async getSettings(): Promise<Record<string, string>> {
-    const response = await fetch("/settings");
+    const response = await fetch(withBasePath("/settings"));
     if (!response.ok) {
       throw new Error(`Failed to get settings: ${response.statusText}`);
     }
@@ -323,7 +326,7 @@ class ApiService {
   }
 
   async setSetting(key: string, value: string): Promise<{ status: string }> {
-    const response = await fetch("/settings", {
+    const response = await fetch(withBasePath("/settings"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -372,7 +375,7 @@ export interface TestCustomModelRequest {
 }
 
 class CustomModelsApi {
-  private baseUrl = "/api";
+  private baseUrl = withBasePath("/api");
 
   private postHeaders = {
     "Content-Type": "application/json",
@@ -489,7 +492,7 @@ export interface ChannelTypeInfo {
 }
 
 class NotificationChannelsApi {
-  private baseUrl = "/api";
+  private baseUrl = withBasePath("/api");
 
   private postHeaders = {
     "Content-Type": "application/json",

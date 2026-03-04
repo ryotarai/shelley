@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import type * as Monaco from "monaco-editor";
 import { api } from "../services/api";
 import { isDarkModeActive } from "../services/theme";
+import { withBasePath } from "../services/paths";
 import { GitDiffInfo, GitFileInfo, GitFileDiff } from "../types";
 import DirectoryPickerModal from "./DirectoryPickerModal";
 
@@ -56,22 +57,23 @@ function loadMonaco(): Promise<typeof Monaco> {
   monacoLoadPromise = (async () => {
     // Configure Monaco environment for web workers before importing
     const monacoEnv: Monaco.Environment = {
-      getWorkerUrl: () => "/editor.worker.js",
+      getWorkerUrl: () => withBasePath("/editor.worker.js"),
     };
     (self as Window).MonacoEnvironment = monacoEnv;
 
     // Load Monaco CSS if not already loaded
-    if (!document.querySelector('link[href="/monaco-editor.css"]')) {
+    const monacoCssPath = withBasePath("/monaco-editor.css");
+    if (!document.querySelector(`link[href="${monacoCssPath}"]`)) {
       const link = document.createElement("link");
       link.rel = "stylesheet";
-      link.href = "/monaco-editor.css";
+      link.href = monacoCssPath;
       document.head.appendChild(link);
     }
 
     // Load Monaco from our local bundle (runtime URL, cast to proper types)
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore - dynamic runtime URL import
-    const monaco = (await import("/monaco-editor.js")) as typeof Monaco;
+    const monaco = (await import(/* @vite-ignore */ withBasePath("/monaco-editor.js"))) as typeof Monaco;
     monacoInstance = monaco;
     return monacoInstance;
   })();
@@ -640,7 +642,7 @@ function DiffViewer({
 
     try {
       setSaveStatus("saving");
-      const response = await fetch("/api/write-file", {
+      const response = await fetch(withBasePath("/api/write-file"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: fullPath, content }),

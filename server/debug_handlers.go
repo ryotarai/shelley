@@ -268,6 +268,9 @@ tr:hover { background: #f8f8f8; }
 <script>
 const expandedRows = new Set();
 const loadedData = {};
+const debugPrefixIndex = window.location.pathname.indexOf('/debug/');
+const basePath = debugPrefixIndex >= 0 ? window.location.pathname.slice(0, debugPrefixIndex) : '';
+const withBasePath = (path) => basePath + path;
 
 function formatSize(bytes) {
 	if (bytes === null || bytes === undefined) return '-';
@@ -316,7 +319,7 @@ function syntaxHighlight(json) {
 
 async function loadRequests() {
 	try {
-		const resp = await fetch('/debug/llm_requests/api?limit=100');
+		const resp = await fetch(withBasePath('/debug/llm_requests/api?limit=100'));
 		const data = await resp.json();
 		renderTable(data);
 	} catch (e) {
@@ -409,8 +412,8 @@ async function loadBody(id, type) {
 
 	try {
 		const url = type === 'request'
-			? '/debug/llm_requests/' + id + '/request'
-			: '/debug/llm_requests/' + id + '/response';
+			? withBasePath('/debug/llm_requests/' + id + '/request')
+			: withBasePath('/debug/llm_requests/' + id + '/response');
 		const resp = await fetch(url);
 		const text = await resp.text();
 		let data;
@@ -438,7 +441,7 @@ async function loadFullBody(id) {
 	}
 
 	try {
-		const resp = await fetch('/debug/llm_requests/' + id + '/request_full');
+		const resp = await fetch(withBasePath('/debug/llm_requests/' + id + '/request_full'));
 		const text = await resp.text();
 		let data;
 		try {

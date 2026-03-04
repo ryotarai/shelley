@@ -103,10 +103,13 @@
   
   <script>
     let allConversations = [];
+    const debugPrefixIndex = window.location.pathname.indexOf('/debug/');
+    const basePath = debugPrefixIndex >= 0 ? window.location.pathname.slice(0, debugPrefixIndex) : '';
+    const withBasePath = (path) => `${basePath}${path}`;
     
     async function loadConversations() {
       try {
-        const response = await fetch('/api/conversations?limit=500');
+        const response = await fetch(withBasePath('/api/conversations?limit=500'));
         allConversations = await response.json();
         renderTable(allConversations);
       } catch (e) {
@@ -152,7 +155,7 @@
     
     async function downloadCSV(conversationId, slug) {
       try {
-        const response = await fetch(`/api/conversation/${conversationId}`);
+        const response = await fetch(withBasePath(`/api/conversation/${conversationId}`));
         const data = await response.json();
         
         const rows = ['input_tokens,cache_write_tokens,cache_read_tokens,output_tokens'];

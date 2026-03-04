@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useI18n } from "../i18n";
+import { withBasePath } from "../services/paths";
 
 // Web Speech API types
 interface SpeechRecognitionEvent extends Event {
@@ -207,7 +208,7 @@ function MessageInput({
       const formData = new FormData();
       formData.append("file", file);
 
-      const response = await fetch("/api/upload", {
+      const response = await fetch(withBasePath("/api/upload"), {
         method: "POST",
         body: formData,
       });

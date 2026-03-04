@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { LLMContent } from "../types";
+import { withBasePath } from "../services/paths";
 
 interface BrowserProfileToolProps {
   toolInput?: unknown;
@@ -140,7 +141,7 @@ function BrowserProfileTool({
                 </button>
                 {(action === "cpu_stop" || action === "trace_stop") && (
                   <a
-                    href={`https://www.speedscope.app/#profileURL=${encodeURIComponent(window.location.origin + "/api/read?path=" + encodeURIComponent(savedFilePath))}`}
+                    href={`https://www.speedscope.app/#profileURL=${encodeURIComponent(window.location.origin + withBasePath(`/api/read?path=${encodeURIComponent(savedFilePath)}`))}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     onClick={(e) => e.stopPropagation()}

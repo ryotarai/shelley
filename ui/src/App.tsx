@@ -9,12 +9,13 @@ import ModelsModal from "./components/ModelsModal";
 import NotificationsModal from "./components/NotificationsModal";
 import { Conversation, ConversationWithState, ConversationListUpdate } from "./types";
 import { api } from "./services/api";
+import { stripBasePath, withBasePath } from "./services/paths";
 import { useI18n } from "./i18n";
 
 // Worker pool configuration for @pierre/diffs syntax highlighting
 // Workers run tokenization off the main thread for better performance with large diffs
 const diffsPoolOptions = {
-  workerFactory: () => new Worker("/diffs-worker.js"),
+  workerFactory: () => new Worker(withBasePath("/diffs-worker.js")),
 };
 
 // Languages to preload in the highlighter (matches PatchTool.tsx langMap)
@@ -57,7 +58,7 @@ function isGeneratedId(slug: string | null): boolean {
 
 // Get slug from the current URL path (expects /c/<slug> format)
 function getSlugFromPath(): string | null {
-  const path = window.location.pathname;
+  const path = stripBasePath(window.location.pathname);
   // Check for /c/<slug> format
   if (path.startsWith("/c/")) {
     const slug = path.slice(3); // Remove "/c/" prefix
@@ -80,9 +81,9 @@ function updateUrlWithSlug(conversation: Conversation | undefined) {
 
   if (currentSlug !== newSlug) {
     if (newSlug) {
-      window.history.replaceState({}, "", `/c/${newSlug}`);
+      window.history.replaceState({}, "", withBasePath(`/c/${newSlug}`));
     } else {
-      window.history.replaceState({}, "", "/");
+      window.history.replaceState({}, "", withBasePath("/"));
     }
   }
 }
@@ -151,7 +152,7 @@ function App() {
       }
 
       // Slug not found, clear the URL
-      window.history.replaceState({}, "", "/");
+      window.history.replaceState({}, "", withBasePath("/"));
       return null;
     },
     [],
@@ -437,7 +438,7 @@ function App() {
     setCurrentConversationId(null);
     setViewedConversation(null);
     // Clear URL when starting new conversation
-    window.history.replaceState({}, "", "/");
+    window.history.replaceState({}, "", withBasePath("/"));
     setDrawerOpen(false);
   };
 
@@ -445,7 +446,7 @@ function App() {
     localStorage.setItem("shelley_selected_cwd", cwd);
     setCurrentConversationId(null);
     setViewedConversation(null);
-    window.history.replaceState({}, "", "/");
+    window.history.replaceState({}, "", withBasePath("/"));
     setDrawerOpen(false);
   };
 
