@@ -232,6 +232,7 @@ type Server struct {
 	versionChecker      *VersionChecker
 	notifDispatcher     *notifications.Dispatcher
 	shutdownCh          chan struct{} // Signals background routines to stop
+	basePath            string
 }
 
 // NewServer creates a new server instance
@@ -250,6 +251,7 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 		versionChecker:      NewVersionChecker(),
 		notifDispatcher:     notifications.NewDispatcher(logger),
 		shutdownCh:          make(chan struct{}),
+		basePath:            "/",
 	}
 
 	// Set up subagent support
@@ -258,6 +260,29 @@ func NewServer(database *db.DB, llmManager LLMProvider, toolSetConfig claudetool
 	s.toolSetConfig.MaxSubagentDepth = 1 // Only top-level conversations can spawn subagents
 
 	return s
+}
+
+func normalizeBasePath(path string) (string, error) {
+	if path == "" || path == "/" {
+		return "/", nil
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", fmt.Errorf("base path must start with '/'")
+	}
+	trimmed := strings.TrimRight(path, "/")
+	if trimmed == "" {
+		return "/", nil
+	}
+	return trimmed, nil
+}
+
+func (s *Server) SetBasePath(path string) error {
+	normalized, err := normalizeBasePath(path)
+	if err != nil {
+		return err
+	}
+	s.basePath = normalized
+	return nil
 }
 
 // RegisterNotificationChannel adds a backend notification channel to the dispatcher.
@@ -1125,20 +1150,31 @@ func (s *Server) StartWithListener(listener net.Listener) error {
 // The Unix socket listener gets only the logger middleware (no CSRF, no requireHeader)
 // since it is local and trusted.
 func (s *Server) StartWithListeners(tcpListener net.Listener, socketPath string) error {
-	// Set up shared mux with routes
-	mux := http.NewServeMux()
-	s.RegisterRoutes(mux)
+	// Set up app mux with routes
+	appMux := http.NewServeMux()
+	s.RegisterRoutes(appMux)
 
-	// TCP handler: full middleware (applied in reverse order: last added = first executed)
-	tcpHandler := LoggerMiddleware(s.logger)(mux)
+	baseAppHandler := http.Handler(appMux)
+
+	// Apply request protections before optional base-path stripping.
+	tcpAppHandler := baseAppHandler
 	cop := http.NewCrossOriginProtection()
-	tcpHandler = cop.Handler(tcpHandler)
+	tcpAppHandler = cop.Handler(tcpAppHandler)
 	if s.requireHeader != "" {
-		tcpHandler = RequireHeaderMiddleware(s.requireHeader)(tcpHandler)
+		tcpAppHandler = RequireHeaderMiddleware(s.requireHeader)(tcpAppHandler)
+	}
+
+	// Optionally mount the app under a base path.
+	tcpRoutedHandler := tcpAppHandler
+	if s.basePath != "/" {
+		rootMux := http.NewServeMux()
+		rootMux.Handle(s.basePath+"/", http.StripPrefix(s.basePath, tcpAppHandler))
+		rootMux.Handle(s.basePath, http.RedirectHandler(s.basePath+"/", http.StatusTemporaryRedirect))
+		tcpRoutedHandler = rootMux
 	}
 
 	tcpServer := &http.Server{
-		Handler: tcpHandler,
+		Handler: LoggerMiddleware(s.logger)(tcpRoutedHandler),
 	}
 
 	// Start cleanup routine
@@ -1195,7 +1231,14 @@ func (s *Server) StartWithListeners(tcpListener net.Listener, socketPath string)
 		}
 
 		// Unix socket handler: relaxed middleware (only logger, no CSRF or requireHeader)
-		socketHandler := LoggerMiddleware(s.logger)(mux)
+		socketRoutedHandler := baseAppHandler
+		if s.basePath != "/" {
+			rootMux := http.NewServeMux()
+			rootMux.Handle(s.basePath+"/", http.StripPrefix(s.basePath, baseAppHandler))
+			rootMux.Handle(s.basePath, http.RedirectHandler(s.basePath+"/", http.StatusTemporaryRedirect))
+			socketRoutedHandler = rootMux
+		}
+		socketHandler := LoggerMiddleware(s.logger)(socketRoutedHandler)
 
 		socketServer = &http.Server{
 			Handler: socketHandler,

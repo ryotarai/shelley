@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { LLMContent } from "../types";
+import { withBasePath } from "../services/paths";
 
 interface ScreenshotToolProps {
   // For tool_use (pending state)
@@ -78,9 +79,9 @@ function ScreenshotTool({
     imageUrl =
       url ||
       (path
-        ? `/api/read?path=${encodeURIComponent(path)}`
+        ? withBasePath(`/api/read?path=${encodeURIComponent(path)}`)
         : id
-          ? `/api/read?path=${encodeURIComponent(id)}`
+          ? withBasePath(`/api/read?path=${encodeURIComponent(id)}`)
           : undefined);
   }
 

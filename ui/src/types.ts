@@ -88,6 +88,7 @@ export interface Link {
 export interface InitData {
   models: Model[];
   default_model: string;
+  base_path?: string;
   default_cwd?: string;
   home_dir?: string;
   hostname?: string;

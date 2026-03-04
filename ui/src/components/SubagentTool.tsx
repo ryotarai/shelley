@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { LLMContent } from "../types";
+import { withBasePath } from "../services/paths";
 
 interface SubagentToolProps {
   // For tool_use (pending state)
@@ -120,11 +121,11 @@ function SubagentTool({
               <div className="tool-label">Conversation:</div>
               <div className="tool-code">
                 <a
-                  href={`/c/${slug}`}
+                  href={withBasePath(`/c/${slug}`)}
                   onClick={(e) => {
                     e.preventDefault();
                     // Navigate to the subagent conversation
-                    window.history.pushState({}, "", `/c/${slug}`);
+                    window.history.pushState({}, "", withBasePath(`/c/${slug}`));
                     window.dispatchEvent(new PopStateEvent("popstate"));
                   }}
                   style={{ color: "var(--link-color)", textDecoration: "underline" }}

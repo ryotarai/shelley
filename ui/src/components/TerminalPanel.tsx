@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { withBasePath } from "../services/paths";
 import { isDarkModeActive } from "../services/theme";
 import "@xterm/xterm/css/xterm.css";
 
@@ -649,7 +650,8 @@ function TerminalInstanceWithRegistry({
     onRegister(term.id, xterm);
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/api/exec-ws?cmd=${encodeURIComponent(term.command)}&cwd=${encodeURIComponent(term.cwd)}`;
+    const wsPath = withBasePath("/api/exec-ws");
+    const wsUrl = `${protocol}//${window.location.host}${wsPath}?cmd=${encodeURIComponent(term.command)}&cwd=${encodeURIComponent(term.cwd)}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 

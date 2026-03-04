@@ -412,6 +412,7 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 		"hostname":      hostname,
 		"default_cwd":   defaultCwd,
 		"home_dir":      homeDir,
+		"base_path":     s.basePath,
 	}
 	if s.terminalURL != "" {
 		initData["terminal_url"] = s.terminalURL
