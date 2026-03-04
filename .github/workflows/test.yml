@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - release/fork
   pull_request:
     branches:
       - main
+      - release/fork
 
 jobs:
   test:

@@ -5,8 +5,10 @@ on:
     workflows: ["Test"]
     branches:
       - main
+      - release/fork
     types:
       - completed
+  workflow_dispatch:
 
 permissions:
   contents: write
