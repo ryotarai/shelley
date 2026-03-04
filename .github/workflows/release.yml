@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows: ["Test"]
     branches:
-      - main
       - release/fork
     types:
       - completed
