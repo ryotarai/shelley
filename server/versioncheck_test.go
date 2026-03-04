@@ -23,6 +23,8 @@ func TestExtractSHAFromTag(t *testing.T) {
 		{"v0.178.952740443", "abc123"}, // SHA abc123 in octal is 52740443
 		{"v0.178.933471105", "6e7245"}, // Real release tag
 		{"v0.1.90", "000000"},          // SHA 0
+		{"v0.178.933471105-ryotarai", "6e7245"},
+		{"v0.178.933471105+build.meta", "6e7245"},
 		{"", ""},
 		{"invalid", ""},
 		{"v", ""},
