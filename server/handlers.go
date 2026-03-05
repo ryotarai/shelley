@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"mime"
 	"net/http"
@@ -435,12 +436,31 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 	faviconDataURI := "data:image/svg+xml," + url.PathEscape(faviconSVG)
 	faviconLink := fmt.Sprintf(`<link rel="icon" type="image/svg+xml" href="%s"/>`, faviconDataURI)
 
+	// Inject a dynamic base href so relative asset paths work under a custom base path.
+	modifiedHTML := injectBaseHref(string(indexHTML), s.basePath)
+
 	// Inject the script tag and favicon before </head>
 	initScript := fmt.Sprintf(`<script>window.__SHELLEY_INIT__=%s;</script>`, initJSON)
 	injection := faviconLink + initScript
-	modifiedHTML := strings.Replace(string(indexHTML), "</head>", injection+"</head>", 1)
+	modifiedHTML = strings.Replace(modifiedHTML, "</head>", injection+"</head>", 1)
 
 	w.Write([]byte(modifiedHTML))
+}
+
+func baseHrefForPath(basePath string) string {
+	trimmed := strings.TrimSpace(basePath)
+	if trimmed == "" || trimmed == "/" {
+		return "/"
+	}
+	return strings.TrimRight(trimmed, "/") + "/"
+}
+
+func injectBaseHref(indexHTML, basePath string) string {
+	baseTag := fmt.Sprintf(`<base href="%s" />`, html.EscapeString(baseHrefForPath(basePath)))
+	if strings.Contains(indexHTML, `<base href="/" />`) {
+		return strings.Replace(indexHTML, `<base href="/" />`, baseTag, 1)
+	}
+	return strings.Replace(indexHTML, "</head>", baseTag+"</head>", 1)
 }
 
 // handleConfig returns server configuration
