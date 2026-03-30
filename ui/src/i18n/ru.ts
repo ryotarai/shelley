@@ -198,16 +198,21 @@ export const ru: TranslationKeys = {
   dirLabel: "Каталог:",
 
   // Sidebar buttons
+  editUserAgentsMd: "Редактировать AGENTS.md",
+
   openConversations: "Открыть диалоги",
   expandSidebar: "Развернуть боковую панель",
 
   // Language
   language: "Язык",
   switchLanguage: "Сменить язык",
+  reportBug: "Сообщить об ошибке",
   english: "English",
   japanese: "日本語",
   french: "Français",
   russian: "Русский",
   spanish: "Español",
   upgoerFive: "Up-Goer Five",
+  simplifiedChinese: "简体中文",
+  traditionalChinese: "繁體中文",
 };

@@ -75,6 +75,10 @@ type StreamResponse struct {
 	Heartbeat bool `json:"heartbeat,omitempty"`
 	// NotificationEvent is set when a notification-worthy event occurs (e.g. agent finished).
 	NotificationEvent *notifications.Event `json:"notification_event,omitempty"`
+	// ToolProgress is set when a running tool reports partial output.
+	ToolProgress *llm.ToolProgress `json:"tool_progress,omitempty"`
+	// StreamDelta is set when the LLM streams partial text content.
+	StreamDelta *llm.StreamDelta `json:"stream_delta,omitempty"`
 }
 
 // LLMProvider is an interface for getting LLM services
@@ -233,6 +237,7 @@ type Server struct {
 	notifDispatcher     *notifications.Dispatcher
 	shutdownCh          chan struct{} // Signals background routines to stop
 	basePath            string
+	listenPort          int           // TCP port the server is listening on
 }
 
 // NewServer creates a new server instance
@@ -296,8 +301,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// API routes - wrap with gzip where beneficial
 	mux.Handle("/api/conversations", gzipHandler(http.HandlerFunc(s.handleConversations)))
 	mux.Handle("/api/conversations/archived", gzipHandler(http.HandlerFunc(s.handleArchivedConversations)))
-	mux.Handle("/api/conversations/new", http.HandlerFunc(s.handleNewConversation))         // Small response
-	mux.Handle("/api/conversations/distill", http.HandlerFunc(s.handleDistillConversation)) // Small response
+	mux.Handle("/api/conversations/previews", gzipHandler(http.HandlerFunc(s.handleConversationPreviews)))
+	mux.Handle("/api/conversations/new", http.HandlerFunc(s.handleNewConversation))            // Small response
+	mux.Handle("/api/conversations/distill", http.HandlerFunc(s.handleDistillConversation))    // Small response
+	mux.Handle("/api/conversations/distill-replace", http.HandlerFunc(s.handleDistillReplace)) // Small response
 	mux.Handle("/api/conversation/", http.StripPrefix("/api/conversation", s.conversationMux()))
 	mux.Handle("/api/conversation-by-slug/", gzipHandler(http.HandlerFunc(s.handleConversationBySlug)))
 	mux.Handle("/api/validate-cwd", http.HandlerFunc(s.handleValidateCwd)) // Small response
@@ -306,6 +313,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/git/diffs", gzipHandler(http.HandlerFunc(s.handleGitDiffs)))
 	mux.Handle("/api/git/diffs/", gzipHandler(http.HandlerFunc(s.handleGitDiffFiles)))
 	mux.Handle("/api/git/file-diff/", gzipHandler(http.HandlerFunc(s.handleGitFileDiff)))
+	mux.Handle("/api/git/commit-messages", gzipHandler(http.HandlerFunc(s.handleGitCommitMessages)))
+	mux.Handle("/api/git/amend-message", http.HandlerFunc(s.handleGitAmendMessage))
 	mux.Handle("/api/git/create-worktree", http.HandlerFunc(s.handleGitCreateWorktree)) // Small response
 	mux.HandleFunc("/api/upload", s.handleUpload)                                       // Binary uploads
 	mux.HandleFunc("/api/read", s.handleRead)                                           // Serves images
@@ -336,6 +345,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Debug endpoints
 	mux.Handle("GET /debug/conversations", http.HandlerFunc(s.handleDebugConversationsPage))
+	mux.Handle("GET /debug/stylebook", http.HandlerFunc(s.handleDebugStylebook))
 	mux.Handle("GET /debug/llm_requests", http.HandlerFunc(s.handleDebugLLMRequests))
 	mux.Handle("GET /debug/llm_requests/api", http.HandlerFunc(s.handleDebugLLMRequestsAPI))
 	mux.Handle("GET /debug/llm_requests/{id}/request", http.HandlerFunc(s.handleDebugLLMRequestBody))
@@ -956,6 +966,8 @@ func (s *Server) notifySubscribersNewMessage(ctx context.Context, conversationID
 	// Update agent working state based on message type
 	if isAgentEndOfTurn(newMsg) {
 		manager.SetAgentWorking(false)
+		// Process any queued messages now that the agent is done
+		go manager.drainPendingMessages(s)
 	}
 
 	// Publish only the new message
@@ -1034,17 +1046,50 @@ func (s *Server) publishConversationListUpdate(update ConversationListUpdate) {
 	}
 }
 
+// publicHostname returns the server's public hostname.
+func publicHostname() string {
+	if h, err := os.Hostname(); err == nil {
+		if !strings.Contains(h, ".") {
+			return h + ".exe.xyz"
+		}
+		return h
+	}
+	return "localhost"
+}
+
+// conversationURL returns the full URL for a conversation, using slug if available.
+func (s *Server) conversationURL(slug string) string {
+	hostname := publicHostname()
+	path := "/"
+	if slug != "" {
+		path = "/c/" + slug
+	}
+	if s.listenPort == 443 || s.listenPort == 0 {
+		return fmt.Sprintf("https://%s%s", hostname, path)
+	}
+	return fmt.Sprintf("https://%s:%d%s", hostname, s.listenPort, path)
+}
+
 // publishConversationState broadcasts a conversation state update to ALL active
 // conversation streams. This allows clients to see the working state of other conversations.
 func (s *Server) publishConversationState(state ConversationState) {
 	// When the agent finishes working, emit a notification event.
+	// Skip notifications for subagent conversations — they're internal
+	// and would just be noise for the user.
 	var notifEvent *notifications.Event
 	if !state.Working {
-		payload := notifications.AgentDonePayload{
-			Model: state.Model,
+		conv, convErr := s.db.GetConversationByID(context.Background(), state.ConversationID)
+		isSubagent := convErr == nil && conv.ParentConversationID != nil
+
+		var slug string
+		if convErr == nil && conv.Slug != nil {
+			slug = *conv.Slug
 		}
-		if conv, err := s.db.GetConversationByID(context.Background(), state.ConversationID); err == nil && conv.Slug != nil {
-			payload.ConversationTitle = *conv.Slug
+		payload := notifications.AgentDonePayload{
+			Hostname:          publicHostname(),
+			Model:             state.Model,
+			ConversationTitle: slug,
+			ConversationURL:   s.conversationURL(slug),
 		}
 		if msg, err := s.db.GetLatestMessage(context.Background(), state.ConversationID); err == nil && msg.Type == string(db.MessageTypeAgent) && msg.LlmData != nil {
 			var llmMsg llm.Message
@@ -1055,8 +1100,8 @@ func (s *Server) publishConversationState(state ConversationState) {
 						text = c.Text
 					}
 				}
-				if len(text) > 255 {
-					text = text[:255] + "..."
+				if len(text) > 10000 {
+					text = text[:10000] + "..."
 				}
 				payload.FinalResponse = text
 			}
@@ -1067,7 +1112,10 @@ func (s *Server) publishConversationState(state ConversationState) {
 			Timestamp:      time.Now(),
 			Payload:        payload,
 		}
-		s.notifDispatcher.Dispatch(context.Background(), event)
+		if !isSubagent {
+			s.notifDispatcher.Dispatch(context.Background(), event)
+		}
+		// Still set notifEvent so the SSE stream broadcasts it to the UI.
 		notifEvent = &event
 	}
 
@@ -1112,9 +1160,13 @@ func (s *Server) IsAgentWorking(conversationID string) bool {
 
 // Cleanup removes inactive conversation managers
 func (s *Server) Cleanup() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Collect managers to clean up under the lock, but don't call stopLoop
+	// while holding s.mu. stopLoop can block on browser shutdown, and holding
+	// s.mu would block all /api/conversations requests and getOrCreateConversationManager.
+	var toCleanup []*ConversationManager
+	var toCleanupIDs []string
 
+	s.mu.Lock()
 	now := time.Now()
 	for id, manager := range s.activeConversations {
 		// Remove managers that have been inactive for more than 30 minutes
@@ -1122,10 +1174,17 @@ func (s *Server) Cleanup() {
 		lastActivity := manager.lastActivity
 		manager.mu.Unlock()
 		if now.Sub(lastActivity) > 30*time.Minute {
-			manager.stopLoop()
+			toCleanup = append(toCleanup, manager)
+			toCleanupIDs = append(toCleanupIDs, id)
 			delete(s.activeConversations, id)
-			s.logger.Debug("Cleaned up inactive conversation", "conversationID", id)
 		}
+	}
+	s.mu.Unlock()
+
+	// Stop loops outside the lock to avoid blocking other requests.
+	for i, manager := range toCleanup {
+		manager.stopLoop()
+		s.logger.Debug("Cleaned up inactive conversation", "conversationID", toCleanupIDs[i])
 	}
 }
 
@@ -1191,6 +1250,7 @@ func (s *Server) StartWithListeners(tcpListener net.Listener, socketPath string)
 
 	// Get actual port from listener
 	actualPort := tcpListener.Addr().(*net.TCPAddr).Port
+	s.listenPort = actualPort
 
 	// Start TCP server in goroutine
 	serverErrCh := make(chan error, 2)

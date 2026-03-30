@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"shelley.exe.dev/db"
@@ -260,6 +261,23 @@ func All() []Model {
 			},
 		},
 		{
+			ID:              "gpt-5.4",
+			Provider:        ProviderOpenAI,
+			Description:     "GPT-5.4",
+			RequiredEnvVars: []string{"OPENAI_API_KEY"},
+			GatewayEnabled:  true,
+			Factory: func(config *Config, httpc *http.Client) (llm.Service, error) {
+				if config.OpenAIAPIKey == "" {
+					return nil, fmt.Errorf("gpt-5.4 requires OPENAI_API_KEY")
+				}
+				svc := &oai.ResponsesService{Model: oai.GPT54, APIKey: config.OpenAIAPIKey, HTTPC: httpc, ThinkingLevel: llm.ThinkingLevelMedium}
+				if url := config.getOpenAIURL(); url != "" {
+					svc.ModelURL = url
+				}
+				return svc, nil
+			},
+		},
+		{
 			ID:              "gpt-5.3-codex",
 			Provider:        ProviderOpenAI,
 			Description:     "GPT-5.3 Codex",
@@ -305,22 +323,6 @@ func All() []Model {
 					return nil, fmt.Errorf("gpt-oss-20b-fireworks requires FIREWORKS_API_KEY")
 				}
 				svc := &oai.Service{Model: oai.GPTOSS20B, APIKey: config.FireworksAPIKey, HTTPC: httpc}
-				if url := config.getFireworksURL(); url != "" {
-					svc.ModelURL = url
-				}
-				return svc, nil
-			},
-		},
-		{
-			ID:              "glm-4p6-fireworks",
-			Provider:        ProviderFireworks,
-			Description:     "GLM-4P6 on Fireworks",
-			RequiredEnvVars: []string{"FIREWORKS_API_KEY"},
-			Factory: func(config *Config, httpc *http.Client) (llm.Service, error) {
-				if config.FireworksAPIKey == "" {
-					return nil, fmt.Errorf("glm-4p6-fireworks requires FIREWORKS_API_KEY")
-				}
-				svc := &oai.Service{Model: oai.GLM4P6Fireworks, APIKey: config.FireworksAPIKey, HTTPC: httpc}
 				if url := config.getFireworksURL(); url != "" {
 					svc.ModelURL = url
 				}
@@ -400,6 +402,7 @@ func Default() Model {
 
 // Manager manages LLM services for all configured models
 type Manager struct {
+	mu         sync.RWMutex
 	services   map[string]serviceEntry
 	modelOrder []string // ordered list of model IDs (built-in first, then custom)
 	logger     *slog.Logger
@@ -616,6 +619,7 @@ func NewManager(cfg *Config) (*Manager, error) {
 
 // loadCustomModels loads custom models from the database into the manager.
 // It adds them after built-in models in the order.
+// It must only be called during construction (before the Manager is shared).
 func (m *Manager) loadCustomModels() error {
 	if m.db == nil {
 		return nil
@@ -658,6 +662,9 @@ func (m *Manager) RefreshCustomModels() error {
 		return nil
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// Remove existing custom models from services and modelOrder
 	newOrder := make([]string, 0, len(m.modelOrder))
 	for _, id := range m.modelOrder {
@@ -676,7 +683,11 @@ func (m *Manager) RefreshCustomModels() error {
 
 // GetService returns the LLM service for the given model ID, wrapped with logging
 func (m *Manager) GetService(modelID string) (llm.Service, error) {
+	m.mu.RLock()
 	entry, ok := m.services[modelID]
+	m.mu.RUnlock()
+	// entry is a by-value copy; safe to use after unlock because
+	// evicted services are not torn down or closed.
 	if !ok {
 		return nil, fmt.Errorf("unsupported model: %s", modelID)
 	}
@@ -697,6 +708,8 @@ func (m *Manager) GetService(modelID string) (llm.Service, error) {
 // GetAvailableModels returns a list of available model IDs.
 // Returns union of built-in models (in order) followed by custom models.
 func (m *Manager) GetAvailableModels() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	// Return a copy to prevent external modification
 	result := make([]string, len(m.modelOrder))
 	copy(result, m.modelOrder)
@@ -705,7 +718,9 @@ func (m *Manager) GetAvailableModels() []string {
 
 // HasModel reports whether the manager has a service for the given model ID
 func (m *Manager) HasModel(modelID string) bool {
+	m.mu.RLock()
 	_, ok := m.services[modelID]
+	m.mu.RUnlock()
 	return ok
 }
 
@@ -718,7 +733,9 @@ type ModelInfo struct {
 
 // GetModelInfo returns the display name, tags, and source for a model
 func (m *Manager) GetModelInfo(modelID string) *ModelInfo {
+	m.mu.RLock()
 	entry, ok := m.services[modelID]
+	m.mu.RUnlock()
 	if !ok {
 		return nil
 	}

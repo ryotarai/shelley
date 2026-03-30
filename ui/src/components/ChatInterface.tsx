@@ -5,9 +5,12 @@ import {
   StreamResponse,
   LLMContent,
   ConversationListUpdate,
+  ToolProgress,
   isDistillStatusMessage,
+  isQueuedMessage,
 } from "../types";
 import { api } from "../services/api";
+import { conversationCache } from "../services/conversationCache";
 import { ThemeMode, getStoredTheme, setStoredTheme, applyTheme } from "../services/theme";
 import { useMarkdown } from "../contexts/MarkdownContext";
 import { useI18n, type Locale, type TranslationKeys } from "../i18n";
@@ -22,6 +25,7 @@ import {
 import MessageComponent from "./Message";
 import MessageInput from "./MessageInput";
 import DiffViewer from "./DiffViewer";
+import AgentsMdEditorModal from "./AgentsMdEditorModal";
 import BashTool from "./BashTool";
 import PatchTool from "./PatchTool";
 import ScreenshotTool from "./ScreenshotTool";
@@ -36,6 +40,7 @@ import ChangeDirTool from "./ChangeDirTool";
 import SubagentTool from "./SubagentTool";
 import LLMOneShotTool from "./LLMOneShotTool";
 import OutputIframeTool from "./OutputIframeTool";
+import ReadContextFileTool from "./ReadContextFileTool";
 import BrowserEmulateTool from "./BrowserEmulateTool";
 import BrowserNetworkTool from "./BrowserNetworkTool";
 import BrowserAccessibilityTool from "./BrowserAccessibilityTool";
@@ -44,6 +49,7 @@ import DirectoryPickerModal from "./DirectoryPickerModal";
 import { useVersionChecker } from "./VersionChecker";
 import TerminalPanel, { EphemeralTerminal } from "./TerminalPanel";
 import ModelPicker from "./ModelPicker";
+import ModelBar from "./ModelBar";
 import SystemPromptView from "./SystemPromptView";
 
 interface ContextUsageBarProps {
@@ -52,6 +58,7 @@ interface ContextUsageBarProps {
   conversationId?: string | null;
   modelName?: string;
   onDistillConversation?: () => void;
+  onDistillReplaceConversation?: () => void;
   agentWorking?: boolean;
 }
 
@@ -61,6 +68,7 @@ function ContextUsageBar({
   conversationId,
   modelName,
   onDistillConversation,
+  onDistillReplaceConversation,
   agentWorking,
 }: ContextUsageBarProps) {
   const [showPopup, setShowPopup] = useState(false);
@@ -91,10 +99,13 @@ function ContextUsageBar({
   // Auto-open popup when hitting 100k tokens (once per conversation).
   // Only auto-open at end of turn (when agent is not working) so we don't
   // interrupt the user while the agent is plugging away.
+  // Skip auto-open on mobile where the popup is too intrusive.
   useEffect(() => {
+    const isMobile = window.innerWidth <= 768;
     if (
       showLongConversationWarning &&
       !agentWorking &&
+      !isMobile &&
       conversationId &&
       hasAutoOpenedRef.current !== conversationId
     ) {
@@ -143,57 +154,52 @@ function ContextUsageBar({
     }
   };
 
+  const handleDistillReplace = async () => {
+    if (distilling || !onDistillReplaceConversation) return;
+    setDistilling(true);
+    try {
+      await onDistillReplaceConversation();
+      setShowPopup(false);
+    } finally {
+      setDistilling(false);
+    }
+  };
+
   return (
     <div ref={barRef}>
       {showPopup && popupPosition && (
         <div
+          className="chat-context-popup"
           style={{
-            position: "fixed",
             bottom: popupPosition.bottom,
             right: popupPosition.right,
             maxWidth: `calc(100vw - ${popupPosition.right + 8}px)`,
-            padding: "6px 10px",
-            backgroundColor: "var(--bg-secondary)",
-            border: "1px solid var(--border-color)",
-            borderRadius: "4px",
-            fontSize: "12px",
-            color: "var(--text-secondary)",
-            boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
-            zIndex: 100,
           }}
         >
-          {modelName && (
-            <div style={{ fontWeight: 500, color: "var(--text-primary)", marginBottom: "4px" }}>
-              {modelName}
-            </div>
-          )}
+          {modelName && <div className="chat-popup-model-name">{modelName}</div>}
           {formatTokens(contextWindowSize)} / {formatTokens(maxContextTokens)} (
           {percentage.toFixed(1)}%) tokens used
           {showLongConversationWarning && (
-            <div style={{ marginTop: "6px", color: "var(--warning-text, #f59e0b)" }}>
+            <div className="chat-popup-warning">
               This conversation is getting long.
               <br />
               For best results, start a new conversation.
             </div>
           )}
           {onDistillConversation && conversationId && (
-            <div style={{ display: "flex", gap: "6px", marginTop: "8px" }}>
-              <button
-                onClick={handleDistill}
-                disabled={distilling}
-                style={{
-                  padding: "4px 8px",
-                  backgroundColor: "var(--blue-text)",
-                  color: "white",
-                  border: "none",
-                  borderRadius: "4px",
-                  cursor: distilling ? "not-allowed" : "pointer",
-                  fontSize: "12px",
-                  opacity: distilling ? 0.7 : 1,
-                }}
-              >
+            <div className="chat-distill-container">
+              <button onClick={handleDistill} disabled={distilling} className="chat-distill-button">
                 {distilling ? "Distilling..." : "Distill & Continue in New Conversation"}
               </button>
+              {onDistillReplaceConversation && (
+                <button
+                  onClick={handleDistillReplace}
+                  disabled={distilling}
+                  className="chat-distill-button chat-distill-replace-button"
+                >
+                  {distilling ? "Distilling..." : "Distill & Replace in Place"}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -249,6 +255,7 @@ interface CoalescedToolCallProps {
   hasResult?: boolean;
   display?: unknown;
   onCommentTextChange?: (text: string) => void;
+  streamingOutput?: string;
 }
 
 // Map tool names to their specialized components.
@@ -265,6 +272,7 @@ const TOOL_COMPONENTS: Record<string, React.ComponentType<any>> = {
   change_dir: ChangeDirTool,
   subagent: SubagentTool,
   output_iframe: OutputIframeTool,
+  read_context_file: ReadContextFileTool,
   llm_one_shot: LLMOneShotTool,
   browser_emulate: BrowserEmulateTool,
   browser_network: BrowserNetworkTool,
@@ -289,6 +297,7 @@ const CoalescedToolCall = React.memo(function CoalescedToolCall({
   hasResult,
   display,
   onCommentTextChange,
+  streamingOutput,
 }: CoalescedToolCallProps) {
   // Calculate execution time if available
   let executionTime = "";
@@ -314,6 +323,7 @@ const CoalescedToolCall = React.memo(function CoalescedToolCall({
       executionTime,
       display,
       ...(toolName === "patch" && onCommentTextChange ? { onCommentTextChange } : {}),
+      ...(streamingOutput !== undefined ? { streamingOutput } : {}),
     };
     return <ToolComponent {...props} />;
   }
@@ -347,12 +357,7 @@ const CoalescedToolCall = React.memo(function CoalescedToolCall({
         <div className="message-content">
           <div className="tool-running">
             <div className="tool-running-header">
-              <svg
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-                style={{ width: "1rem", height: "1rem", color: "var(--blue-text)" }}
-              >
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" className="chat-tool-icon">
                 <path
                   strokeLinecap="round"
                   strokeLinejoin="round"
@@ -392,7 +397,7 @@ const CoalescedToolCall = React.memo(function CoalescedToolCall({
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
-                  style={{ width: "1rem", height: "1rem", color: "var(--blue-text)" }}
+                  className="chat-tool-icon"
                 >
                   <path
                     strokeLinecap="round"
@@ -488,8 +493,19 @@ interface ChatInterfaceProps {
   onConversationUpdate?: (conversation: Conversation) => void;
   onConversationListUpdate?: (update: ConversationListUpdate) => void;
   onConversationStateUpdate?: (state: ConversationStateUpdate) => void;
-  onFirstMessage?: (message: string, model: string, cwd?: string) => Promise<void>;
+  onFirstMessage?: (
+    message: string,
+    model: string,
+    cwd?: string,
+    conversationType?: "normal" | "orchestrator",
+    subagentBackend?: "shelley" | "claude-cli" | "codex-cli",
+  ) => Promise<void>;
   onDistillConversation?: (
+    sourceConversationId: string,
+    model: string,
+    cwd?: string,
+  ) => Promise<void>;
+  onDistillReplaceConversation?: (
     sourceConversationId: string,
     model: string,
     cwd?: string,
@@ -513,6 +529,8 @@ const LANGUAGE_OPTIONS: { locale: Locale; flag: string; label: string }[] = [
   { locale: "fr", flag: "🇫🇷", label: "Français" },
   { locale: "ru", flag: "🇷🇺", label: "Русский" },
   { locale: "es", flag: "🇪🇸", label: "Español" },
+  { locale: "zh-CN", flag: "🇨🇳", label: "简体中文" },
+  { locale: "zh-TW", flag: "🇹🇼", label: "繁體中文" },
   { locale: "upgoer5", flag: "🚀", label: "Up-Goer Five" },
 ];
 
@@ -603,6 +621,12 @@ function LanguageDropdown({
   );
 }
 
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function ChatInterface({
   conversationId,
   onOpenDrawer,
@@ -614,6 +638,7 @@ function ChatInterface({
   onConversationStateUpdate,
   onFirstMessage,
   onDistillConversation,
+  onDistillReplaceConversation,
   mostRecentCwd,
   isDrawerCollapsed,
   onToggleDrawerCollapse,
@@ -628,6 +653,12 @@ function ChatInterface({
 }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showLoadingProgressUI, setShowLoadingProgressUI] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState<{
+    phase: "downloading" | "parsing";
+    bytesDownloaded: number;
+    bytesTotal?: number;
+  } | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<
@@ -679,10 +710,13 @@ function ChatInterface({
     }
   }, [currentConversation?.conversation_id]);
 
-  // Reset cwdInitialized when switching to a new conversation so we re-read from localStorage
+  // Reset cwdInitialized and orchestrator mode when switching to a new conversation
   useEffect(() => {
     if (conversationId === null) {
       setCwdInitialized(false);
+      setOrchestratorMode(false);
+      setSubagentBackend("shelley");
+      setShowAdvancedSettings(false);
     }
   }, [conversationId]);
 
@@ -751,6 +785,7 @@ function ChatInterface({
     isChannelEnabled("browser"),
   );
   const [showDiffViewer, setShowDiffViewer] = useState(false);
+  const [showAgentsMdEditor, setShowAgentsMdEditor] = useState(false);
   const [diffViewerInitialCommit, setDiffViewerInitialCommit] = useState<string | undefined>(
     undefined,
   );
@@ -758,7 +793,45 @@ function ChatInterface({
   const [diffCommentText, setDiffCommentText] = useState("");
   const [agentWorking, setAgentWorking] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+
+  // Detect if the conversation is currently distilling
+  const isDistilling = useMemo(() => {
+    return messages.some((m) => {
+      if (m.type !== "system" || !m.user_data) return false;
+      try {
+        const userData = typeof m.user_data === "string" ? JSON.parse(m.user_data) : m.user_data;
+        return userData.distill_status === "in_progress";
+      } catch {
+        return false;
+      }
+    });
+  }, [messages]);
+
   const [contextWindowSize, setContextWindowSize] = useState(0);
+  // Tool progress: maps tool_use_id -> partial output
+  const [toolProgress, setToolProgress] = useState<Record<string, ToolProgress>>({});
+  // Streaming LLM text: accumulated text from stream deltas
+  const [streamingText, setStreamingText] = useState("");
+  const [orchestratorMode, setOrchestratorMode] = useState(false);
+  const [subagentBackend, setSubagentBackend] = useState<"shelley" | "claude-cli" | "codex-cli">(
+    "shelley",
+  );
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const advancedSettingsRef = useRef<HTMLDivElement>(null);
+  const cliAgents = window.__SHELLEY_INIT__?.cli_agents || [];
+
+  // Close advanced settings popover on click outside
+  useEffect(() => {
+    if (!showAdvancedSettings) return;
+    const handleClick = (e: MouseEvent) => {
+      if (advancedSettingsRef.current && !advancedSettingsRef.current.contains(e.target as Node)) {
+        setShowAdvancedSettings(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showAdvancedSettings]);
+
   const terminalURL = window.__SHELLEY_INIT__?.terminal_url || null;
   const links = window.__SHELLEY_INIT__?.links || [];
   const hostname = window.__SHELLEY_INIT__?.hostname || "localhost";
@@ -767,7 +840,33 @@ function ChatInterface({
   const [isDisconnected, setIsDisconnected] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [lastKnownMessageCount, setLastKnownMessageCount] = useState<number | null>(null);
   const [terminalInjectedText, setTerminalInjectedText] = useState<string | null>(null);
+
+  const messageCountStore = useMemo(() => {
+    const key = conversationId ? `shelley_msg_count_${conversationId}` : null;
+    return {
+      save(count: number) {
+        if (!key) return;
+        try {
+          localStorage.setItem(key, String(count));
+        } catch {
+          // Ignore localStorage failures (private mode/quota restrictions)
+        }
+      },
+      load(): number | null {
+        if (!key) return null;
+        try {
+          const v = localStorage.getItem(key);
+          if (v == null) return null;
+          const n = Number(v);
+          return Number.isFinite(n) ? n : null;
+        } catch {
+          return null;
+        }
+      },
+    };
+  }, [conversationId]);
   const [terminalAutoFocusId, setTerminalAutoFocusId] = useState<string | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -782,6 +881,9 @@ function ChatInterface({
   const loadingRef = useRef(false);
   // Pending scroll target from loadMessages: undefined = none, null = bottom, number = saved position
   const pendingScrollRef = useRef<number | null | undefined>(undefined);
+  const loadingProgressDelayRef = useRef<number | null>(null);
+  // Track the current conversation ID to detect if user navigated away during async operations
+  const currentConversationIdRef = useRef<string | null>(conversationId);
 
   const handleOpenDiffViewer = useCallback((commit: string, cwd?: string) => {
     setDiffViewerInitialCommit(commit);
@@ -860,16 +962,31 @@ function ChatInterface({
     };
   }, [navigateUserMessageTrigger]);
 
+  // Update the ref whenever conversationId changes
+  useEffect(() => {
+    currentConversationIdRef.current = conversationId;
+  }, [conversationId]);
+
   // Load messages and set up streaming
   useEffect(() => {
     if (conversationId) {
       setAgentWorking(false);
+      setToolProgress({});
+      setStreamingText("");
       loadMessages();
       setupMessageStream();
     } else {
       // No conversation yet, show empty state
       setMessages([]);
       setContextWindowSize(0);
+      setToolProgress({});
+      setStreamingText("");
+      if (loadingProgressDelayRef.current) {
+        clearTimeout(loadingProgressDelayRef.current);
+        loadingProgressDelayRef.current = null;
+      }
+      setShowLoadingProgressUI(false);
+      setLoadingProgress(null);
       loadingRef.current = false;
       setLoading(false);
     }
@@ -886,6 +1003,19 @@ function ChatInterface({
       }
       if (heartbeatTimeoutRef.current) {
         clearTimeout(heartbeatTimeoutRef.current);
+      }
+      if (loadingProgressDelayRef.current) {
+        clearTimeout(loadingProgressDelayRef.current);
+        loadingProgressDelayRef.current = null;
+      }
+      // Save the latest sequence ID to cache before resetting, so when we
+      // switch back we can resume the SSE stream from where we left off.
+      // Note: conversationId in this closure is the *old* one being cleaned up.
+      if (conversationId && lastSequenceIdRef.current >= 0) {
+        const cached = conversationCache.peek(conversationId);
+        if (cached) {
+          cached.lastSequenceId = lastSequenceIdRef.current;
+        }
       }
       // Reset sequence ID and connection tracking when conversation changes
       lastSequenceIdRef.current = -1;
@@ -1054,16 +1184,69 @@ function ChatInterface({
 
   const loadMessages = async () => {
     if (!conversationId) return;
+
+    // Capture the conversation ID at the start of the async operation
+    // so we can check if it's still current when the load completes
+    const loadingConversationId = conversationId;
+
+    // Check cache first — if we have this conversation cached, restore instantly
+    const cached = conversationCache.get(conversationId);
+    if (cached) {
+      if (loadingConversationId !== currentConversationIdRef.current) {
+        return;
+      }
+      pendingScrollRef.current = scrollStore.load();
+      setMessages(cached.messages);
+      setLastKnownMessageCount(cached.messages.length);
+      messageCountStore.save(cached.messages.length);
+      setContextWindowSize(cached.contextWindowSize);
+      lastSequenceIdRef.current = cached.lastSequenceId;
+      loadingRef.current = false;
+      setLoading(false);
+      setShowLoadingProgressUI(false);
+      setLoadingProgress(null);
+      if (onConversationUpdate) {
+        onConversationUpdate(cached.conversation);
+      }
+      return;
+    }
+
     try {
       loadingRef.current = true;
       setLoading(true);
       setError(null);
-      const response = await api.getConversation(conversationId);
+      setShowLoadingProgressUI(false);
+      if (loadingProgressDelayRef.current) {
+        clearTimeout(loadingProgressDelayRef.current);
+      }
+      loadingProgressDelayRef.current = window.setTimeout(() => {
+        setShowLoadingProgressUI(true);
+      }, 500);
+      setLastKnownMessageCount(messageCountStore.load());
+      setLoadingProgress({ phase: "downloading", bytesDownloaded: 0 });
+      const response = await api.getConversationWithProgress(conversationId, (progress) => {
+        setLoadingProgress(progress);
+      });
+
+      // Check if the user navigated away during the load (issue #155)
+      if (loadingConversationId !== currentConversationIdRef.current) {
+        return;
+      }
+
       // Set pending scroll target before state updates so useLayoutEffect can handle it.
       pendingScrollRef.current = scrollStore.load();
-      setMessages(response.messages ?? []);
+      const loadedMessages = response.messages ?? [];
+      setMessages(loadedMessages);
+      setLastKnownMessageCount(loadedMessages.length);
+      messageCountStore.save(loadedMessages.length);
       loadingRef.current = false;
       setLoading(false);
+      if (loadingProgressDelayRef.current) {
+        clearTimeout(loadingProgressDelayRef.current);
+        loadingProgressDelayRef.current = null;
+      }
+      setShowLoadingProgressUI(false);
+      setLoadingProgress(null);
       // ConversationState is sent via the streaming endpoint, not on initial load
       // We don't update agentWorking here - the stream will provide the current state
       // Always update context window size when loading a conversation.
@@ -1072,11 +1255,22 @@ function ChatInterface({
       if (onConversationUpdate) {
         onConversationUpdate(response.conversation);
       }
+      // Populate cache with the fetched data.
+      // Compute max sequence_id from loaded messages for SSE resume.
+      const loadedMaxSeqId =
+        loadedMessages.length > 0 ? Math.max(...loadedMessages.map((m) => m.sequence_id)) : -1;
+      conversationCache.set(conversationId, response, loadedMaxSeqId);
     } catch (err) {
       console.error("Failed to load messages:", err);
       setError("Failed to load messages");
       loadingRef.current = false;
       setLoading(false);
+      if (loadingProgressDelayRef.current) {
+        clearTimeout(loadingProgressDelayRef.current);
+        loadingProgressDelayRef.current = null;
+      }
+      setShowLoadingProgressUI(false);
+      setLoadingProgress(null);
     }
   };
 
@@ -1098,6 +1292,9 @@ function ChatInterface({
 
     if (!conversationId) return;
 
+    // Capture the conversation ID for this stream so we can detect stale messages
+    const streamConversationId = conversationId;
+
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
     }
@@ -1116,6 +1313,11 @@ function ChatInterface({
     eventSourceRef.current = eventSource;
 
     eventSource.onmessage = (event) => {
+      // Ignore messages if the user has navigated to a different conversation (issue #155)
+      if (streamConversationId !== currentConversationIdRef.current) {
+        return;
+      }
+
       // Reset heartbeat timeout on every message
       resetHeartbeatTimeout();
 
@@ -1140,6 +1342,39 @@ function ChatInterface({
         // Merge new messages without losing existing ones.
         // If no new messages (e.g., only conversation/slug update or heartbeat), keep existing list.
         if (incomingMessages.length > 0) {
+          // Clear streaming state when actual messages arrive
+          // Tool results replace tool progress; agent messages replace streaming text
+          for (const msg of incomingMessages) {
+            if (msg.type === "tool" || msg.type === "user") {
+              // Tool result message arrived - clear any tool progress for tools in this message
+              try {
+                const llmData = msg.llm_data
+                  ? typeof msg.llm_data === "string"
+                    ? JSON.parse(msg.llm_data)
+                    : msg.llm_data
+                  : null;
+                if (llmData?.Content) {
+                  const toolIds = llmData.Content.filter((c: { Type: number }) => c.Type === 6) // tool_result
+                    .map((c: { ToolUseID?: string }) => c.ToolUseID)
+                    .filter(Boolean);
+                  if (toolIds.length > 0) {
+                    setToolProgress((prev) => {
+                      const next = { ...prev };
+                      for (const id of toolIds) delete next[id];
+                      return next;
+                    });
+                  }
+                }
+              } catch {
+                /* ignore parse errors */
+              }
+            }
+            if (msg.type === "agent") {
+              // Agent message arrived - clear streaming text
+              setStreamingText("");
+            }
+          }
+
           setMessages((prev) => {
             const byId = new Map<string, Message>();
             for (const m of prev) byId.set(m.message_id, m);
@@ -1152,11 +1387,19 @@ function ChatInterface({
             }
             return result;
           });
+          // Keep the cache in sync with streaming updates
+          if (conversationId) {
+            conversationCache.updateMessages(conversationId, incomingMessages);
+          }
         }
 
         // Update conversation data if provided
         if (onConversationUpdate && streamResponse.conversation) {
           onConversationUpdate(streamResponse.conversation);
+        }
+        // Keep cache conversation metadata in sync
+        if (conversationId && streamResponse.conversation) {
+          conversationCache.updateConversation(conversationId, streamResponse.conversation);
         }
 
         // Handle conversation list updates (for other conversations)
@@ -1185,8 +1428,32 @@ function ChatInterface({
           handleNotificationEvent(streamResponse.notification_event);
         }
 
+        // Handle tool progress (partial output from running tools)
+        if (streamResponse.tool_progress) {
+          const progress = streamResponse.tool_progress;
+          setToolProgress((prev) => ({
+            ...prev,
+            [progress.tool_use_id]: progress,
+          }));
+        }
+
+        // Handle LLM streaming text deltas
+        if (streamResponse.stream_delta) {
+          const delta = streamResponse.stream_delta;
+          if (delta.type === "text") {
+            setStreamingText((prev) => prev + delta.text);
+          }
+        }
+
         if (typeof streamResponse.context_window_size === "number") {
           setContextWindowSize(streamResponse.context_window_size);
+          // Keep cache in sync
+          if (conversationId) {
+            conversationCache.updateContextWindowSize(
+              conversationId,
+              streamResponse.context_window_size,
+            );
+          }
         }
       } catch (err) {
         console.error("Failed to parse message stream data:", err);
@@ -1344,6 +1611,32 @@ function ChatInterface({
     };
   }, [checkConnectionHealth, reconnect, forceReconnect]);
 
+  const queueMessage = useCallback(
+    async (message: string) => {
+      if (!message.trim() || !conversationId) return;
+      try {
+        await api.sendMessage(conversationId, {
+          message: message.trim(),
+          model: selectedModel,
+          queue: true,
+        });
+      } catch (err) {
+        console.error("Failed to queue message:", err);
+        throw err;
+      }
+    },
+    [conversationId, selectedModel],
+  );
+
+  const cancelQueuedMessages = useCallback(async () => {
+    if (!conversationId) return;
+    try {
+      await api.cancelQueuedMessages(conversationId);
+    } catch (err) {
+      console.error("Failed to cancel queued messages:", err);
+    }
+  }, [conversationId]);
+
   const sendMessage = async (message: string) => {
     if (!message.trim() || sending) return;
 
@@ -1378,6 +1671,7 @@ function ChatInterface({
       setSending(true);
       setError(null);
       setAgentWorking(true);
+      setStreamingText("");
 
       // If no conversation ID, this is the first message - validate cwd first
       if (!conversationId && onFirstMessage) {
@@ -1388,7 +1682,13 @@ function ChatInterface({
             throw new Error(`Invalid working directory: ${validation.error}`);
           }
         }
-        await onFirstMessage(message.trim(), selectedModel, selectedCwd || undefined);
+        await onFirstMessage(
+          message.trim(),
+          selectedModel,
+          selectedCwd || undefined,
+          orchestratorMode ? "orchestrator" : undefined,
+          orchestratorMode ? subagentBackend : undefined,
+        );
       } else if (conversationId) {
         await api.sendMessage(conversationId, {
           message: message.trim(),
@@ -1446,6 +1746,16 @@ function ChatInterface({
   const handleDistillConversation = async () => {
     if (!conversationId || !onDistillConversation) return;
     await onDistillConversation(
+      conversationId,
+      selectedModel,
+      currentConversation?.cwd || selectedCwd || undefined,
+    );
+  };
+
+  // Handler to distill and replace conversation in place
+  const handleDistillReplaceConversation = async () => {
+    if (!conversationId || !onDistillReplaceConversation) return;
+    await onDistillReplaceConversation(
       conversationId,
       selectedModel,
       currentConversation?.cwd || selectedCwd || undefined,
@@ -1632,7 +1942,7 @@ function ChatInterface({
       return (
         <div className="empty-state">
           <div className="empty-state-content">
-            <p className="text-base" style={{ marginBottom: "1rem", lineHeight: "1.6" }}>
+            <p className="text-base chat-welcome-text">
               {t("welcomeMessage")
                 .split(/(\{hostname\}|\{docsLink\}|\{proxyLink\})/)
                 .map((part, i) => {
@@ -1644,7 +1954,7 @@ function ChatInterface({
                         href="https://exe.dev/docs/proxy"
                         target="_blank"
                         rel="noopener noreferrer"
-                        style={{ color: "var(--blue-text)", textDecoration: "underline" }}
+                        className="chat-welcome-link"
                       >
                         docs
                       </a>
@@ -1656,7 +1966,7 @@ function ChatInterface({
                         href={proxyURL}
                         target="_blank"
                         rel="noopener noreferrer"
-                        style={{ color: "var(--blue-text)", textDecoration: "underline" }}
+                        className="chat-welcome-link"
                       >
                         {proxyURL}
                       </a>
@@ -1666,14 +1976,10 @@ function ChatInterface({
             </p>
             {models.length === 0 ? (
               <div className="add-model-hint">
-                <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
-                  {t("noModelsConfiguredHint")}
-                </p>
+                <p className="text-sm chat-secondary-text">{t("noModelsConfiguredHint")}</p>
               </div>
             ) : (
-              <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
-                {t("sendMessageToStart")}
-              </p>
+              <p className="text-sm chat-secondary-text">{t("sendMessageToStart")}</p>
             )}
           </div>
         </div>
@@ -1688,6 +1994,8 @@ function ChatInterface({
             message={item.message}
             onOpenDiffViewer={handleOpenDiffViewer}
             onCommentTextChange={setDiffCommentText}
+            onCancelQueued={isQueuedMessage(item.message) ? cancelQueuedMessages : undefined}
+            toolProgress={toolProgress}
           />
         );
       } else if (item.type === "tool") {
@@ -1703,6 +2011,7 @@ function ChatInterface({
             hasResult={item.hasResult}
             display={item.display}
             onCommentTextChange={setDiffCommentText}
+            streamingOutput={item.toolUseId ? toolProgress[item.toolUseId]?.output : undefined}
           />
         );
       }
@@ -1712,9 +2021,24 @@ function ChatInterface({
     // Find system prompt message to render at the top (exclude distill status messages)
     const systemMessage = messages.find((m) => m.type === "system" && !isDistillStatusMessage(m));
 
+    // Streaming text preview: show when agent is generating text
+    const streamingPreview =
+      streamingText && agentWorking ? (
+        <div key="streaming-preview" className="message message-agent streaming-message">
+          <div className="message-content" data-testid="message-content">
+            <div className="whitespace-pre-wrap break-words">
+              {streamingText}
+              <span className="streaming-cursor">▊</span>
+            </div>
+          </div>
+        </div>
+      ) : null;
+
     return [
+      <ModelBar key="model-bar" model={currentConversation?.model} models={models} />,
       systemMessage && <SystemPromptView key="system-prompt" message={systemMessage} />,
       ...rendered,
+      streamingPreview,
     ];
   };
 
@@ -1785,6 +2109,9 @@ function ChatInterface({
           conversationId={conversationId}
           modelName={selectedModelDisplayName}
           onDistillConversation={onDistillConversation ? handleDistillConversation : undefined}
+          onDistillReplaceConversation={
+            onDistillReplaceConversation ? handleDistillReplaceConversation : undefined
+          }
           agentWorking={agentWorking}
         />
       </div>
@@ -1803,6 +2130,85 @@ function ChatInterface({
             onManageModels={() => onOpenModelsModal?.()}
             disabled={sending}
           />
+          <div className="advanced-settings-wrapper" ref={advancedSettingsRef}>
+            <button
+              className={`advanced-settings-trigger${orchestratorMode ? " active" : ""}`}
+              onClick={() => setShowAdvancedSettings(!showAdvancedSettings)}
+              title="Advanced settings"
+              disabled={sending}
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+            {showAdvancedSettings && (
+              <div className="advanced-settings-popover">
+                <div className="advanced-settings-header">Advanced Settings</div>
+                <label className="orchestrator-toggle">
+                  <input
+                    type="checkbox"
+                    checked={orchestratorMode}
+                    onChange={(e) => {
+                      setOrchestratorMode(e.target.checked);
+                      if (!e.target.checked) setSubagentBackend("shelley");
+                    }}
+                    disabled={sending}
+                  />
+                  <span className="orchestrator-toggle-label">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="12" cy="5" r="3" />
+                      <circle cx="5" cy="19" r="3" />
+                      <circle cx="19" cy="19" r="3" />
+                      <line x1="12" y1="8" x2="5" y2="16" />
+                      <line x1="12" y1="8" x2="19" y2="16" />
+                    </svg>
+                    Orchestrator
+                    <span className="experimental-badge">experimental</span>
+                  </span>
+                </label>
+                {orchestratorMode && (
+                  <div className="orchestrator-backend-select">
+                    <label className="orchestrator-backend-label">Subagent backend</label>
+                    <select
+                      className="orchestrator-backend-dropdown"
+                      value={subagentBackend}
+                      onChange={(e) =>
+                        setSubagentBackend(e.target.value as "shelley" | "claude-cli" | "codex-cli")
+                      }
+                      disabled={sending}
+                    >
+                      <option value="shelley">Shelley (native)</option>
+                      {cliAgents.includes("claude-cli") && (
+                        <option value="claude-cli">Claude CLI</option>
+                      )}
+                      {cliAgents.includes("codex-cli") && (
+                        <option value="codex-cli">Codex CLI</option>
+                      )}
+                    </select>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
         <div
           className={`status-field status-field-cwd${cwdError ? " status-field-error" : ""}`}
@@ -1833,6 +2239,9 @@ function ChatInterface({
           conversationId={conversationId}
           modelName={selectedModelDisplayName}
           onDistillConversation={onDistillConversation ? handleDistillConversation : undefined}
+          onDistillReplaceConversation={
+            onDistillReplaceConversation ? handleDistillReplaceConversation : undefined
+          }
           agentWorking={agentWorking}
         />
       </div>
@@ -1886,12 +2295,7 @@ function ChatInterface({
         <div className="header-actions">
           {/* Green + icon in circle for new conversation */}
           <button onClick={onNewConversation} className="btn-new" aria-label={t("newConversation")}>
-            <svg
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              style={{ width: "1rem", height: "1rem" }}
-            >
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" className="chat-icon-1rem">
               <path
                 strokeLinecap="round"
                 strokeLinejoin="round"
@@ -1902,7 +2306,7 @@ function ChatInterface({
           </button>
 
           {/* Overflow menu */}
-          <div ref={overflowMenuRef} style={{ position: "relative" }}>
+          <div ref={overflowMenuRef} className="chat-overflow-menu-wrapper">
             <button
               onClick={() => setShowOverflowMenu(!showOverflowMenu)}
               className="btn-icon"
@@ -1934,7 +2338,7 @@ function ChatInterface({
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
-                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.75rem" }}
+                      className="chat-menu-icon"
                     >
                       <path
                         strokeLinecap="round"
@@ -1960,7 +2364,7 @@ function ChatInterface({
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
-                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.75rem" }}
+                      className="chat-menu-icon"
                     >
                       <path
                         strokeLinecap="round"
@@ -1985,7 +2389,7 @@ function ChatInterface({
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
-                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.75rem" }}
+                      className="chat-menu-icon"
                     >
                       <path
                         strokeLinecap="round"
@@ -2019,7 +2423,7 @@ function ChatInterface({
                         fill="none"
                         stroke="currentColor"
                         viewBox="0 0 24 24"
-                        style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.75rem" }}
+                        className="chat-menu-icon"
                       >
                         <path
                           strokeLinecap="round"
@@ -2032,6 +2436,31 @@ function ChatInterface({
                     </button>
                   </>
                 )}
+
+                {/* Edit user AGENTS.md */}
+                <div className="overflow-menu-divider" />
+                <button
+                  onClick={() => {
+                    setShowOverflowMenu(false);
+                    setShowAgentsMdEditor(true);
+                  }}
+                  className="overflow-menu-item"
+                >
+                  <svg
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    className="chat-menu-icon"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                    />
+                  </svg>
+                  {t("editUserAgentsMd")}
+                </button>
 
                 {/* Version check */}
                 <div className="overflow-menu-divider" />
@@ -2046,7 +2475,7 @@ function ChatInterface({
                     fill="none"
                     stroke="currentColor"
                     viewBox="0 0 24 24"
-                    style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.75rem" }}
+                    className="chat-menu-icon"
                   >
                     <path
                       strokeLinecap="round"
@@ -2202,7 +2631,18 @@ function ChatInterface({
                 {/* Language selector */}
                 <div className="overflow-menu-divider" />
                 <div className="language-selector-row">
-                  <div className="md-toggle-label">{t("language")}</div>
+                  <div className="md-toggle-label">
+                    {t("language")}{" "}
+                    <a
+                      href={`https://github.com/boldsoftware/shelley/issues/new?labels=translation&title=${encodeURIComponent("Translation issue: ")}&body=${encodeURIComponent("**Language:** \n**Where in the UI:** \n**Current text:** \n**Suggested text:** \n")}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="report-bug-link"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      [{t("reportBug")}]
+                    </a>
+                  </div>
                   <LanguageDropdown locale={locale} setLocale={setLocale} t={t} />
                 </div>
               </div>
@@ -2216,9 +2656,50 @@ function ChatInterface({
       <div className="messages-area-wrapper">
         <div className="messages-container scrollable" ref={messagesContainerRef}>
           {loading ? (
-            <div className="flex items-center justify-center full-height">
-              <div className="spinner"></div>
-            </div>
+            showLoadingProgressUI ? (
+              <div className="conversation-loading full-height">
+                <div className="spinner"></div>
+                <div className="conversation-loading-title">
+                  {loadingProgress?.phase === "parsing"
+                    ? "Rendering conversation…"
+                    : "Loading conversation…"}
+                </div>
+                <div className="conversation-loading-subtitle">
+                  {loadingProgress
+                    ? loadingProgress.bytesTotal && loadingProgress.bytesTotal > 0
+                      ? `${formatBytes(loadingProgress.bytesDownloaded)} of ${formatBytes(loadingProgress.bytesTotal)}`
+                      : `${formatBytes(loadingProgress.bytesDownloaded)} downloaded`
+                    : "Starting…"}
+                  {lastKnownMessageCount !== null
+                    ? ` • ~${lastKnownMessageCount} messages last time`
+                    : ""}
+                </div>
+                <div className="conversation-loading-bar">
+                  <div
+                    className={`conversation-loading-bar-fill${
+                      loadingProgress?.phase === "parsing"
+                        ? " parsing"
+                        : !loadingProgress?.bytesTotal || loadingProgress.bytesTotal <= 0
+                          ? " indeterminate"
+                          : ""
+                    }`}
+                    style={
+                      loadingProgress?.phase === "parsing"
+                        ? undefined
+                        : loadingProgress?.bytesTotal && loadingProgress.bytesTotal > 0
+                          ? {
+                              width: `${Math.min(100, (loadingProgress.bytesDownloaded / loadingProgress.bytesTotal) * 100)}%`,
+                            }
+                          : undefined
+                    }
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center full-height">
+                <div className="spinner"></div>
+              </div>
+            )
           ) : (
             <div className="messages-list">{renderMessages()}</div>
           )}
@@ -2231,12 +2712,7 @@ function ChatInterface({
             onClick={scrollToBottom}
             aria-label="Scroll to bottom"
           >
-            <svg
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              style={{ width: "1.25rem", height: "1.25rem" }}
-            >
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" className="chat-scroll-icon">
               <path
                 strokeLinecap="round"
                 strokeLinejoin="round"
@@ -2278,6 +2754,10 @@ function ChatInterface({
         <MessageInput
           key={conversationId || "new"}
           onSend={sendMessage}
+          onQueue={queueMessage}
+          showQueueOption={!!conversationId}
+          canQueue={agentWorking && !!conversationId}
+          autoQueue={isDistilling && !!conversationId}
           disabled={sending || loading}
           autoFocus={true}
           injectedText={terminalInjectedText || diffCommentText}
@@ -2314,6 +2794,12 @@ function ChatInterface({
         onCommentTextChange={setDiffCommentText}
         initialCommit={diffViewerInitialCommit}
         onCwdChange={setDiffViewerCwd}
+      />
+
+      {/* AGENTS.md Editor Modal */}
+      <AgentsMdEditorModal
+        isOpen={showAgentsMdEditor}
+        onClose={() => setShowAgentsMdEditor(false)}
       />
 
       {/* Version Checker Modal */}

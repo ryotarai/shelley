@@ -86,12 +86,81 @@ class ApiService {
     return response.json();
   }
 
-  async getConversation(conversationId: string): Promise<StreamResponse> {
+  async distillReplaceConversation(
+    sourceConversationId: string,
+    model?: string,
+    cwd?: string,
+  ): Promise<{ conversation_id: string }> {
+    const response = await fetch(`${this.baseUrl}/conversations/distill-replace`, {
+      method: "POST",
+      headers: this.postHeaders,
+      body: JSON.stringify({
+        source_conversation_id: sourceConversationId,
+        model: model || "",
+        cwd: cwd || "",
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to distill-replace conversation: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  async getConversationWithProgress(
+    conversationId: string,
+    onProgress?: (progress: {
+      phase: "downloading" | "parsing";
+      bytesDownloaded: number;
+      bytesTotal?: number;
+    }) => void,
+  ): Promise<StreamResponse> {
     const response = await fetch(`${this.baseUrl}/conversation/${conversationId}`);
     if (!response.ok) {
       throw new Error(`Failed to get messages: ${response.statusText}`);
     }
-    return response.json();
+
+    const contentLengthHeader = response.headers.get("Content-Length");
+    const contentLength = contentLengthHeader ? Number(contentLengthHeader) : undefined;
+
+    if (!response.body) {
+      onProgress?.({
+        phase: "parsing",
+        bytesDownloaded: contentLength ?? 0,
+        bytesTotal: contentLength,
+      });
+      return response.json();
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const chunks: string[] = [];
+    let bytesDownloaded = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      bytesDownloaded += value.byteLength;
+      onProgress?.({
+        phase: "downloading",
+        bytesDownloaded,
+        bytesTotal: contentLength,
+      });
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+
+    chunks.push(decoder.decode());
+    onProgress?.({
+      phase: "parsing",
+      bytesDownloaded,
+      bytesTotal: contentLength,
+    });
+
+    try {
+      return JSON.parse(chunks.join("")) as StreamResponse;
+    } catch {
+      throw new Error("Failed to parse conversation response");
+    }
   }
 
   async sendMessage(conversationId: string, request: ChatRequest): Promise<void> {
@@ -119,6 +188,15 @@ class ApiService {
     });
     if (!response.ok) {
       throw new Error(`Failed to cancel conversation: ${response.statusText}`);
+    }
+  }
+
+  async cancelQueuedMessages(conversationId: string): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/conversation/${conversationId}/cancel-queued`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to cancel queued messages: ${response.statusText}`);
     }
   }
 
@@ -156,6 +234,14 @@ class ApiService {
     });
     if (!response.ok) {
       throw new Error(`Failed to create directory: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  async getConversationPreviews(): Promise<Record<string, { text: string; updated_at: string }>> {
+    const response = await fetch(`${this.baseUrl}/conversations/previews`);
+    if (!response.ok) {
+      throw new Error(`Failed to get conversation previews: ${response.statusText}`);
     }
     return response.json();
   }
@@ -238,6 +324,31 @@ class ApiService {
       throw new Error(`Failed to get file diff: ${response.statusText}`);
     }
     return response.json();
+  }
+
+  async getGitCommitMessages(
+    cwd: string,
+    from: string,
+  ): Promise<{ hash: string; subject: string; body: string; author: string; isHead: boolean }[]> {
+    const response = await fetch(
+      `${this.baseUrl}/git/commit-messages?cwd=${encodeURIComponent(cwd)}&from=${encodeURIComponent(from)}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to get commit messages: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  async amendGitMessage(cwd: string, message: string): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/git/amend-message`, {
+      method: "POST",
+      headers: this.postHeaders,
+      body: JSON.stringify({ cwd, message }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `Failed to amend: ${response.statusText}`);
+    }
   }
 
   async createGitWorktree(cwd: string): Promise<{ path?: string; error?: string }> {

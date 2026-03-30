@@ -393,6 +393,21 @@ func fromLLMToolUse(tu *llm.ToolUse) *toolUse {
 	}
 }
 
+// stripThinkingBlocks returns a copy of the message with thinking and
+// redacted_thinking content blocks removed. Used to strip stale thinking
+// from older assistant turns before sending to the API.
+func stripThinkingBlocks(msg llm.Message) llm.Message {
+	var filtered []llm.Content
+	for _, c := range msg.Content {
+		if c.Type == llm.ContentTypeThinking || c.Type == llm.ContentTypeRedactedThinking {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	msg.Content = filtered
+	return msg
+}
+
 func fromLLMMessage(msg llm.Message) message {
 	var contents []content
 	for _, c := range msg.Content {
@@ -442,8 +457,27 @@ func (s *Service) fromLLMRequest(r *llm.Request) *request {
 	model := cmp.Or(s.Model, DefaultModel)
 	maxTokens := cmp.Or(s.MaxTokens, maxOutputTokens(model))
 
+	// Find the last assistant message index so we can strip thinking blocks
+	// from all earlier assistant messages. The Anthropic API validates thinking
+	// signatures, and they become invalid when the underlying model version
+	// rotates (e.g. "claude-opus-4-6" points to a new version). Only the
+	// most recent assistant turn's thinking blocks need to be preserved.
+	lastAssistantIdx := -1
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		if r.Messages[i].Role == llm.MessageRoleAssistant {
+			lastAssistantIdx = i
+			break
+		}
+	}
+
 	var messages []message
-	for _, m := range r.Messages {
+	for i, m := range r.Messages {
+		// Strip thinking/redacted_thinking blocks from all assistant messages
+		// except the last one. This avoids "Invalid signature" errors when
+		// the model version has changed since the thinking was generated.
+		if m.Role == llm.MessageRoleAssistant && i != lastAssistantIdx {
+			m = stripThinkingBlocks(m)
+		}
 		msg := fromLLMMessage(m)
 		if len(msg.Content) > 0 {
 			messages = append(messages, msg)
@@ -472,6 +506,49 @@ func (s *Service) fromLLMRequest(r *llm.Request) *request {
 	if limit := s.maxOutputTokens(); req.MaxTokens > limit {
 		req.MaxTokens = limit
 		// Also cap the thinking budget if it exceeds the new max_tokens
+		if req.Thinking != nil && req.Thinking.BudgetTokens >= req.MaxTokens {
+			req.Thinking.BudgetTokens = req.MaxTokens - 1024
+		}
+	}
+	return req
+}
+
+// fromLLMRequestStrippingAllThinking is like fromLLMRequest but strips thinking
+// blocks from ALL assistant messages (including the last one). Used as a fallback
+// when the API rejects thinking signatures — e.g. after model version rotation.
+func (s *Service) fromLLMRequestStrippingAllThinking(r *llm.Request) *request {
+	model := cmp.Or(s.Model, DefaultModel)
+	maxTokens := cmp.Or(s.MaxTokens, maxOutputTokens(model))
+
+	var messages []message
+	for _, m := range r.Messages {
+		if m.Role == llm.MessageRoleAssistant {
+			m = stripThinkingBlocks(m)
+		}
+		msg := fromLLMMessage(m)
+		if len(msg.Content) > 0 {
+			messages = append(messages, msg)
+		}
+	}
+	req := &request{
+		Model:      model,
+		Messages:   messages,
+		MaxTokens:  maxTokens,
+		ToolChoice: fromLLMToolChoice(r.ToolChoice),
+		Tools:      mapped(r.Tools, fromLLMTool),
+		System:     mapped(r.System, fromLLMSystem),
+	}
+
+	if s.ThinkingLevel != llm.ThinkingLevelOff {
+		budget := s.ThinkingLevel.ThinkingBudgetTokens()
+		if maxTokens <= budget {
+			req.MaxTokens = budget + 1024
+		}
+		req.Thinking = &thinking{Type: "enabled", BudgetTokens: budget}
+	}
+
+	if limit := s.maxOutputTokens(); req.MaxTokens > limit {
+		req.MaxTokens = limit
 		if req.Thinking != nil && req.Thinking.BudgetTokens >= req.MaxTokens {
 			req.Thinking.BudgetTokens = req.MaxTokens - 1024
 		}
@@ -572,107 +649,134 @@ type streamDelta struct {
 	StopSequence *string `json:"stop_sequence,omitempty"`
 }
 
-// sanitizeJSONControlChars escapes raw control characters (U+0000–U+001F)
-// that appear inside JSON string values. Per RFC 8259, these must be escaped,
-// but some upstream APIs (e.g. Anthropic) occasionally send them raw in SSE
-// event data. Go's json.Unmarshal correctly rejects them, so we fix them up
-// before parsing.
-//
-// TODO: this is a workaround for Anthropic sending invalid JSON in their
-// streaming API. Remove once they fix their encoder.
-func sanitizeJSONControlChars(data []byte) []byte {
-	// Quick check: if no raw control chars exist, return as-is.
-	// We skip \n and \r because they can't appear inside SSE data lines
-	// (they're line terminators), so they're always structural.
-	hasControl := false
-	for _, b := range data {
-		if b < 0x20 && b != '\n' && b != '\r' {
-			hasControl = true
-			break
+// sseEvent represents a parsed Server-Sent Event per the SSE spec.
+// See https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
+type sseEvent struct {
+	EventType string // from "event:" field; empty if not set
+	Data      string // from "data:" field(s); multiple data lines joined with "\n"
+}
+
+// iterSSEEvents reads an SSE stream and yields parsed events.
+// It follows the SSE spec: events are delimited by blank lines,
+// multiple "data:" lines are joined with "\n", and the "event:" field
+// sets the event type.
+func iterSSEEvents(r io.Reader, yield func(sseEvent) error) error {
+	scanner := bufio.NewScanner(r)
+	// SSE lines can be large (e.g. tool input JSON).
+	// Max buffer: 10MB to handle very large content blocks.
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	var (
+		eventType string
+		dataLines []string
+		hasData   bool
+	)
+
+	dispatch := func() error {
+		if !hasData {
+			// Reset and skip — no data fields means no event to dispatch
+			eventType = ""
+			return nil
 		}
-	}
-	if !hasControl {
-		return data
+		ev := sseEvent{
+			EventType: eventType,
+			Data:      strings.Join(dataLines, "\n"),
+		}
+		// Reset state
+		eventType = ""
+		dataLines = dataLines[:0]
+		hasData = false
+		return yield(ev)
 	}
 
-	// Walk the bytes, tracking whether we're inside a JSON string.
-	// When we encounter a raw control char inside a string, replace it
-	// with its \uXXXX escape.
-	var buf bytes.Buffer
-	buf.Grow(len(data) + 64)
-	inString := false
-	for i := 0; i < len(data); i++ {
-		b := data[i]
-		if inString {
-			if b == '\\' {
-				// Escaped character — write both bytes and skip next
-				buf.WriteByte(b)
-				if i+1 < len(data) {
-					i++
-					buf.WriteByte(data[i])
-				}
-				continue
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Blank line dispatches the event
+		if line == "" {
+			if err := dispatch(); err != nil {
+				return err
 			}
-			if b == '"' {
-				inString = false
-				buf.WriteByte(b)
-				continue
+			continue
+		}
+
+		// Lines starting with ':' are comments
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		// Split into field name and value
+		var field, value string
+		if idx := strings.IndexByte(line, ':'); idx >= 0 {
+			field = line[:idx]
+			value = line[idx+1:]
+			// SSE spec: if value starts with a space, remove it
+			if strings.HasPrefix(value, " ") {
+				value = value[1:]
 			}
-			if b < 0x20 {
-				// Raw control char inside a string — escape it
-				fmt.Fprintf(&buf, "\\u%04x", b)
-				continue
-			}
-			buf.WriteByte(b)
 		} else {
-			if b == '"' {
-				inString = true
-			}
-			buf.WriteByte(b)
+			field = line
+		}
+
+		switch field {
+		case "event":
+			eventType = value
+		case "data":
+			dataLines = append(dataLines, value)
+			hasData = true
+			// "id" and "retry" fields are ignored for our use case
 		}
 	}
-	return buf.Bytes()
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reading SSE stream: %w", err)
+	}
+
+	// Dispatch any trailing event (stream ended without final blank line)
+	return dispatch()
+}
+
+// truncateForError returns a string representation of data suitable for error messages,
+// truncating to a reasonable length.
+func truncateForError(data string, maxLen int) string {
+	if len(data) <= maxLen {
+		return data
+	}
+	return data[:maxLen] + fmt.Sprintf("... (%d bytes total)", len(data))
 }
 
 // parseSSEStream reads an SSE stream and assembles the complete response.
-func parseSSEStream(r io.Reader) (*response, error) {
+// If onStream is non-nil, it is called with each text/thinking delta as it arrives.
+func parseSSEStream(r io.Reader, onStream func(llm.StreamDelta)) (*response, error) {
 	var (
 		resp        *response
 		contents    []content // indexed by content block index
 		messageDone bool
 	)
 
-	scanner := bufio.NewScanner(r)
-	// SSE lines can be large (e.g. tool input JSON)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := line[len("data: "):]
+	err := iterSSEEvents(r, func(sse sseEvent) error {
+		data := sse.Data
 		if data == "[DONE]" {
-			break
+			return nil
 		}
 
 		var event streamEvent
-		if err := json.Unmarshal(sanitizeJSONControlChars([]byte(data)), &event); err != nil {
-			return nil, fmt.Errorf("parsing SSE event: %w", err)
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return fmt.Errorf("parsing SSE event (event=%q, data=%s): %w",
+				sse.EventType, truncateForError(data, 512), err)
 		}
 
 		switch event.Type {
 		case "message_start":
 			if event.Message == nil {
-				return nil, fmt.Errorf("message_start event has no message")
+				return fmt.Errorf("message_start event has no message")
 			}
 			resp = event.Message
 			resp.Content = nil // will be rebuilt from content blocks
 
 		case "content_block_start":
 			if event.ContentBlock == nil {
-				return nil, fmt.Errorf("content_block_start event has no content_block")
+				return fmt.Errorf("content_block_start event has no content_block")
 			}
 			// Grow slice to accommodate index
 			for len(contents) <= event.Index {
@@ -688,11 +792,11 @@ func parseSSEStream(r io.Reader) (*response, error) {
 
 		case "content_block_delta":
 			if event.Index >= len(contents) {
-				return nil, fmt.Errorf("content_block_delta index %d out of range", event.Index)
+				return fmt.Errorf("content_block_delta index %d out of range", event.Index)
 			}
 			var delta streamDelta
 			if err := json.Unmarshal(event.Delta, &delta); err != nil {
-				return nil, fmt.Errorf("parsing content_block_delta: %w", err)
+				return fmt.Errorf("parsing content_block_delta: %w", err)
 			}
 			c := &contents[event.Index]
 			switch delta.Type {
@@ -701,11 +805,17 @@ func parseSSEStream(r io.Reader) (*response, error) {
 					c.Text = new(string)
 				}
 				*c.Text += delta.Text
+				if onStream != nil {
+					onStream(llm.StreamDelta{Type: "text", Text: delta.Text, Index: event.Index})
+				}
 			case "thinking_delta":
 				if c.Thinking == nil {
 					c.Thinking = new(string)
 				}
 				*c.Thinking += delta.Thinking
+				if onStream != nil {
+					onStream(llm.StreamDelta{Type: "thinking", Text: delta.Thinking, Index: event.Index})
+				}
 			case "input_json_delta":
 				// Accumulate raw JSON for tool_use input
 				c.ToolInput = append(c.ToolInput, []byte(delta.PartialJSON)...)
@@ -719,7 +829,7 @@ func parseSSEStream(r io.Reader) (*response, error) {
 		case "message_delta":
 			var delta streamDelta
 			if err := json.Unmarshal(event.Delta, &delta); err != nil {
-				return nil, fmt.Errorf("parsing message_delta: %w", err)
+				return fmt.Errorf("parsing message_delta: %w", err)
 			}
 			if resp != nil {
 				resp.StopReason = delta.StopReason
@@ -737,12 +847,12 @@ func parseSSEStream(r io.Reader) (*response, error) {
 			// keepalive, ignore
 
 		case "error":
-			return nil, fmt.Errorf("stream error event: %s", data)
+			return fmt.Errorf("stream error event: %s", data)
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading SSE stream: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	if resp == nil {
@@ -778,6 +888,10 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 		return nil, err
 	}
 	payload = append(payload, '\n')
+
+	// strippedPayload is built lazily on the first "Invalid signature" error.
+	// It strips ALL thinking blocks from the request as a fallback.
+	var strippedPayload []byte
 
 	backoff := s.Backoff
 	if backoff == nil {
@@ -828,7 +942,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 
 		switch {
 		case resp.StatusCode == http.StatusOK:
-			response, err := parseSSEStream(resp.Body)
+			response, err := parseSSEStream(resp.Body, ir.OnStream)
 			resp.Body.Close()
 			if err != nil {
 				// Stream parse errors might be transient (connection reset, etc.)
@@ -859,6 +973,23 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 				errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %v (url=%s, model=%s): %s", attempts+1, time.Now().Format(time.DateTime), resp.Status, url, cmp.Or(s.Model, DefaultModel), buf))
 				continue
 			case resp.StatusCode >= 400 && resp.StatusCode < 500:
+				// Check for "Invalid signature" in thinking blocks — this happens
+				// when the model version rotated and old signatures are no longer valid.
+				// Retry once with ALL thinking blocks stripped from the request.
+				if strippedPayload == nil && strings.Contains(string(buf), "Invalid `signature`") {
+					slog.WarnContext(ctx, "anthropic_invalid_thinking_signature, retrying without thinking blocks",
+						"response", string(buf), "url", url, "model", s.Model)
+					strippedReq := s.fromLLMRequestStrippingAllThinking(ir)
+					strippedReq.Stream = true
+					strippedPayload, err = json.Marshal(strippedReq)
+					if err != nil {
+						return nil, errors.Join(errs, fmt.Errorf("failed to marshal stripped request: %w", err))
+					}
+					strippedPayload = append(strippedPayload, '\n')
+					payload = strippedPayload
+					errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: invalid thinking signature, retrying without thinking blocks", attempts+1, time.Now().Format(time.DateTime)))
+					continue
+				}
 				// some other 400, probably unrecoverable
 				slog.WarnContext(ctx, "anthropic_request_failed", "response", string(buf), "status_code", resp.StatusCode, "url", url, "model", s.Model)
 				return nil, errors.Join(errs, fmt.Errorf("attempt %d at %s: status %v (url=%s, model=%s): %s", attempts+1, time.Now().Format(time.DateTime), resp.Status, url, cmp.Or(s.Model, DefaultModel), buf))

@@ -60,12 +60,31 @@ export interface ChatRequest {
   message: string;
   model?: string;
   cwd?: string;
+  conversation_options?: {
+    type?: "normal" | "orchestrator";
+    subagent_backend?: "shelley" | "claude-cli" | "codex-cli";
+  };
+  queue?: boolean;
 }
 // Notification event types
 export type NotificationEventType = "agent_done" | "agent_error";
 
 export interface NotificationEvent extends Omit<NotificationEventForTS, "type"> {
   type: NotificationEventType;
+}
+
+// ToolProgress represents partial output from a running tool.
+export interface ToolProgress {
+  tool_use_id: string;
+  tool_name: string;
+  output: string;
+}
+
+// StreamDelta represents a partial text delta from the LLM.
+export interface StreamDelta {
+  type: string; // "text" or "thinking"
+  text: string;
+  index: number;
 }
 
 // StreamResponse represents the streaming response format
@@ -75,6 +94,8 @@ export interface StreamResponse extends Omit<StreamResponseForTS, "messages"> {
   conversation_list_update?: ConversationListUpdate;
   heartbeat?: boolean;
   notification_event?: NotificationEvent;
+  tool_progress?: ToolProgress;
+  stream_delta?: StreamDelta;
 }
 
 // Link represents a custom link that can be added to the UI
@@ -94,7 +115,10 @@ export interface InitData {
   hostname?: string;
   terminal_url?: string;
   links?: Link[];
+  user_agents_md_path?: string;
+  user_agents_md_content?: string;
   notification_channel_types?: import("./services/api").ChannelTypeInfo[];
+  cli_agents?: string[]; // Available CLI agents (e.g., "claude-cli", "codex-cli")
 }
 
 // Extend Window interface to include our init data
@@ -127,6 +151,14 @@ export interface GitFileDiff {
   path: string;
   oldContent: string;
   newContent: string;
+}
+
+export interface GitCommitMessage {
+  hash: string;
+  subject: string;
+  body: string;
+  author: string;
+  isHead: boolean;
 }
 
 // Comment for diff viewer
@@ -184,6 +216,18 @@ export function isDistillStatusMessage(message: Message): boolean {
     const userData =
       typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
     return !!userData.distill_status;
+  } catch {
+    return false;
+  }
+}
+
+// Helper to check if a user message is queued (waiting for agent to finish)
+export function isQueuedMessage(message: Message): boolean {
+  if (message.type !== "user" || !message.user_data) return false;
+  try {
+    const userData =
+      typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
+    return !!userData.queued;
   } catch {
     return false;
   }

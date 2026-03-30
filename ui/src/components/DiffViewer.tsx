@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import type * as Monaco from "monaco-editor";
 import { api } from "../services/api";
+import { loadMonaco } from "../services/monaco";
 import { isDarkModeActive } from "../services/theme";
 import { withBasePath } from "../services/paths";
-import { GitDiffInfo, GitFileInfo, GitFileDiff } from "../types";
+import { GitDiffInfo, GitFileInfo, GitFileDiff, GitCommitMessage } from "../types";
 import DirectoryPickerModal from "./DirectoryPickerModal";
 
 interface DiffViewerProps {
@@ -42,46 +43,25 @@ const NextFileIcon = () => (
   </svg>
 );
 
-// Global Monaco instance - loaded lazily
-let monacoInstance: typeof Monaco | null = null;
-let monacoLoadPromise: Promise<typeof Monaco> | null = null;
+type ViewMode = "comment" | "edit";
 
-function loadMonaco(): Promise<typeof Monaco> {
-  if (monacoInstance) {
-    return Promise.resolve(monacoInstance);
-  }
-  if (monacoLoadPromise) {
-    return monacoLoadPromise;
-  }
+const COMMIT_MSG_PREFIX = "commit-message:";
 
-  monacoLoadPromise = (async () => {
-    // Configure Monaco environment for web workers before importing
-    const monacoEnv: Monaco.Environment = {
-      getWorkerUrl: () => withBasePath("/editor.worker.js"),
-    };
-    (self as Window).MonacoEnvironment = monacoEnv;
-
-    // Load Monaco CSS if not already loaded
-    const monacoCssPath = withBasePath("/monaco-editor.css");
-    if (!document.querySelector(`link[href="${monacoCssPath}"]`)) {
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      link.href = monacoCssPath;
-      document.head.appendChild(link);
-    }
-
-    // Load Monaco from our local bundle (runtime URL, cast to proper types)
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore - dynamic runtime URL import
-    const monaco = (await import(/* @vite-ignore */ withBasePath("/monaco-editor.js"))) as typeof Monaco;
-    monacoInstance = monaco;
-    return monacoInstance;
-  })();
-
-  return monacoLoadPromise;
+function isCommitMessageFile(path: string): boolean {
+  return path.startsWith(COMMIT_MSG_PREFIX);
 }
 
-type ViewMode = "comment" | "edit";
+function commitHashFromPath(path: string): string {
+  return path.slice(COMMIT_MSG_PREFIX.length);
+}
+
+function formatCommitMessage(msg: GitCommitMessage): string {
+  let text = msg.subject;
+  if (msg.body) {
+    text += "\n\n" + msg.body;
+  }
+  return text;
+}
 
 function DiffViewer({
   cwd,
@@ -116,6 +96,9 @@ function DiffViewer({
   } | null>(null);
   const [commentText, setCommentText] = useState("");
   const [mode, setMode] = useState<ViewMode>("comment");
+  const [commitMessages, setCommitMessages] = useState<GitCommitMessage[]>([]);
+  const [amendStatus, setAmendStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const amendTimeoutRef = useRef<number | null>(null);
   const [showKeyboardHint, setShowKeyboardHint] = useState(false);
   const hasShownKeyboardHint = useRef(false);
 
@@ -126,16 +109,19 @@ function DiffViewer({
   const commentInputRef = useRef<HTMLTextAreaElement>(null);
   const modeRef = useRef<ViewMode>(mode);
   const hoverDecorationsRef = useRef<string[]>([]);
+  const touchScrolledRef = useRef(false);
+  const touchStartPosRef = useRef<{ x: number; y: number } | null>(null);
 
   // Keep modeRef in sync with mode state and update editor options
   useEffect(() => {
     modeRef.current = mode;
     // Update editor readOnly state when mode changes
-    if (editorRef.current) {
+    // (but not for commit message files - those have their own editability logic)
+    if (editorRef.current && selectedFile && !isCommitMessageFile(selectedFile)) {
       const modifiedEditor = editorRef.current.getModifiedEditor();
       modifiedEditor.updateOptions({ readOnly: mode === "comment" });
     }
-  }, [mode]);
+  }, [mode, selectedFile]);
 
   // Track viewport size
   useEffect(() => {
@@ -201,6 +187,12 @@ function DiffViewer({
       setError(null);
       setShowCommentDialog(null);
       setCommentText("");
+      setCommitMessages([]);
+      setAmendStatus("idle");
+      if (amendTimeoutRef.current) {
+        clearTimeout(amendTimeoutRef.current);
+        amendTimeoutRef.current = null;
+      }
       // Dispose editor when closing
       if (editorRef.current) {
         editorRef.current.dispose();
@@ -238,14 +230,22 @@ function DiffViewer({
       editorRef.current = null;
     }
 
-    // Get language from file extension
-    const ext = "." + (fileDiff.path.split(".").pop()?.toLowerCase() || "");
-    const languages = monaco.languages.getLanguages();
+    // Determine if this is a commit message file and whether it's the HEAD commit
+    const isCommitMsg = isCommitMessageFile(fileDiff.path);
+    const commitHash = isCommitMsg ? commitHashFromPath(fileDiff.path) : null;
+    const isHeadCommit =
+      isCommitMsg && commitMessages.some((m) => m.hash === commitHash && m.isHead);
+
+    // Get language from file extension (use plaintext for commit messages)
     let language = "plaintext";
-    for (const lang of languages) {
-      if (lang.extensions?.includes(ext)) {
-        language = lang.id;
-        break;
+    if (!isCommitMsg) {
+      const ext = "." + (fileDiff.path.split(".").pop()?.toLowerCase() || "");
+      const languages = monaco.languages.getLanguages();
+      for (const lang of languages) {
+        if (lang.extensions?.includes(ext)) {
+          language = lang.id;
+          break;
+        }
       }
     }
 
@@ -260,7 +260,7 @@ function DiffViewer({
     // Create diff editor with mobile-friendly options
     const diffEditor = monaco.editor.createDiffEditor(editorContainerRef.current, {
       theme: isDarkModeActive() ? "vs-dark" : "vs",
-      readOnly: true, // Always read-only in diff viewer
+      readOnly: !isHeadCommit, // Editable only for HEAD commit messages
       originalEditable: false,
       automaticLayout: true,
       renderSideBySide: !isMobile,
@@ -339,24 +339,59 @@ function DiffViewer({
       });
     };
 
-    modifiedEditor.onMouseDown((e: Monaco.editor.IEditorMouseEvent) => {
-      // In comment mode, clicking on line content opens comment dialog
-      const isLineClick =
-        e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
-        e.target.type === monaco.editor.MouseTargetType.CONTENT_EMPTY;
+    // Desktop: open comment dialog on mousedown (immediate response).
+    // Mobile uses onMouseUp below to distinguish taps from scrolls.
+    if (!isMobile) {
+      modifiedEditor.onMouseDown((e: Monaco.editor.IEditorMouseEvent) => {
+        const isLineClick =
+          e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
+          e.target.type === monaco.editor.MouseTargetType.CONTENT_EMPTY;
 
-      if (isLineClick && modeRef.current === "comment") {
-        const position = e.target.position;
-        if (position) {
-          openCommentDialog(position.lineNumber);
+        if (isLineClick && modeRef.current === "comment") {
+          const position = e.target.position;
+          if (position) {
+            openCommentDialog(position.lineNumber);
+          }
         }
-      }
-    });
+      });
+    }
 
-    // For mobile: use onMouseUp which fires more reliably on touch devices
+    // For mobile: use onMouseUp which fires more reliably on touch devices,
+    // but only if the user tapped without scrolling (issue #153).
+    // Track touch gestures to distinguish taps from scrolls.
+    let touchCleanup: (() => void) | null = null;
     if (isMobile) {
+      const editorDom = editorContainerRef.current!;
+      const onTouchStart = (e: TouchEvent) => {
+        touchScrolledRef.current = false;
+        const t = e.touches[0];
+        touchStartPosRef.current = { x: t.clientX, y: t.clientY };
+      };
+      const onTouchMove = (e: TouchEvent) => {
+        if (touchScrolledRef.current || !touchStartPosRef.current) return;
+        const t = e.touches[0];
+        const dx = t.clientX - touchStartPosRef.current.x;
+        const dy = t.clientY - touchStartPosRef.current.y;
+        if (dx * dx + dy * dy > 100) {
+          // 10px threshold
+          touchScrolledRef.current = true;
+        }
+      };
+      const onTouchEnd = () => {
+        touchStartPosRef.current = null;
+      };
+      editorDom.addEventListener("touchstart", onTouchStart, { passive: true });
+      editorDom.addEventListener("touchmove", onTouchMove, { passive: true });
+      editorDom.addEventListener("touchend", onTouchEnd, { passive: true });
+      touchCleanup = () => {
+        editorDom.removeEventListener("touchstart", onTouchStart);
+        editorDom.removeEventListener("touchmove", onTouchMove);
+        editorDom.removeEventListener("touchend", onTouchEnd);
+      };
+
       modifiedEditor.onMouseUp((e: Monaco.editor.IEditorMouseEvent) => {
         if (modeRef.current !== "comment") return;
+        if (touchScrolledRef.current) return; // was a scroll, not a tap
 
         const isLineClick =
           e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
@@ -419,10 +454,31 @@ function DiffViewer({
       );
     });
 
-    // Add content change listener for auto-save
+    // Add content change listener for auto-save (files) or auto-amend (HEAD commit message)
     contentChangeDisposableRef.current?.dispose();
     contentChangeDisposableRef.current = modifiedEditor.onDidChangeModelContent(() => {
-      scheduleSaveRef.current?.();
+      if (isHeadCommit) {
+        // Debounced amend for HEAD commit message
+        if (amendTimeoutRef.current) {
+          clearTimeout(amendTimeoutRef.current);
+        }
+        setAmendStatus("saving");
+        amendTimeoutRef.current = window.setTimeout(async () => {
+          const model = modifiedEditor.getModel();
+          if (!model) return;
+          const newMessage = model.getValue();
+          try {
+            await api.amendGitMessage(cwd, newMessage);
+            setAmendStatus("saved");
+            setTimeout(() => setAmendStatus("idle"), 2000);
+          } catch {
+            setAmendStatus("error");
+            setTimeout(() => setAmendStatus("idle"), 3000);
+          }
+        }, 1500);
+      } else {
+        scheduleSaveRef.current?.();
+      }
     });
 
     // Cleanup function
@@ -430,12 +486,13 @@ function DiffViewer({
       diffUpdateDisposable.dispose();
       contentChangeDisposableRef.current?.dispose();
       contentChangeDisposableRef.current = null;
+      touchCleanup?.();
       if (editorRef.current) {
         editorRef.current.dispose();
         editorRef.current = null;
       }
     };
-  }, [monacoLoaded, fileDiff, isMobile]);
+  }, [monacoLoaded, fileDiff, isMobile, commitMessages, cwd]);
 
   const loadDiffs = async () => {
     try {
@@ -482,9 +539,34 @@ function DiffViewer({
       setLoading(true);
       setError(null);
       const filesData = await api.getGitDiffFiles(diffId, cwd);
-      setFiles(filesData || []);
-      if (filesData && filesData.length > 0) {
-        setSelectedFile(filesData[0].path);
+
+      // Load commit messages if this is a commit (not working changes)
+      let msgs: GitCommitMessage[] = [];
+      if (diffId !== "working") {
+        try {
+          msgs = await api.getGitCommitMessages(cwd, diffId);
+          setCommitMessages(msgs);
+        } catch {
+          // Non-fatal: just don't show commit messages
+          setCommitMessages([]);
+        }
+      } else {
+        setCommitMessages([]);
+      }
+
+      // Prepend synthetic commit message entries
+      const commitFileEntries: GitFileInfo[] = msgs.map((msg) => ({
+        path: COMMIT_MSG_PREFIX + msg.hash,
+        status: "added" as const,
+        additions: formatCommitMessage(msg).split("\n").length,
+        deletions: 0,
+        isGenerated: false,
+      }));
+
+      const allFiles = [...commitFileEntries, ...(filesData || [])];
+      setFiles(allFiles);
+      if (allFiles.length > 0) {
+        setSelectedFile(allFiles[0].path);
       } else {
         setSelectedFile(null);
         setFileDiff(null);
@@ -500,6 +582,23 @@ function DiffViewer({
     try {
       setLoading(true);
       setError(null);
+
+      // Handle synthetic commit message files
+      if (isCommitMessageFile(filePath)) {
+        const hash = commitHashFromPath(filePath);
+        const msg = commitMessages.find((m) => m.hash === hash);
+        if (msg) {
+          setFileDiff({
+            path: filePath,
+            oldContent: "",
+            newContent: formatCommitMessage(msg),
+          });
+        } else {
+          setError("Commit message not found");
+        }
+        return;
+      }
+
       const diffData = await api.getGitFileDiff(diffId, filePath, cwd);
       setFileDiff(diffData);
     } catch (err) {
@@ -512,14 +611,22 @@ function DiffViewer({
   const handleAddComment = () => {
     if (!showCommentDialog || !commentText.trim() || !selectedFile) return;
 
-    // Format: > filename:123: code
-    // Comment...
     const line = showCommentDialog.line;
     const codeSnippet = showCommentDialog.selectedText?.split("\n")[0]?.trim() || "";
     const truncatedCode =
       codeSnippet.length > 60 ? codeSnippet.substring(0, 57) + "..." : codeSnippet;
 
-    const commentBlock = `> ${selectedFile}:${line}: ${truncatedCode}\n${commentText}\n\n`;
+    // For commit message files, use a readable reference
+    let fileRef = selectedFile;
+    if (isCommitMessageFile(selectedFile)) {
+      const hash = commitHashFromPath(selectedFile);
+      const msg = commitMessages.find((m) => m.hash === hash);
+      fileRef = msg
+        ? `commit ${hash.slice(0, 8)} (${msg.subject.slice(0, 40)})`
+        : `commit ${hash.slice(0, 8)}`;
+    }
+
+    const commentBlock = `> ${fileRef}:${line}: ${truncatedCode}\n${commentText}\n\n`;
 
     onCommentTextChange(commentBlock);
     setShowCommentDialog(null);
@@ -626,6 +733,7 @@ function DiffViewer({
     if (
       !editorRef.current ||
       !selectedFile ||
+      isCommitMessageFile(selectedFile) ||
       !fileDiff ||
       modeRef.current !== "edit" ||
       !gitRoot
@@ -720,6 +828,11 @@ function DiffViewer({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // If Monaco's find widget is open, let Monaco handle Escape to close it
+        const findWidget = editorContainerRef.current?.querySelector(".find-widget.visible");
+        if (findWidget) {
+          return; // Let Monaco close its find widget
+        }
         if (showCommentDialog) {
           setShowCommentDialog(null);
         } else {
@@ -730,6 +843,25 @@ function DiffViewer({
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
         e.preventDefault();
         saveImmediately();
+        return;
+      }
+
+      // Route Ctrl/Cmd+F to Monaco's find widget instead of browser find
+      if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+        if (editorRef.current) {
+          e.preventDefault();
+          e.stopPropagation();
+          const modifiedEditor = editorRef.current.getModifiedEditor();
+          modifiedEditor.focus();
+          modifiedEditor.trigger("keyboard", "actions.find", null);
+        }
+        return;
+      }
+
+      // When Monaco's find widget is open, let all non-modifier keys pass through
+      // so typing in the find input works (e.g. "." and "," won't trigger nav)
+      const findWidget = editorContainerRef.current?.querySelector(".find-widget.visible");
+      if (findWidget) {
         return;
       }
 
@@ -847,14 +979,29 @@ function DiffViewer({
         disabled={files.length === 0}
       >
         <option value="">{files.length === 0 ? "No files" : "Choose file..."}</option>
-        {files.map((file) => (
-          <option key={file.path} value={file.path}>
-            {getStatusSymbol(file.status)} {file.path}
-            {file.additions > 0 && ` (+${file.additions})`}
-            {file.deletions > 0 && ` (-${file.deletions})`}
-            {file.isGenerated && " [generated]"}
-          </option>
-        ))}
+        {files.map((file) => {
+          if (isCommitMessageFile(file.path)) {
+            const hash = commitHashFromPath(file.path);
+            const msg = commitMessages.find((m) => m.hash === hash);
+            const label = msg
+              ? `📝 ${msg.subject.slice(0, 50)}${msg.subject.length > 50 ? "..." : ""}`
+              : `📝 ${hash.slice(0, 8)}`;
+            return (
+              <option key={file.path} value={file.path}>
+                {label}
+                {msg?.isHead ? " [HEAD]" : ""}
+              </option>
+            );
+          }
+          return (
+            <option key={file.path} value={file.path}>
+              {getStatusSymbol(file.status)} {file.path}
+              {file.additions > 0 && ` (+${file.additions})`}
+              {file.deletions > 0 && ` (-${file.deletions})`}
+              {file.isGenerated && " [generated]"}
+            </option>
+          );
+        })}
       </select>
       {fileIndexIndicator && <span className="diff-viewer-file-index">{fileIndexIndicator}</span>}
     </div>
@@ -946,6 +1093,13 @@ function DiffViewer({
             {saveStatus === "saving" && "💾 Saving..."}
             {saveStatus === "saved" && "✅ Saved"}
             {saveStatus === "error" && "❌ Error saving"}
+          </div>
+        )}
+        {amendStatus !== "idle" && (
+          <div className={`diff-viewer-toast diff-viewer-toast-${amendStatus}`}>
+            {amendStatus === "saving" && "💾 Amending..."}
+            {amendStatus === "saved" && "✅ Amended"}
+            {amendStatus === "error" && "❌ Error amending"}
           </div>
         )}
         {showKeyboardHint && (

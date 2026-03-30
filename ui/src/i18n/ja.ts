@@ -199,16 +199,21 @@ export const ja: TranslationKeys = {
   dirLabel: "ディレクトリ:",
 
   // Sidebar buttons
+  editUserAgentsMd: "ユーザー AGENTS.md を編集",
+
   openConversations: "会話を開く",
   expandSidebar: "サイドバーを展開",
 
   // Language
   language: "言語",
   switchLanguage: "言語を切り替える",
+  reportBug: "バグを報告",
   english: "English",
   japanese: "日本語",
   french: "Français",
   russian: "Русский",
   spanish: "Español",
   upgoerFive: "Up-Goer Five",
+  simplifiedChinese: "简体中文",
+  traditionalChinese: "繁體中文",
 };

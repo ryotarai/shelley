@@ -21,6 +21,15 @@ var systemPromptTemplate string
 //go:embed subagent_system_prompt.txt
 var subagentSystemPromptTemplate string
 
+//go:embed orchestrator_system_prompt.txt
+var orchestratorSystemPromptTemplate string
+
+//go:embed operational_context.txt
+var operationalContextTemplate string
+
+//go:embed orchestrator_subagent_system_prompt.txt
+var orchestratorSubagentSystemPromptTemplate string
+
 // SystemPromptData contains all the data needed to render the system prompt template
 type SystemPromptData struct {
 	WorkingDirectory string
@@ -29,7 +38,6 @@ type SystemPromptData struct {
 	IsExeDev         bool
 	IsSudoAvailable  bool
 	Hostname         string // For exe.dev, the public hostname (e.g., "vmname.exe.xyz")
-	ShelleyDBPath    string // Path to the shelley database
 	SkillsXML        string // XML block for available skills
 	UserEmail        string // The exe.dev auth email of the user, if known
 }
@@ -158,20 +166,6 @@ func collectSystemData(workingDir string) (*SystemPromptData, error) {
 		}
 	}
 
-	// Set shelley database path if it was configured
-	if DBPath != "" {
-		// Convert to absolute path if relative
-		if !filepath.IsAbs(DBPath) {
-			if absPath, err := filepath.Abs(DBPath); err == nil {
-				data.ShelleyDBPath = absPath
-			} else {
-				data.ShelleyDBPath = DBPath
-			}
-		} else {
-			data.ShelleyDBPath = DBPath
-		}
-	}
-
 	// Discover and load skills
 	var gitRoot string
 	if gitInfo != nil {
@@ -205,8 +199,10 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 		InjectFileContents: make(map[string]string),
 	}
 
-	// Track seen files to avoid duplicates on case-insensitive file systems
+	// Track seen files to avoid duplicates: by resolved path (handles symlinks
+	// and case-insensitive filesystems) and by content (handles copies).
 	seenFiles := make(map[string]bool)
+	seenContents := make(map[string]bool)
 
 	// Check for user-level agent instructions in ~/.config/AGENTS.md, ~/.config/shelley/AGENTS.md, and ~/.shelley/AGENTS.md
 	if home, err := os.UserHomeDir(); err == nil {
@@ -216,14 +212,19 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 			filepath.Join(home, ".shelley", "AGENTS.md"),
 		}
 		for _, f := range userAgentsFiles {
-			lowerPath := strings.ToLower(f)
-			if seenFiles[lowerPath] {
+			canonical := resolveAndNormalize(f)
+			if seenFiles[canonical] {
 				continue
 			}
 			if content, err := os.ReadFile(f); err == nil && len(content) > 0 {
+				contentKey := string(content)
+				if seenContents[contentKey] {
+					continue
+				}
 				info.InjectFiles = append(info.InjectFiles, f)
-				info.InjectFileContents[f] = string(content)
-				seenFiles[lowerPath] = true
+				info.InjectFileContents[f] = contentKey
+				seenFiles[canonical] = true
+				seenContents[contentKey] = true
 			}
 		}
 	}
@@ -237,16 +238,21 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 	// Find root-level guidance files (case-insensitive)
 	rootGuidanceFiles := findGuidanceFilesInDir(searchRoot)
 	for _, file := range rootGuidanceFiles {
-		lowerPath := strings.ToLower(file)
-		if seenFiles[lowerPath] {
+		canonical := resolveAndNormalize(file)
+		if seenFiles[canonical] {
 			continue
 		}
-		seenFiles[lowerPath] = true
 
 		content, err := os.ReadFile(file)
 		if err == nil && len(content) > 0 {
+			contentKey := string(content)
+			if seenContents[contentKey] {
+				continue
+			}
+			seenFiles[canonical] = true
+			seenContents[contentKey] = true
 			info.InjectFiles = append(info.InjectFiles, file)
-			info.InjectFileContents[file] = string(content)
+			info.InjectFileContents[file] = contentKey
 		}
 	}
 
@@ -254,16 +260,21 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 	if wd != searchRoot {
 		wdGuidanceFiles := findGuidanceFilesInDir(wd)
 		for _, file := range wdGuidanceFiles {
-			lowerPath := strings.ToLower(file)
-			if seenFiles[lowerPath] {
+			canonical := resolveAndNormalize(file)
+			if seenFiles[canonical] {
 				continue
 			}
-			seenFiles[lowerPath] = true
 
 			content, err := os.ReadFile(file)
 			if err == nil && len(content) > 0 {
+				contentKey := string(content)
+				if seenContents[contentKey] {
+					continue
+				}
+				seenFiles[canonical] = true
+				seenContents[contentKey] = true
 				info.InjectFiles = append(info.InjectFiles, file)
-				info.InjectFileContents[file] = string(content)
+				info.InjectFileContents[file] = contentKey
 			}
 		}
 	}
@@ -347,34 +358,18 @@ func isExeDev() bool {
 }
 
 // collectSkills discovers skills from default directories, project .skills dirs,
-// and the project tree.
+// the project tree, and built-in skills. See skills.ListAll for precedence rules.
 func collectSkills(workingDir, gitRoot string) string {
-	// Start with default directories (user-level skills)
-	dirs := skills.DefaultDirs()
+	return skills.ToPromptXML(skills.ListAll(workingDir, gitRoot))
+}
 
-	// Add .skills directories found in the project tree
-	dirs = append(dirs, skills.ProjectSkillsDirs(workingDir, gitRoot)...)
-
-	// Discover skills from all directories
-	foundSkills := skills.Discover(dirs)
-
-	// Also discover skills anywhere in the project tree
-	treeSkills := skills.DiscoverInTree(workingDir, gitRoot)
-
-	// Merge, avoiding duplicates by path
-	seen := make(map[string]bool)
-	for _, s := range foundSkills {
-		seen[s.Path] = true
+// resolveAndNormalize returns a canonical lowercase path for dedup.
+// It resolves symlinks and normalizes to lowercase for case-insensitive FS.
+func resolveAndNormalize(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
 	}
-	for _, s := range treeSkills {
-		if !seen[s.Path] {
-			foundSkills = append(foundSkills, s)
-			seen[s.Path] = true
-		}
-	}
-
-	// Generate XML
-	return skills.ToPromptXML(foundSkills)
+	return strings.ToLower(path)
 }
 
 func isSudoAvailable() bool {
@@ -383,14 +378,33 @@ func isSudoAvailable() bool {
 	return err == nil
 }
 
-// SubagentSystemPromptData contains data for subagent system prompts (minimal subset)
+// SubagentSystemPromptData contains data for subagent system prompts (minimal subset).
+// Used in two contexts:
+//   - Non-orchestrator subagents (GenerateSubagentSystemPrompt): WorkingDirectory, GitInfo,
+//     ShelleyDBPath, and ConversationID are populated; OperationalContext is not used.
+//   - Orchestrator subagents (GenerateOrchestratorSubagentSystemPrompt): only OperationalContext
+//     is populated (it already contains pwd, git root, codebase info, etc.).
 type SubagentSystemPromptData struct {
-	WorkingDirectory string
-	GitInfo          *GitInfo
+	WorkingDirectory   string
+	GitInfo            *GitInfo
+	ShelleyDBPath      string
+	ConversationID     string // Parent conversation ID for querying user messages
+	OperationalContext string // Rendered operational context (orchestrator subagents only)
+}
+
+// OrchestratorSystemPromptData contains data for orchestrator system prompts.
+type OrchestratorSystemPromptData struct {
+	WorkingDirectory           string
+	GitInfo                    *GitInfo
+	ContextDir                 string
+	Codebase                   *CodebaseInfo
+	ShelleyDBPath              string
+	ConversationID             string // This conversation's ID for querying user messages
+	IncludeConversationHistory bool   // Whether to include the sqlite query in operational context
 }
 
 // GenerateSubagentSystemPrompt generates a minimal system prompt for subagent conversations.
-func GenerateSubagentSystemPrompt(workingDir string) (string, error) {
+func GenerateSubagentSystemPrompt(workingDir, parentConversationID string) (string, error) {
 	wd := workingDir
 	if wd == "" {
 		var err error
@@ -402,6 +416,8 @@ func GenerateSubagentSystemPrompt(workingDir string) (string, error) {
 
 	data := &SubagentSystemPromptData{
 		WorkingDirectory: wd,
+		ShelleyDBPath:    DBPath,
+		ConversationID:   parentConversationID,
 	}
 
 	// Try to collect git info
@@ -419,6 +435,108 @@ func GenerateSubagentSystemPrompt(workingDir string) (string, error) {
 	err = tmpl.Execute(&buf, data)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute subagent template: %w", err)
+	}
+
+	return collapseBlankLines(buf.String()), nil
+}
+
+// renderOperationalContext renders the operational context template for the given working directory
+// and conversation ID. If includeConversationHistory is true, the sqlite query for looking up
+// user messages is included (useful for subagents, not needed by the orchestrator).
+func renderOperationalContext(workingDir, conversationID string, includeConversationHistory bool) (string, error) {
+	if workingDir == "" {
+		var err error
+		workingDir, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get working directory: %w", err)
+		}
+	}
+
+	data := &OrchestratorSystemPromptData{
+		WorkingDirectory:           workingDir,
+		ShelleyDBPath:              DBPath,
+		ConversationID:             conversationID,
+		IncludeConversationHistory: includeConversationHistory,
+	}
+
+	if gitInfo, err := collectGitInfo(workingDir); err == nil {
+		data.GitInfo = gitInfo
+	}
+
+	if codebaseInfo, err := collectCodebaseInfo(workingDir, data.GitInfo); err == nil {
+		data.Codebase = codebaseInfo
+	}
+
+	tmpl, err := template.New("operational_context").Parse(operationalContextTemplate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse operational context template: %w", err)
+	}
+
+	var buf strings.Builder
+	if err = tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("failed to execute operational context template: %w", err)
+	}
+
+	return collapseBlankLines(buf.String()), nil
+}
+
+// GenerateOrchestratorSystemPrompt generates the system prompt for orchestrator conversations.
+// Operational context (without conversation history) is appended to the prompt.
+func GenerateOrchestratorSystemPrompt(workingDir, contextDir, conversationID string) (string, error) {
+	wd := workingDir
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get working directory: %w", err)
+		}
+	}
+
+	data := &OrchestratorSystemPromptData{
+		WorkingDirectory: wd,
+		ContextDir:       contextDir,
+		ShelleyDBPath:    DBPath,
+		ConversationID:   conversationID,
+	}
+
+	tmpl, err := template.New("orchestrator_system_prompt").Parse(orchestratorSystemPromptTemplate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse orchestrator template: %w", err)
+	}
+
+	var buf strings.Builder
+	if err = tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("failed to execute orchestrator template: %w", err)
+	}
+
+	operationalCtx, err := renderOperationalContext(wd, conversationID, false)
+	if err != nil {
+		return "", err
+	}
+
+	return collapseBlankLines(buf.String() + "\n\n" + operationalCtx), nil
+}
+
+// GenerateOrchestratorSubagentSystemPrompt generates the system prompt for
+// subagents spawned by an orchestrator conversation.
+func GenerateOrchestratorSubagentSystemPrompt(workingDir, parentConversationID string) (string, error) {
+	operationalCtx, err := renderOperationalContext(workingDir, parentConversationID, true)
+	if err != nil {
+		return "", err
+	}
+
+	data := &SubagentSystemPromptData{
+		OperationalContext: operationalCtx,
+	}
+
+	tmpl, err := template.New("orchestrator_subagent_system_prompt").Parse(orchestratorSubagentSystemPromptTemplate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse orchestrator subagent template: %w", err)
+	}
+
+	var buf strings.Builder
+	if err = tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("failed to execute orchestrator subagent template: %w", err)
 	}
 
 	return collapseBlankLines(buf.String()), nil

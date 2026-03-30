@@ -580,6 +580,75 @@ func abs(x float64) float64 {
 	return x
 }
 
+func TestFromLLMRequestStripsOldThinkingBlocks(t *testing.T) {
+	s := &Service{Model: Claude46Opus, ThinkingLevel: llm.ThinkingLevelMedium}
+
+	// Simulate a conversation with multiple assistant turns containing thinking blocks.
+	// Only the last assistant turn's thinking should be preserved.
+	req := s.fromLLMRequest(&llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{
+				{Type: llm.ContentTypeText, Text: "first question"},
+			}},
+			{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+				{Type: llm.ContentTypeThinking, Thinking: "old thinking", Signature: "old-sig-1"},
+				{Type: llm.ContentTypeText, Text: "first answer"},
+			}},
+			{Role: llm.MessageRoleUser, Content: []llm.Content{
+				{Type: llm.ContentTypeText, Text: "second question"},
+			}},
+			{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+				{Type: llm.ContentTypeThinking, Thinking: "old thinking 2", Signature: "old-sig-2"},
+				{Type: llm.ContentTypeRedactedThinking, Data: "redacted", Signature: "old-sig-3"},
+				{Type: llm.ContentTypeText, Text: "second answer"},
+			}},
+			{Role: llm.MessageRoleUser, Content: []llm.Content{
+				{Type: llm.ContentTypeText, Text: "third question"},
+			}},
+			{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+				{Type: llm.ContentTypeThinking, Thinking: "latest thinking", Signature: "valid-sig"},
+				{Type: llm.ContentTypeText, Text: "third answer"},
+				{Type: llm.ContentTypeToolUse, ID: "tool1", ToolName: "bash", ToolInput: json.RawMessage(`{}`)},
+			}},
+			{Role: llm.MessageRoleUser, Content: []llm.Content{
+				{Type: llm.ContentTypeToolResult, ToolUseID: "tool1", ToolResult: []llm.Content{{Type: llm.ContentTypeText, Text: "output"}}},
+			}},
+		},
+	})
+
+	// Should have 7 messages (no messages dropped)
+	if len(req.Messages) != 7 {
+		t.Fatalf("expected 7 messages, got %d", len(req.Messages))
+	}
+
+	// First assistant (index 1): thinking should be stripped, only text remains
+	firstAssistant := req.Messages[1]
+	if len(firstAssistant.Content) != 1 {
+		t.Errorf("first assistant: expected 1 content block, got %d", len(firstAssistant.Content))
+	}
+	if firstAssistant.Content[0].Type != "text" {
+		t.Errorf("first assistant content[0]: expected text, got %s", firstAssistant.Content[0].Type)
+	}
+
+	// Second assistant (index 3): thinking + redacted_thinking stripped, only text remains
+	secondAssistant := req.Messages[3]
+	if len(secondAssistant.Content) != 1 {
+		t.Errorf("second assistant: expected 1 content block, got %d", len(secondAssistant.Content))
+	}
+
+	// Last assistant (index 5): thinking preserved
+	lastAssistant := req.Messages[5]
+	if len(lastAssistant.Content) != 3 {
+		t.Errorf("last assistant: expected 3 content blocks, got %d", len(lastAssistant.Content))
+	}
+	if lastAssistant.Content[0].Type != "thinking" {
+		t.Errorf("last assistant content[0]: expected thinking, got %s", lastAssistant.Content[0].Type)
+	}
+	if lastAssistant.Content[0].Signature != "valid-sig" {
+		t.Errorf("last assistant thinking signature not preserved")
+	}
+}
+
 func TestFromLLMRequest(t *testing.T) {
 	s := &Service{
 		Model:     Claude45Sonnet,
@@ -1222,63 +1291,9 @@ func TestToLLMContentWithNestedToolResults(t *testing.T) {
 	}
 }
 
-func TestSanitizeJSONControlChars(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"no control chars", `{"text":"hello"}`, `{"text":"hello"}`},
-		{"form feed in string", "{\"text\":\"hello\fworld\"}", `{"text":"hello\u000cworld"}`},
-		{"multiple control chars", "{\"t\":\"a\x01b\x02c\"}", `{"t":"a\u0001b\u0002c"}`},
-		{"control char outside string", "{\n\"t\":\"v\"}", "{\n\"t\":\"v\"}"},
-		{"escaped quote in string", `{"t":"say \"hi\""}`, `{"t":"say \"hi\""}`},
-		{"escaped backslash then quote", `{"t":"a\\"}`, `{"t":"a\\"}`},
-		{"tab escaped", "{\"t\":\"a\tb\"}", `{"t":"a\u0009b"}`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := string(sanitizeJSONControlChars([]byte(tt.input)))
-			if got != tt.want {
-				t.Errorf("sanitizeJSONControlChars() = %q, want %q", got, tt.want)
-			}
-			// Verify the result is valid JSON
-			var v any
-			if err := json.Unmarshal([]byte(got), &v); err != nil {
-				t.Errorf("result is not valid JSON: %v", err)
-			}
-		})
-	}
-}
-
-func TestParseSSEStreamFormFeedInText(t *testing.T) {
-	// Simulate Anthropic sending a raw form feed (\f) in a text delta.
-	// This is invalid JSON but happens in practice.
-	var b strings.Builder
-	b.WriteString("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ff\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n")
-	b.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
-	// Raw \f inside the text delta value
-	b.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\fworld\"}}\n\n")
-	b.WriteString("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
-	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n")
-	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-
-	resp, err := parseSSEStream(strings.NewReader(b.String()))
-	if err != nil {
-		t.Fatalf("parseSSEStream() error = %v", err)
-	}
-	if len(resp.Content) != 1 {
-		t.Fatalf("Content length = %d, want 1", len(resp.Content))
-	}
-	want := "hello\fworld"
-	if resp.Content[0].Text == nil || *resp.Content[0].Text != want {
-		t.Errorf("Content[0].Text = %v, want %q", resp.Content[0].Text, want)
-	}
-}
-
 func TestParseSSEStreamText(t *testing.T) {
 	stream := mockSSEResponse("msg_abc", Claude45Sonnet, "Hello!", 10, 5)
-	resp, err := parseSSEStream(strings.NewReader(stream))
+	resp, err := parseSSEStream(strings.NewReader(stream), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1319,7 +1334,7 @@ func TestParseSSEStreamMultipleDeltas(t *testing.T) {
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
-	resp, err := parseSSEStream(strings.NewReader(b.String()))
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1346,7 +1361,7 @@ func TestParseSSEStreamToolUse(t *testing.T) {
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":25}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
-	resp, err := parseSSEStream(strings.NewReader(b.String()))
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1397,7 +1412,7 @@ func TestParseSSEStreamToolUseEmptyInput(t *testing.T) {
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":10}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
-	resp, err := parseSSEStream(strings.NewReader(b.String()))
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1435,7 +1450,7 @@ func TestParseSSEStreamThinking(t *testing.T) {
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
-	resp, err := parseSSEStream(strings.NewReader(b.String()))
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1470,7 +1485,7 @@ func TestParseSSEStreamPing(t *testing.T) {
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
-	resp, err := parseSSEStream(strings.NewReader(b.String()))
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1481,7 +1496,7 @@ func TestParseSSEStreamPing(t *testing.T) {
 
 func TestParseSSEStreamNoMessageStart(t *testing.T) {
 	stream := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
-	_, err := parseSSEStream(strings.NewReader(stream))
+	_, err := parseSSEStream(strings.NewReader(stream), nil)
 	if err == nil {
 		t.Fatal("expected error for missing message_start")
 	}
@@ -1497,7 +1512,7 @@ func TestParseSSEStreamIncomplete(t *testing.T) {
 	b.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n")
 	b.WriteString("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 
-	_, err := parseSSEStream(strings.NewReader(b.String()))
+	_, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err == nil {
 		t.Fatal("expected error for incomplete stream (no message_stop)")
 	}
@@ -1511,13 +1526,94 @@ func TestParseSSEStreamError(t *testing.T) {
 	b.WriteString("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n")
 	b.WriteString(`event: error` + "\n" + `data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` + "\n\n")
 
-	_, err := parseSSEStream(strings.NewReader(b.String()))
+	_, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err == nil {
 		t.Fatal("expected error for stream error event")
 	}
 	if !strings.Contains(err.Error(), "stream error event") {
 		t.Errorf("error = %q, want to contain %q", err.Error(), "stream error event")
 	}
+}
+
+func TestDoRetriesOnInvalidThinkingSignature(t *testing.T) {
+	// When the API returns "Invalid `signature` in `thinking` block",
+	// Do should retry with all thinking blocks stripped.
+	invalidSigResponse := `{"type":"error","error":{"type":"invalid_request_error","message":"messages.11.content.0: Invalid ` + "`" + `signature` + "`" + ` in ` + "`" + `thinking` + "`" + ` block"}}`
+	successResponse := mockSSEResponse("msg_retry", Claude46Opus, "It works!", 100, 50)
+
+	callCount := 0
+	transport := &roundTripFunc{fn: func(req *http.Request) (*http.Response, error) {
+		callCount++
+		if callCount == 1 {
+			// First call: return invalid signature error
+			return &http.Response{
+				StatusCode: 400,
+				Body:       io.NopCloser(strings.NewReader(invalidSigResponse)),
+				Header:     http.Header{"Content-Type": {"application/json"}},
+			}, nil
+		}
+		// Second call: check that thinking content blocks were stripped, return success.
+		// The request-level "thinking" config (budget_tokens) is fine; we check for
+		// signature which only appears in thinking content blocks.
+		body, _ := io.ReadAll(req.Body)
+		if strings.Contains(string(body), `"signature"`) {
+			t.Errorf("retry request still contains thinking signature")
+		}
+		if strings.Contains(string(body), `"old thinking"`) {
+			t.Errorf("retry request still contains thinking text")
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(successResponse)),
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		}, nil
+	}}
+
+	s := &Service{
+		APIKey:        "test-key",
+		Model:         Claude46Opus,
+		ThinkingLevel: llm.ThinkingLevelMedium,
+		HTTPC:         &http.Client{Transport: transport},
+		Backoff:       []time.Duration{time.Millisecond}, // fast backoff for tests
+	}
+
+	req := &llm.Request{
+		Messages: []llm.Message{
+			{Role: llm.MessageRoleUser, Content: []llm.Content{
+				{Type: llm.ContentTypeText, Text: "What is 2+2?"},
+			}},
+			{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+				{Type: llm.ContentTypeThinking, Thinking: "old thinking", Signature: "bad-sig"},
+				{Type: llm.ContentTypeText, Text: "4"},
+			}},
+			{Role: llm.MessageRoleUser, Content: []llm.Content{
+				{Type: llm.ContentTypeText, Text: "And 3+3?"},
+			}},
+		},
+	}
+
+	resp, err := s.Do(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Do() error = %v, want nil", err)
+	}
+	if resp == nil {
+		t.Fatal("Do() response = nil")
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls, got %d", callCount)
+	}
+	if resp.Content[0].Text != "It works!" {
+		t.Errorf("unexpected response text: %q", resp.Content[0].Text)
+	}
+}
+
+// roundTripFunc implements http.RoundTripper using a function.
+type roundTripFunc struct {
+	fn func(*http.Request) (*http.Response, error)
+}
+
+func (f *roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f.fn(req)
 }
 
 func TestDoClientError(t *testing.T) {
@@ -1768,7 +1864,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 event: message_stop
 data: {"type":"message_stop"}
 `
-	resp, err := parseSSEStream(strings.NewReader(recorded))
+	resp, err := parseSSEStream(strings.NewReader(recorded), nil)
 	if err != nil {
 		t.Fatalf("parseSSEStream() error = %v", err)
 	}
@@ -1797,7 +1893,7 @@ func TestParseSSEStreamConnectionReset(t *testing.T) {
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n"
 
 	r := &errorAfterReader{data: []byte(partial), err: fmt.Errorf("connection reset by peer")}
-	_, err := parseSSEStream(r)
+	_, err := parseSSEStream(r, nil)
 	if err == nil {
 		t.Fatal("expected error for connection reset")
 	}
@@ -1839,7 +1935,7 @@ func mockTruncatedSSEResponse(id, model, text string, inputTokens uint64) string
 func TestParseSSEStreamTruncated(t *testing.T) {
 	// A stream that cuts off before message_delta (no stop_reason) should be an error.
 	stream := mockTruncatedSSEResponse("msg_trunc", Claude45Sonnet, "partial response", 100)
-	_, err := parseSSEStream(strings.NewReader(stream))
+	_, err := parseSSEStream(strings.NewReader(stream), nil)
 	if err == nil {
 		t.Fatal("expected error for truncated stream, got nil")
 	}
@@ -1856,7 +1952,7 @@ func TestParseSSEStreamTruncatedMidContentBlock(t *testing.T) {
 	b.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n")
 	// Cut off here — no content_block_stop, no message_delta, no message_stop
 
-	_, err := parseSSEStream(strings.NewReader(b.String()))
+	_, err := parseSSEStream(strings.NewReader(b.String()), nil)
 	if err == nil {
 		t.Fatal("expected error for truncated stream, got nil")
 	}
@@ -2009,5 +2105,134 @@ func TestDoFailsAfterMaxRetriesOnTruncatedStream(t *testing.T) {
 	// Should have made 11 attempts (0-10, then fails at attempts > 10)
 	if transport.calls != 11 {
 		t.Errorf("expected 11 attempts, got %d", transport.calls)
+	}
+}
+
+func TestParseSSEStreamMultiLineData(t *testing.T) {
+	// SSE spec allows multiple "data:" lines which should be joined with "\n".
+	// This tests that our parser correctly handles this case.
+	var b strings.Builder
+	// Use multi-line data format for message_start
+	b.WriteString("event: message_start\n")
+	b.WriteString("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_multi\",\n")
+	b.WriteString("data: \"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\n")
+	b.WriteString("data: \"content\":[],\"stop_reason\":null,\n")
+	b.WriteString("data: \"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n")
+	b.WriteString("\n") // blank line dispatches event
+
+	b.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+	b.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n")
+	b.WriteString("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n")
+	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
+	if err != nil {
+		t.Fatalf("parseSSEStream() error = %v", err)
+	}
+	if resp.ID != "msg_multi" {
+		t.Errorf("resp.ID = %q, want %q", resp.ID, "msg_multi")
+	}
+	if len(resp.Content) != 1 || *resp.Content[0].Text != "hello" {
+		t.Errorf("unexpected content: %+v", resp.Content)
+	}
+}
+
+func TestParseSSEStreamErrorIncludesData(t *testing.T) {
+	// When JSON parsing fails, the error should include the raw data for debugging.
+	var b strings.Builder
+	b.WriteString("event: message_start\n")
+	b.WriteString("data: {\"type\": \"message_start\" \"broken json}\n")
+	b.WriteString("\n")
+
+	_, err := parseSSEStream(strings.NewReader(b.String()), nil)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+	// Error should contain the event type and the raw data
+	if !strings.Contains(err.Error(), "message_start") {
+		t.Errorf("error should contain event type, got: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "broken json") {
+		t.Errorf("error should contain raw data, got: %q", err.Error())
+	}
+}
+
+func TestParseSSEStreamTruncatedJSON(t *testing.T) {
+	// Simulate what happens when the connection drops mid-JSON (the actual bug we're debugging).
+	// The data line contains incomplete JSON that would cause "unexpected end of JSON input".
+	var b strings.Builder
+	b.WriteString("event: content_block_delta\n")
+	b.WriteString("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_del\n")
+	b.WriteString("\n")
+
+	_, err := parseSSEStream(strings.NewReader(b.String()), nil)
+	if err == nil {
+		t.Fatal("expected error for truncated JSON")
+	}
+	// Should include the event type for context
+	if !strings.Contains(err.Error(), "content_block_delta") {
+		t.Errorf("error should contain event type, got: %q", err.Error())
+	}
+	// Should include the truncated data
+	if !strings.Contains(err.Error(), "text_del") {
+		t.Errorf("error should contain the truncated data, got: %q", err.Error())
+	}
+}
+
+func TestIterSSEEventsComments(t *testing.T) {
+	// Comments (lines starting with ':') should be ignored.
+	stream := ": this is a comment\nevent: ping\ndata: {}\n\n"
+	var events []sseEvent
+	err := iterSSEEvents(strings.NewReader(stream), func(ev sseEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterSSEEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if events[0].EventType != "ping" {
+		t.Errorf("event type = %q, want %q", events[0].EventType, "ping")
+	}
+}
+
+func TestIterSSEEventsNoTrailingNewline(t *testing.T) {
+	// Stream that ends without a trailing blank line should still dispatch.
+	stream := "event: ping\ndata: {}"
+	var events []sseEvent
+	err := iterSSEEvents(strings.NewReader(stream), func(ev sseEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterSSEEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+}
+
+func TestParseSSEStreamInvalidCharInJSON(t *testing.T) {
+	// Simulate the "invalid character '\"' after object key:value pair" error
+	// mentioned in the bug report. This can happen when JSON is split across
+	// what the old parser thought were separate lines.
+	var b strings.Builder
+	b.WriteString("event: message_start\n")
+	b.WriteString(`data: {"type":"message_start","message":{"id":"msg_ok","type":"message","role":"assistant","model":"test","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n")
+	b.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+	b.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
+	b.WriteString("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n")
+	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+	resp, err := parseSSEStream(strings.NewReader(b.String()), nil)
+	if err != nil {
+		t.Fatalf("parseSSEStream() error = %v", err)
+	}
+	if resp.ID != "msg_ok" {
+		t.Errorf("resp.ID = %q, want %q", resp.ID, "msg_ok")
 	}
 }

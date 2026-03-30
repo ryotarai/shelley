@@ -15,12 +15,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"shelley.exe.dev/claudetool/browse"
+	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/gitstate"
 	"shelley.exe.dev/llm"
@@ -29,6 +31,19 @@ import (
 	"shelley.exe.dev/ui"
 	"shelley.exe.dev/version"
 )
+
+// detectCLIAgents checks which CLI agent binaries are available in PATH.
+// Returns a list of agent identifiers (e.g., "claude-cli", "codex-cli").
+func detectCLIAgents() []string {
+	var agents []string
+	if _, err := exec.LookPath("claude"); err == nil {
+		agents = append(agents, "claude-cli")
+	}
+	if _, err := exec.LookPath("codex"); err == nil {
+		agents = append(agents, "codex-cli")
+	}
+	return agents
+}
 
 // handleRead serves files from limited allowed locations via /api/read?path=
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +137,15 @@ func (s *Server) handleWriteFile(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// userAgentsMdPath returns the path to ~/.config/shelley/AGENTS.md
+func userAgentsMdPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "shelley", "AGENTS.md"), nil
+}
+
 // handleUpload handles file uploads via POST /api/upload
 // Files are saved to the ScreenshotDir with a random filename
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +215,10 @@ func isConversationSlugPath(path string) bool {
 	return strings.HasPrefix(path, "/c/")
 }
 
+func isSPARoute(path string) bool {
+	return path == "/inbox"
+}
+
 // acceptsGzip reports whether r accepts gzip encoding.
 func acceptsGzip(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
@@ -231,7 +259,7 @@ func (s *Server) staticHandler(fsys http.FileSystem) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Inject initialization data into index.html
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" || isConversationSlugPath(r.URL.Path) {
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" || isConversationSlugPath(r.URL.Path) || isSPARoute(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 			w.Header().Set("Pragma", "no-cache")
 			w.Header().Set("Expires", "0")
@@ -407,13 +435,21 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 	// Get home directory for tilde display
 	homeDir, _ := os.UserHomeDir()
 
+	userAgentsMdPath, _ := userAgentsMdPath()
+	userAgentsMdContent := ""
+	if b, err := os.ReadFile(userAgentsMdPath); err == nil {
+		userAgentsMdContent = string(b)
+	}
+
 	initData := map[string]interface{}{
-		"models":        modelList,
-		"default_model": defaultModel,
-		"hostname":      hostname,
-		"default_cwd":   defaultCwd,
-		"home_dir":      homeDir,
-		"base_path":     s.basePath,
+		"models":                 modelList,
+		"default_model":          defaultModel,
+		"hostname":               hostname,
+		"default_cwd":            defaultCwd,
+		"home_dir":               homeDir,
+		"base_path":              s.basePath,
+		"user_agents_md_path":    userAgentsMdPath,
+		"user_agents_md_content": userAgentsMdContent,
 	}
 	if s.terminalURL != "" {
 		initData["terminal_url"] = s.terminalURL
@@ -424,6 +460,7 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 
 	// Inject notification channel type metadata for the settings modal
 	initData["notification_channel_types"] = s.getNotificationChannelTypes()
+	initData["cli_agents"] = detectCLIAgents()
 
 	initJSON, err := json.Marshal(initData)
 	if err != nil {
@@ -432,7 +469,13 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 	}
 
 	// Generate favicon as data URI
-	faviconSVG := generateFaviconSVG(hostname)
+	// Include the listening port in the hash so demo servers on different ports
+	// get visually distinct favicons.
+	faviconKey := hostname
+	if s.listenPort != 0 {
+		faviconKey = fmt.Sprintf("%s:%d", hostname, s.listenPort)
+	}
+	faviconSVG := generateFaviconSVG(faviconKey)
 	faviconDataURI := "data:image/svg+xml," + url.PathEscape(faviconSVG)
 	faviconLink := fmt.Sprintf(`<link rel="icon" type="image/svg+xml" href="%s"/>`, faviconDataURI)
 
@@ -587,6 +630,9 @@ func (s *Server) conversationMux() *http.ServeMux {
 	mux.HandleFunc("GET /{id}/subagents", func(w http.ResponseWriter, r *http.Request) {
 		s.handleGetSubagents(w, r, r.PathValue("id"))
 	})
+	mux.HandleFunc("POST /{id}/cancel-queued", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCancelQueued(w, r, r.PathValue("id"))
+	})
 	return mux
 }
 
@@ -633,9 +679,11 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request, c
 
 // ChatRequest represents a chat message from the user
 type ChatRequest struct {
-	Message string `json:"message"`
-	Model   string `json:"model,omitempty"`
-	Cwd     string `json:"cwd,omitempty"`
+	Message             string                  `json:"message"`
+	Model               string                  `json:"model,omitempty"`
+	Cwd                 string                  `json:"cwd,omitempty"`
+	ConversationOptions *db.ConversationOptions `json:"conversation_options,omitempty"`
+	Queue               bool                    `json:"queue,omitempty"`
 }
 
 // handleChatConversation handles POST /conversation/<id>/chat
@@ -694,6 +742,19 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 		},
 	}
 
+	// Queue mode: record the message to DB but don't interrupt the agent.
+	// The message will be sent when the agent finishes its current turn.
+	if req.Queue {
+		if err := manager.QueueMessage(ctx, s, modelID, userMessage); err != nil {
+			s.logger.Error("Failed to queue user message", "conversationID", conversationID, "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
+		return
+	}
+
 	firstMessage, err := manager.AcceptUserMessage(ctx, llmService, modelID, userMessage)
 	if errors.Is(err, errConversationModelMismatch) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -747,8 +808,7 @@ func (s *Server) handleNewConversation(w http.ResponseWriter, r *http.Request) {
 	// Get LLM service for the requested model
 	modelID := req.Model
 	if modelID == "" {
-		// Default to GPT-OSS 20B on Fireworks
-		modelID = "gpt-oss-20b-fireworks"
+		modelID = s.defaultModel
 	}
 
 	llmService, err := s.llmManager.GetService(modelID)
@@ -763,7 +823,20 @@ func (s *Server) handleNewConversation(w http.ResponseWriter, r *http.Request) {
 	if req.Cwd != "" {
 		cwdPtr = &req.Cwd
 	}
-	conversation, err := s.db.CreateConversation(ctx, nil, true, cwdPtr, &modelID)
+	var convOpts db.ConversationOptions
+	if req.ConversationOptions != nil {
+		convOpts = *req.ConversationOptions
+		if convOpts.Type != "" && convOpts.Type != "normal" && convOpts.Type != "orchestrator" {
+			http.Error(w, fmt.Sprintf("Invalid conversation options type: %s", convOpts.Type), http.StatusBadRequest)
+			return
+		}
+		if convOpts.SubagentBackend != "" && convOpts.SubagentBackend != "shelley" && convOpts.SubagentBackend != "claude-cli" && convOpts.SubagentBackend != "codex-cli" {
+			http.Error(w, fmt.Sprintf("Invalid subagent_backend: %s; must be one of: shelley, claude-cli, codex-cli", convOpts.SubagentBackend), http.StatusBadRequest)
+			return
+		}
+	}
+
+	conversation, err := s.db.CreateConversation(ctx, nil, true, cwdPtr, &modelID, convOpts)
 	if err != nil {
 		s.logger.Error("Failed to create conversation", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -1099,6 +1172,61 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.getModelList())
 }
 
+// handleConversationPreviews handles GET /api/conversations/previews
+// Returns a map of conversation_id -> last agent message text preview
+func (s *Server) handleConversationPreviews(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := r.Context()
+
+	var messages []generated.Message
+	err := s.db.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		messages, err = q.GetLatestAgentMessagesForConversations(ctx)
+		return err
+	})
+	if err != nil {
+		s.logger.Error("Failed to get conversation previews", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Extract text content from each agent message
+	type Preview struct {
+		Text      string `json:"text"`
+		UpdatedAt string `json:"updated_at"`
+	}
+	result := make(map[string]Preview, len(messages))
+	for _, msg := range messages {
+		if msg.LlmData == nil {
+			continue
+		}
+		var llmMsg llm.Message
+		if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
+			continue
+		}
+		// Use the last text block — in agent messages with tool calls,
+		// the final text block is typically the summary/conclusion.
+		var text string
+		for _, c := range llmMsg.Content {
+			if c.Type == llm.ContentTypeText && c.Text != "" {
+				text = c.Text
+			}
+		}
+		if text != "" {
+			result[msg.ConversationID] = Preview{
+				Text:      text,
+				UpdatedAt: msg.CreatedAt.UTC().Format(time.RFC3339),
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
 // handleArchivedConversations handles GET /api/conversations/archived
 func (s *Server) handleArchivedConversations(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -1422,6 +1550,24 @@ func (s *Server) handleSetSetting(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to set setting: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleCancelQueued handles POST /conversation/<id>/cancel-queued
+// Cancels all pending queued messages for a conversation.
+func (s *Server) handleCancelQueued(w http.ResponseWriter, r *http.Request, conversationID string) {
+	s.mu.Lock()
+	manager, ok := s.activeConversations[conversationID]
+	s.mu.Unlock()
+
+	if !ok {
+		http.Error(w, "Conversation not found", http.StatusNotFound)
+		return
+	}
+
+	manager.CancelQueuedMessages(r.Context(), s)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

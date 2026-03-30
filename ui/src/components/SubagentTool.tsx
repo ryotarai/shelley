@@ -11,7 +11,7 @@ interface SubagentToolProps {
   toolResult?: LLMContent[];
   hasError?: boolean;
   executionTime?: string;
-  displayData?: { slug?: string; conversation_id?: string };
+  displayData?: { slug?: string; conversation_id?: string; cli_agent?: string; status?: string };
 }
 
 function SubagentTool({
@@ -27,13 +27,25 @@ function SubagentTool({
   // Extract fields from toolInput
   const input =
     typeof toolInput === "object" && toolInput !== null
-      ? (toolInput as { slug?: string; prompt?: string; timeout_seconds?: number; wait?: boolean })
+      ? (toolInput as {
+          slug?: string;
+          prompt?: string;
+          model?: string;
+          timeout_seconds?: number;
+          wait?: boolean;
+        })
       : {};
 
   const slug = input.slug || displayData?.slug || "subagent";
   const prompt = input.prompt || "";
+  const model = input.model || "";
   const wait = input.wait !== false;
   const timeout = input.timeout_seconds || 60;
+
+  // Detect CLI agent backend from display data
+  const cliAgent = displayData?.cli_agent; // "claude-cli" or "codex-cli"
+  const cliAgentLabel =
+    cliAgent === "claude-cli" ? "Claude CLI" : cliAgent === "codex-cli" ? "Codex CLI" : null;
 
   // Extract result text
   const resultText =
@@ -59,10 +71,12 @@ function SubagentTool({
         <div className="tool-summary">
           <span className={`tool-emoji ${isRunning ? "running" : ""}`}>⚡</span>
           <span className="tool-name">subagent</span>
+          {cliAgentLabel && <span className="tool-badge cli-agent-badge">{cliAgentLabel}</span>}
           {isComplete && hasError && <span className="tool-error">✗</span>}
           {isComplete && !hasError && <span className="tool-success">✓</span>}
-          <span className="tool-command">
-            Subagent '{slug}' {isRunning ? (wait ? "running..." : "started") : ""}
+          <span className="tool-command" title={prompt}>
+            Subagent '{slug}'{model ? ` (${model})` : ""}{" "}
+            {isRunning ? (wait ? "running..." : "started") : ""}
             {displayPrompt && !isRunning && ` ${displayPrompt}`}
           </span>
         </div>
@@ -77,10 +91,7 @@ function SubagentTool({
             viewBox="0 0 12 12"
             fill="none"
             xmlns="http://www.w3.org/2000/svg"
-            style={{
-              transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-              transition: "transform 0.2s",
-            }}
+            className={`tool-chevron${isExpanded ? " tool-chevron-expanded" : ""}`}
           >
             <path
               d="M4.5 3L7.5 6L4.5 9"
@@ -98,6 +109,7 @@ function SubagentTool({
           <div className="tool-section">
             <div className="tool-label">
               Prompt to '{slug}':
+              {model && <span className="tool-badge subagent-model-badge">{model}</span>}
               {!wait && <span className="tool-badge">fire-and-forget</span>}
               {timeout !== 60 && <span className="tool-badge">timeout: {timeout}s</span>}
             </div>
@@ -128,7 +140,7 @@ function SubagentTool({
                     window.history.pushState({}, "", withBasePath(`/c/${slug}`));
                     window.dispatchEvent(new PopStateEvent("popstate"));
                   }}
-                  style={{ color: "var(--link-color)", textDecoration: "underline" }}
+                  className="subagent-link"
                 >
                   View subagent conversation →
                 </a>

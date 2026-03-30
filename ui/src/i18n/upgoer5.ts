@@ -198,16 +198,21 @@ export const upgoer5: TranslationKeys = {
   dirLabel: "Place:",
 
   // Sidebar buttons
+  editUserAgentsMd: "Change your helper words file",
+
   openConversations: "Open talks",
   expandSidebar: "Make side bigger",
 
   // Language
   language: "Words",
   switchLanguage: "Change words",
+  reportBug: "Tell us something is broken",
   english: "English",
   japanese: "日本語",
   french: "Français",
   russian: "Русский",
   spanish: "Español",
   upgoerFive: "Up-Goer Five",
+  simplifiedChinese: "简体中文",
+  traditionalChinese: "繁體中文",
 };

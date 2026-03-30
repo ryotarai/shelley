@@ -4,9 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 	"testing"
 
 	"shelley.exe.dev/claudetool"
+	"shelley.exe.dev/db"
+	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/llm"
 )
 
@@ -499,7 +502,7 @@ func TestGetAvailableModelsUnion(t *testing.T) {
 	models := manager.GetAvailableModels()
 
 	// Should have anthropic models and fireworks models, plus predictable
-	expectedModels := []string{"claude-opus-4.6", "claude-opus-4.5", "claude-sonnet-4.6", "gpt-oss-20b-fireworks", "glm-4p6-fireworks", "claude-sonnet-4.5", "claude-haiku-4.5", "predictable"}
+	expectedModels := []string{"claude-opus-4.6", "claude-opus-4.5", "claude-sonnet-4.6", "gpt-oss-20b-fireworks", "claude-sonnet-4.5", "claude-haiku-4.5", "predictable"}
 	for _, expected := range expectedModels {
 		found := false
 		for _, m := range models {
@@ -512,6 +515,64 @@ func TestGetAvailableModelsUnion(t *testing.T) {
 			t.Errorf("Expected model %q not found in available models: %v", expected, models)
 		}
 	}
+}
+
+func TestRefreshCustomModelsConcurrent(t *testing.T) {
+	testDB, err := db.New(db.Config{DSN: t.TempDir() + "/test.db"})
+	if err != nil {
+		t.Fatalf("failed to create test db: %v", err)
+	}
+	defer testDB.Close()
+	if err := testDB.Migrate(context.Background()); err != nil {
+		t.Fatalf("failed to migrate test db: %v", err)
+	}
+	// Insert a custom model so RefreshCustomModels reaches the lock.
+	_, err = testDB.CreateModel(context.Background(), generated.CreateModelParams{
+		ModelID:      "custom-test-model",
+		DisplayName:  "Test Model",
+		ProviderType: "openai",
+		Endpoint:     "https://api.example.com/v1",
+		ApiKey:       "test-key",
+		ModelName:    "test-model",
+		MaxTokens:    4096,
+	})
+	if err != nil {
+		t.Fatalf("failed to create test model: %v", err)
+	}
+
+	cfg := &Config{DB: testDB}
+	manager, err := NewManager(cfg)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const N = 10
+
+	// Readers
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				manager.GetAvailableModels()
+				manager.HasModel("custom-test-model")
+				manager.GetModelInfo("custom-test-model")
+				manager.GetService("custom-test-model")
+			}
+		}()
+	}
+
+	// Writer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 100; j++ {
+			manager.RefreshCustomModels()
+		}
+	}()
+
+	wg.Wait()
 }
 
 func TestPreferredToolModelsAreRegistered(t *testing.T) {

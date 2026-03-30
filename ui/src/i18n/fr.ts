@@ -200,16 +200,21 @@ export const fr: TranslationKeys = {
   dirLabel: "Rép. :",
 
   // Sidebar buttons
+  editUserAgentsMd: "Modifier AGENTS.md utilisateur",
+
   openConversations: "Ouvrir les conversations",
   expandSidebar: "Développer la barre latérale",
 
   // Language
   language: "Langue",
   switchLanguage: "Changer de langue",
+  reportBug: "Signaler un bug",
   english: "English",
   japanese: "日本語",
   french: "Français",
   russian: "Русский",
   spanish: "Español",
   upgoerFive: "Up-Goer Five",
+  simplifiedChinese: "简体中文",
+  traditionalChinese: "繁體中文",
 };

@@ -198,16 +198,21 @@ export const en: TranslationKeys = {
   dirLabel: "Dir:",
 
   // Sidebar buttons
+  editUserAgentsMd: "Edit User AGENTS.md",
+
   openConversations: "Open conversations",
   expandSidebar: "Expand sidebar",
 
   // Language
   language: "Language",
   switchLanguage: "Switch language",
+  reportBug: "Report a Bug",
   english: "English",
   japanese: "日本語",
   french: "Français",
   russian: "Русский",
   spanish: "Español",
   upgoerFive: "Up-Goer Five",
+  simplifiedChinese: "简体中文",
+  traditionalChinese: "繁體中文",
 };

@@ -234,21 +234,47 @@ func WithTxRes[T any](db *DB, ctx context.Context, fn func(*generated.Queries) (
 
 // Conversation methods (moved from ConversationService)
 
+// ConversationOptions holds extensible conversation settings stored as JSON.
+type ConversationOptions struct {
+	Type            string `json:"type,omitempty"`             // "normal" (default) or "orchestrator"
+	SubagentBackend string `json:"subagent_backend,omitempty"` // "shelley" (default), "claude-cli", "codex-cli"
+}
+
+// IsOrchestrator returns true if the conversation is in orchestrator mode.
+func (o ConversationOptions) IsOrchestrator() bool {
+	return o.Type == "orchestrator"
+}
+
+// ParseConversationOptions parses a JSON string into ConversationOptions.
+// Returns zero-value options (type=normal) for empty or invalid input.
+func ParseConversationOptions(s string) ConversationOptions {
+	var opts ConversationOptions
+	if s != "" {
+		_ = json.Unmarshal([]byte(s), &opts)
+	}
+	return opts
+}
+
 // CreateConversation creates a new conversation with an optional slug
-func (db *DB) CreateConversation(ctx context.Context, slug *string, userInitiated bool, cwd, model *string) (*generated.Conversation, error) {
+func (db *DB) CreateConversation(ctx context.Context, slug *string, userInitiated bool, cwd, model *string, opts ConversationOptions) (*generated.Conversation, error) {
 	conversationID, err := generateConversationID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate conversation ID: %w", err)
+	}
+	optsJSON, err := json.Marshal(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal conversation options: %w", err)
 	}
 	var conversation generated.Conversation
 	err = db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
 		q := generated.New(tx.Conn())
 		conversation, err = q.CreateConversation(ctx, generated.CreateConversationParams{
-			ConversationID: conversationID,
-			Slug:           slug,
-			UserInitiated:  userInitiated,
-			Cwd:            cwd,
-			Model:          model,
+			ConversationID:      conversationID,
+			Slug:                slug,
+			UserInitiated:       userInitiated,
+			Cwd:                 cwd,
+			Model:               model,
+			ConversationOptions: string(optsJSON),
 		})
 		return err
 	})
@@ -344,6 +370,21 @@ func (db *DB) UpdateConversationSlug(ctx context.Context, conversationID, slug s
 		var err error
 		conversation, err = q.UpdateConversationSlug(ctx, generated.UpdateConversationSlugParams{
 			Slug:           &slug,
+			ConversationID: conversationID,
+		})
+		return err
+	})
+	return &conversation, err
+}
+
+// ClearConversationSlug removes the slug from a conversation.
+func (db *DB) ClearConversationSlug(ctx context.Context, conversationID string) (*generated.Conversation, error) {
+	var conversation generated.Conversation
+	err := db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		var err error
+		conversation, err = q.UpdateConversationSlug(ctx, generated.UpdateConversationSlugParams{
+			Slug:           nil,
 			ConversationID: conversationID,
 		})
 		return err
@@ -703,6 +744,56 @@ func (db *DB) GetSubagentCounts(ctx context.Context) (map[string]int64, error) {
 		}
 	}
 	return counts, nil
+}
+
+// UpdateConversationParent sets the parent_conversation_id for a conversation
+func (db *DB) UpdateConversationParent(ctx context.Context, conversationID, parentID string) (*generated.Conversation, error) {
+	var conversation generated.Conversation
+	err := db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		var err error
+		conversation, err = q.UpdateConversationParent(ctx, generated.UpdateConversationParentParams{
+			ParentConversationID: &parentID,
+			ConversationID:       conversationID,
+		})
+		return err
+	})
+	return &conversation, err
+}
+
+// DistillReplaceSwap atomically renames the source conversation's slug, assigns the
+// original slug to the new conversation, sets the source as a child of the new
+// conversation, and archives the source. All within a single transaction.
+func (db *DB) DistillReplaceSwap(ctx context.Context, sourceConvID, newConvID, newSourceSlug, originalSlug string) error {
+	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		// 1. Rename source slug
+		if _, err := q.UpdateConversationSlug(ctx, generated.UpdateConversationSlugParams{
+			Slug:           &newSourceSlug,
+			ConversationID: sourceConvID,
+		}); err != nil {
+			return fmt.Errorf("rename source slug: %w", err)
+		}
+		// 2. Assign original slug to new conversation
+		if _, err := q.UpdateConversationSlug(ctx, generated.UpdateConversationSlugParams{
+			Slug:           &originalSlug,
+			ConversationID: newConvID,
+		}); err != nil {
+			return fmt.Errorf("assign original slug to new conv: %w", err)
+		}
+		// 3. Set source as child of new conversation
+		if _, err := q.UpdateConversationParent(ctx, generated.UpdateConversationParentParams{
+			ParentConversationID: &newConvID,
+			ConversationID:       sourceConvID,
+		}); err != nil {
+			return fmt.Errorf("set parent: %w", err)
+		}
+		// 4. Archive source
+		if _, err := q.ArchiveConversation(ctx, sourceConvID); err != nil {
+			return fmt.Errorf("archive source: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetSubagents retrieves all subagent conversations for a parent conversation
