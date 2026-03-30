@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import type * as Monaco from "monaco-editor";
 import { loadMonaco } from "../services/monaco";
 import { isDarkModeActive } from "../services/theme";
+import { withBasePath } from "../services/paths";
 
 interface AgentsMdEditorModalProps {
   isOpen: boolean;
@@ -54,7 +55,7 @@ export default function AgentsMdEditorModal({ isOpen, onClose }: AgentsMdEditorM
       }
       try {
         setSaveStatus("saving");
-        const response = await fetch("/api/write-file", {
+        const response = await fetch(withBasePath("/api/write-file"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: filePath, content: text }),
