@@ -77,7 +77,7 @@ function ScreenshotTool({
       "id" in displayData && typeof displayData.id === "string" ? displayData.id : undefined;
 
     imageUrl =
-      url ||
+      (url ? withBasePath(url) : undefined) ||
       (path
         ? withBasePath(`/api/read?path=${encodeURIComponent(path)}`)
         : id

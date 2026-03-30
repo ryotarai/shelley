@@ -7,6 +7,11 @@ function normalizedBasePath(): string {
 }
 
 export function withBasePath(path: string): string {
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    const url = new URL(path);
+    url.pathname = withBasePath(url.pathname);
+    return url.toString();
+  }
   if (!path.startsWith("/")) {
     throw new Error(`Path must start with '/': ${path}`);
   }
