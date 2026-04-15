@@ -113,6 +113,15 @@ func (l *Loop) GetUsage() llm.Usage {
 	return l.totalUsage
 }
 
+// SetLLMService replaces the LLM service used by this loop.
+// This is safe to call while the loop is running; the next LLM request
+// will pick up the new service (processLLMRequest reads l.llm under l.mu).
+func (l *Loop) SetLLMService(service llm.Service) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.llm = service
+}
+
 // GetHistory returns a copy of the current conversation history
 func (l *Loop) GetHistory() []llm.Message {
 	l.mu.Lock()
