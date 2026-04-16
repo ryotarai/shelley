@@ -712,10 +712,14 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 	cm.mu.Lock()
 	if cm.loop != nil {
 		existingModel := cm.modelID
+		loopInstance := cm.loop
 		cm.mu.Unlock()
 		if existingModel != "" && modelID != "" && existingModel != modelID {
 			return fmt.Errorf("%w: conversation already uses model %s; requested %s", errConversationModelMismatch, existingModel, modelID)
 		}
+		// Update the LLM service so the loop picks up refreshed API keys
+		// (e.g. rotated LiteLLM tokens) on its next request.
+		loopInstance.SetLLMService(service)
 		return nil
 	}
 
