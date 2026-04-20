@@ -48,7 +48,7 @@ type Model struct {
 }
 
 var (
-	DefaultModel = GPT41
+	DefaultModel = GPT54
 
 	GPT41 = Model{
 		UserName:  "gpt4.1",
@@ -299,53 +299,61 @@ var (
 // Service provides chat completions.
 // Fields should not be altered concurrently with calling any method on Service.
 type Service struct {
-	HTTPC     *http.Client // defaults to http.DefaultClient if nil
-	APIKey    string       // optional, if not set will try to load from env var
-	Model     Model        // defaults to DefaultModel if zero value
-	ModelURL  string       // optional, overrides Model.URL
-	MaxTokens int          // defaults to DefaultMaxTokens if zero
-	Org       string       // optional - organization ID
+	HTTPC     *http.Client    // defaults to http.DefaultClient if nil
+	APIKey    string          // optional, if not set will try to load from env var
+	Model     Model           // defaults to DefaultModel if zero value
+	ModelURL  string          // optional, overrides Model.URL
+	MaxTokens int             // defaults to DefaultMaxTokens if zero
+	Org       string          // optional - organization ID
+	Backoff   []time.Duration // retry backoff durations; defaults to {1s, 2s, 5s, 10s, 15s} if nil
 }
 
 var _ llm.Service = (*Service)(nil)
 
 // ModelsRegistry is a registry of all known models with their user-friendly names.
+// Declaration order is display order — keep current models at top, old models at bottom.
 var ModelsRegistry = []Model{
-	GPT41,
-	GPT41Mini,
-	GPT41Nano,
-	GPT4o,
-	GPT4oMini,
+	// Current OpenAI
+	GPT54,
 	GPT5,
 	GPT5Mini,
 	GPT5Nano,
+	O4Mini,
+	O3,
+	// Codex
 	GPT5Codex,
 	GPT52Codex,
 	GPT53Codex,
-	GPT54,
-	O3,
-	O4Mini,
+	// Gemini
 	Gemini25Flash,
 	Gemini25Pro,
+	// Together
 	TogetherDeepseekV3,
 	TogetherDeepseekR1,
 	TogetherLlama4Maverick,
-	TogetherLlama3_3_70B,
-	TogetherMistralSmall,
 	TogetherQwen3,
-	TogetherGemma2,
-	LlamaCPP,
+	TogetherMistralSmall,
+	// Fireworks / misc providers
 	FireworksDeepseekV3,
-	MoonshotKimiK2,
 	FireworksLlama4Maverick,
+	MoonshotKimiK2,
 	MistralMedium,
 	DevstralSmall,
 	GLM47Fireworks,
 	GPTOSS120B,
 	GPTOSS20B,
+	LlamaCPP,
 	// Skaband-supported models
 	Qwen,
 	GLM,
+	// Old models — still work, just not featured
+	GPT41,
+	GPT41Mini,
+	GPT41Nano,
+	GPT4o,
+	GPT4oMini,
+	TogetherLlama3_3_70B,
+	TogetherGemma2,
 }
 
 // ListModels returns a list of all available models with their user-friendly names.
@@ -796,7 +804,10 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 	fullURL := baseURL + "/chat/completions"
 
 	// Retry mechanism
-	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second}
+	backoff := s.Backoff
+	if backoff == nil {
+		backoff = []time.Duration{1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second}
+	}
 
 	// retry loop
 	var errs error // accumulated errors across all attempts
@@ -805,9 +816,18 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			return nil, fmt.Errorf("openai request failed after %d attempts (url=%s, model=%s): %w", attempts, fullURL, model.ModelName, errs)
 		}
 		if attempts > 0 {
-			sleep := backoff[min(attempts, len(backoff)-1)] + time.Duration(rand.Int64N(int64(time.Second)))
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("openai request failed after %d attempts (context cancelled): %w", attempts, errs)
+			}
+			base := backoff[min(attempts, len(backoff)-1)]
+			jitter := time.Duration(rand.Int64N(max(min(int64(base), int64(time.Second)), 1)))
+			sleep := base + jitter
 			slog.WarnContext(ctx, "openai request sleep before retry", "sleep", sleep, "attempts", attempts)
-			time.Sleep(sleep)
+			select {
+			case <-time.After(sleep):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("openai request failed after %d attempts (context cancelled during backoff): %w", attempts, errs)
+			}
 		}
 
 		resp, err := client.CreateChatCompletion(ctx, req)
@@ -825,35 +845,52 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			continue
 		}
 
+		// Extract HTTP status code from either APIError or RequestError.
+		// RequestError occurs when the response body isn't valid JSON
+		// (e.g., from a proxy returning plain text).
+		var (
+			statusCode int
+			errMsg     string
+		)
 		var apiErr *openai.APIError
-		if ok := errors.As(err, &apiErr); !ok {
-			// Not an OpenAI API error, return immediately with accumulated errors
+		var reqErr *openai.RequestError
+		switch {
+		case errors.As(err, &apiErr):
+			statusCode = apiErr.HTTPStatusCode
+			errMsg = apiErr.Error()
+		case errors.As(err, &reqErr):
+			statusCode = reqErr.HTTPStatusCode
+			// Surface the body for proxy errors so the user sees
+			// the actual upstream message (e.g., trace IDs).
+			errMsg = fmt.Sprintf("status %d: %s", reqErr.HTTPStatusCode, strings.TrimSpace(string(reqErr.Body)))
+		default:
+			// Not an OpenAI error at all (network, TLS, etc.), return immediately
 			return nil, errors.Join(errs, fmt.Errorf("attempt %d at %s: url=%s model=%s: %w", attempts+1, time.Now().Format(time.DateTime), fullURL, model.ModelName, err))
 		}
 
 		now := time.Now().Format(time.DateTime)
 		switch {
-		case apiErr.HTTPStatusCode >= 500:
+		case statusCode >= 500:
 			// Server error, try again with backoff
-			slog.WarnContext(ctx, "openai_request_failed", "error", apiErr.Error(), "status_code", apiErr.HTTPStatusCode, "url", fullURL, "model", model.ModelName)
-			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, apiErr.HTTPStatusCode, fullURL, model.ModelName, apiErr.Error()))
+			slog.WarnContext(ctx, "openai_request_failed", "error", errMsg, "status_code", statusCode, "url", fullURL, "model", model.ModelName)
+			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 			continue
 
-		case apiErr.HTTPStatusCode == 429:
+		case statusCode == 429:
 			// Rate limited, accumulate error and retry
-			slog.WarnContext(ctx, "openai_request_rate_limited", "error", apiErr.Error(), "url", fullURL, "model", model.ModelName)
-			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (rate limited, url=%s, model=%s): %s", attempts+1, now, apiErr.HTTPStatusCode, fullURL, model.ModelName, apiErr.Error()))
+			slog.WarnContext(ctx, "openai_request_rate_limited", "error", errMsg, "url", fullURL, "model", model.ModelName)
+			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (rate limited, url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 			continue
 
-		case apiErr.HTTPStatusCode >= 400 && apiErr.HTTPStatusCode < 500:
+		case statusCode >= 400 && statusCode < 500:
 			// Client error, probably unrecoverable
-			slog.WarnContext(ctx, "openai_request_failed", "error", apiErr.Error(), "status_code", apiErr.HTTPStatusCode, "url", fullURL, "model", model.ModelName)
-			return nil, errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, apiErr.HTTPStatusCode, fullURL, model.ModelName, apiErr.Error()))
+			slog.WarnContext(ctx, "openai_request_failed", "error", errMsg, "status_code", statusCode, "url", fullURL, "model", model.ModelName)
+			return nil, errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 
 		default:
 			// Other error, accumulate and retry
-			slog.WarnContext(ctx, "openai_request_failed", "error", apiErr.Error(), "status_code", apiErr.HTTPStatusCode, "url", fullURL, "model", model.ModelName)
-			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, apiErr.HTTPStatusCode, fullURL, model.ModelName, apiErr.Error()))
+			slog.WarnContext(ctx, "openai_request_failed", "error", errMsg, "status_code", statusCode, "url", fullURL, "model", model.ModelName)
+			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 			continue
 		}
 	}

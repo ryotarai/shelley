@@ -31,6 +31,7 @@ body {
   --bg-base: #ffffff;
   --bg-secondary: #f9fafb;
   --bg-tertiary: #f3f4f6;
+  --bg-hover: #f3f4f6;
   --border: #e5e7eb;
   --text-primary: #111827;
   --text-secondary: #6b7280;
@@ -67,6 +68,7 @@ body {
   --bg-base: #1f2937;
   --bg-secondary: #111827;
   --bg-tertiary: #374151;
+  --bg-hover: #374151;
   --border: #374151;
   --text-primary: #f9fafb;
   --text-secondary: #9ca3af;
@@ -1725,6 +1727,134 @@ button {
 }
 
 .screenshot-tool-error-message {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 0.25rem;
+  padding: 0.75rem;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--error-text);
+}
+
+/* Screencast Tool */
+.screencast-tool {
+  background: var(--gray-100);
+  border-radius: 0.5rem;
+  margin: 0.5rem 0;
+  overflow: hidden;
+}
+
+.screencast-tool-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.screencast-tool-header:hover {
+  background: var(--gray-200);
+}
+
+.screencast-tool-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.screencast-tool-emoji {
+  flex-shrink: 0;
+  font-size: 1rem;
+}
+
+.screencast-tool-emoji.running {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.screencast-tool-label {
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.screencast-tool-toggle {
+  background: none;
+  border: none;
+  padding: 0.25rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+}
+
+.screencast-tool-success {
+  color: var(--green-600);
+  font-weight: bold;
+  margin-left: 0.25rem;
+}
+
+.screencast-tool-error {
+  color: var(--error-text);
+  font-weight: bold;
+  margin-left: 0.25rem;
+}
+
+.screencast-tool-details {
+  padding: 0 0.75rem 0.75rem;
+}
+
+.screencast-tool-section {
+  margin-top: 0.5rem;
+}
+
+.screencast-tool-meta {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+}
+
+.screencast-tool-status {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.screencast-tool-video-container {
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  overflow: hidden;
+  background: var(--bg-base);
+  width: fit-content;
+  max-width: 100%;
+}
+
+.screencast-tool-video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.25rem;
+}
+
+.screencast-tool-output {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  background: var(--gray-200);
+  border-radius: 0.25rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.screencast-tool-error-message {
   font-family: var(--font-mono);
   font-size: 0.875rem;
   background: var(--error-bg);
@@ -5223,6 +5353,13 @@ svg {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  min-height: 0;
+}
+
+.version-modal-footer {
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
 .version-info-row {
@@ -5289,8 +5426,6 @@ svg {
   margin: 0;
   padding: 0;
   list-style: none;
-  max-height: 250px;
-  overflow-y: auto;
   font-size: 0.875rem;
 }
 
@@ -5332,9 +5467,7 @@ svg {
 }
 
 .version-auto-upgrade {
-  padding: 1rem 0;
-  border-top: 1px solid var(--border-color);
-  margin-top: 1rem;
+  padding-bottom: 0.75rem;
 }
 
 .version-checkbox-label {
@@ -5355,8 +5488,6 @@ svg {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  border-top: 1px solid var(--border-color);
-  padding-top: 1rem;
 }
 
 .version-btn {
@@ -5381,6 +5512,48 @@ svg {
 
 .version-btn-primary:hover:not(:disabled) {
   background: var(--primary-dark);
+}
+
+.version-btn-secondary {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.version-btn-secondary:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+}
+
+.version-headless-section {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.version-up-to-date {
+  color: var(--text-secondary);
+  font-size: 0.813rem;
+  margin-top: 0.25rem;
+}
+
+.version-success {
+  color: var(--success, #22c55e);
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+@media (max-width: 600px) {
+  .version-modal-overlay {
+    padding: 0;
+    align-items: stretch;
+  }
+
+  .version-modal {
+    max-height: 100dvh;
+    max-width: 100%;
+    border-radius: 0;
+    height: 100dvh;
+  }
 }
 
 .btn-icon.btn-danger:hover {

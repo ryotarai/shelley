@@ -11,7 +11,6 @@ interface ScreenshotToolProps {
   toolResult?: LLMContent[];
   hasError?: boolean;
   executionTime?: string;
-  display?: unknown; // Display data from the tool_result Content
 }
 
 function ScreenshotTool({
@@ -20,7 +19,6 @@ function ScreenshotTool({
   toolResult,
   hasError,
   executionTime,
-  display,
 }: ScreenshotToolProps) {
   const [isExpanded, setIsExpanded] = useState(true); // Default to expanded
 
@@ -63,38 +61,11 @@ function ScreenshotTool({
 
   const filename = getPath(toolInput) || getId(toolInput) || getSelector(toolInput) || "screenshot";
 
-  // Construct image URL
-  // First try: use base64 data from tool result (stored in DB, survives /tmp clearing)
-  let imageUrl: string | undefined = undefined;
-  if (toolResult && toolResult.length >= 2) {
-    const imageContent = toolResult[1];
-    if (imageContent?.Data && imageContent?.MediaType) {
-      imageUrl = `data:${imageContent.MediaType};base64,${imageContent.Data}`;
-    }
-  }
-
-  // Fallback: use display URL (for edge cases / backwards compat)
-  if (!imageUrl) {
-    const displayData = display;
-    if (displayData && typeof displayData === "object" && displayData !== null) {
-      const url =
-        "url" in displayData && typeof displayData.url === "string" ? displayData.url : undefined;
-      const path =
-        "path" in displayData && typeof displayData.path === "string"
-          ? displayData.path
-          : undefined;
-      const id =
-        "id" in displayData && typeof displayData.id === "string" ? displayData.id : undefined;
-
-      imageUrl =
-        (url ? withBasePath(url) : undefined) ||
-        (path
-          ? withBasePath(`/api/read?path=${encodeURIComponent(path)}`)
-          : id
-            ? withBasePath(`/api/read?path=${encodeURIComponent(id)}`)
-            : undefined);
-    }
-  }
+  // Construct image URL from the tool result's image content.
+  // The server replaces inline base64 data with a URL to /api/message/{id}/image/...
+  const rawImageUrl =
+    toolResult && toolResult.length >= 2 ? toolResult[1]?.DisplayImageURL : undefined;
+  const imageUrl = rawImageUrl ? withBasePath(rawImageUrl) : undefined;
 
   const isComplete = !isRunning && toolResult !== undefined;
 

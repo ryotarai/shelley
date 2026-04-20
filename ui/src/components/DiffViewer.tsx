@@ -63,6 +63,11 @@ function formatCommitMessage(msg: GitCommitMessage): string {
   return text;
 }
 
+function truncateWithEllipsis(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  return text.slice(0, Math.max(0, maxLength - 3)) + "...";
+}
+
 function DiffViewer({
   cwd,
   isOpen,
@@ -118,8 +123,9 @@ function DiffViewer({
     // Update editor readOnly state when mode changes
     // (but not for commit message files - those have their own editability logic)
     if (editorRef.current && selectedFile && !isCommitMessageFile(selectedFile)) {
-      const modifiedEditor = editorRef.current.getModifiedEditor();
-      modifiedEditor.updateOptions({ readOnly: mode === "comment" });
+      const readOnly = mode === "comment";
+      editorRef.current.updateOptions({ readOnly });
+      editorRef.current.getModifiedEditor().updateOptions({ readOnly });
     }
   }, [mode, selectedFile]);
 
@@ -260,7 +266,7 @@ function DiffViewer({
     // Create diff editor with mobile-friendly options
     const diffEditor = monaco.editor.createDiffEditor(editorContainerRef.current, {
       theme: isDarkModeActive() ? "vs-dark" : "vs",
-      readOnly: !isHeadCommit, // Editable only for HEAD commit messages
+      readOnly: isCommitMsg ? !isHeadCommit : modeRef.current === "comment",
       originalEditable: false,
       automaticLayout: true,
       renderSideBySide: !isMobile,
@@ -613,8 +619,7 @@ function DiffViewer({
 
     const line = showCommentDialog.line;
     const codeSnippet = showCommentDialog.selectedText?.split("\n")[0]?.trim() || "";
-    const truncatedCode =
-      codeSnippet.length > 60 ? codeSnippet.substring(0, 57) + "..." : codeSnippet;
+    const truncatedCode = truncateWithEllipsis(codeSnippet, 60);
 
     // For commit message files, use a readable reference
     let fileRef = selectedFile;
@@ -622,7 +627,7 @@ function DiffViewer({
       const hash = commitHashFromPath(selectedFile);
       const msg = commitMessages.find((m) => m.hash === hash);
       fileRef = msg
-        ? `commit ${hash.slice(0, 8)} (${msg.subject.slice(0, 40)})`
+        ? `commit ${hash.slice(0, 8)} (${truncateWithEllipsis(msg.subject, 40)})`
         : `commit ${hash.slice(0, 8)}`;
     }
 
@@ -960,7 +965,7 @@ function DiffViewer({
           <option key={diff.id} value={diff.id}>
             {diff.id === "working"
               ? `Working Changes (${stats})`
-              : `${diff.message.slice(0, 40)} (${stats})`}
+              : `${truncateWithEllipsis(diff.message, 40)} (${stats})`}
           </option>
         );
       })}
@@ -984,7 +989,7 @@ function DiffViewer({
             const hash = commitHashFromPath(file.path);
             const msg = commitMessages.find((m) => m.hash === hash);
             const label = msg
-              ? `📝 ${msg.subject.slice(0, 50)}${msg.subject.length > 50 ? "..." : ""}`
+              ? `📝 ${truncateWithEllipsis(msg.subject, 50)}`
               : `📝 ${hash.slice(0, 8)}`;
             return (
               <option key={file.path} value={file.path}>

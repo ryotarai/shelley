@@ -75,10 +75,15 @@ function isInboxPath(): boolean {
   return window.location.pathname === "/inbox";
 }
 
+function isNewPath(): boolean {
+  return window.location.pathname === "/new";
+}
+
 // Capture the initial slug from URL BEFORE React renders, so it won't be affected
 // by the useEffect that updates the URL based on current conversation.
 const initialSlugFromUrl = getSlugFromPath();
 const initialIsInbox = isInboxPath();
+const initialIsNew = isNewPath();
 
 // Update the URL to reflect the current conversation slug
 function updateUrlWithSlug(conversation: Conversation | undefined) {
@@ -292,6 +297,12 @@ function App() {
         setViewedConversation(null);
         return;
       }
+      if (isNewPath()) {
+        setShowInbox(false);
+        setCurrentConversationId(null);
+        setViewedConversation(null);
+        return;
+      }
       setShowInbox(false);
       const slug = getSlugFromPath();
       if (!slug) {
@@ -423,8 +434,8 @@ function App() {
       if (slugConv) {
         setCurrentConversationId(slugConv.conversation_id);
         setViewedConversation(slugConv);
-      } else if (!showInbox && convs.length > 0) {
-        // No slug in URL and not on /inbox — select the most recent conversation
+      } else if (!showInbox && !initialIsNew && convs.length > 0) {
+        // No slug in URL and not on /inbox or /new — select the most recent conversation
         setCurrentConversationId(convs[0].conversation_id);
         setViewedConversation(convs[0]);
       }
@@ -496,10 +507,15 @@ function App() {
         conv.conversation_id === updatedConversation.conversation_id
           ? {
               ...updatedConversation,
+              // Preserve list-level state fields maintained elsewhere
               working: conv.working,
+              subagent_count: conv.subagent_count,
+              // Preserve git metadata from conversation list updates.
+              // Stream conversation updates don't include these fields.
+              git_repo_root: conv.git_repo_root,
+              git_worktree_root: conv.git_worktree_root,
               git_commit: conv.git_commit,
               git_subject: conv.git_subject,
-              subagent_count: conv.subagent_count,
             }
           : conv,
       ),
