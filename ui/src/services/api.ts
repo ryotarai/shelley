@@ -419,7 +419,7 @@ class ApiService {
   }
 
   async upgradeHeadlessShell(): Promise<{ status: string; message: string; version: string }> {
-    const response = await fetch("/upgrade-headless-shell", {
+    const response = await fetch(withBasePath("/upgrade-headless-shell"), {
       method: "POST",
       headers: { "X-Shelley-Request": "1" },
     });

@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { LLMContent } from "../types";
+import { withBasePath } from "../services/paths";
 
 interface ReadImageToolProps {
   toolInput?: unknown; // { path: string }
@@ -47,8 +48,9 @@ function ReadImageTool({
 
   // Build image URL from the tool result's image content.
   // The server replaces inline base64 data with a URL to /api/message/{id}/image/...
-  const imageUrl =
+  const rawImageUrl =
     toolResult && toolResult.length >= 2 ? toolResult[1]?.DisplayImageURL : undefined;
+  const imageUrl = rawImageUrl ? withBasePath(rawImageUrl) : undefined;
 
   const isComplete = !isRunning && toolResult !== undefined;
 

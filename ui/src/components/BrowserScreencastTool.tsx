@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { LLMContent } from "../types";
+import { withBasePath } from "../services/paths";
 
 interface BrowserScreencastToolProps {
   toolInput?: unknown;
@@ -62,9 +63,9 @@ function BrowserScreencastTool({
     const d = display as Record<string, unknown>;
     if (d.type === "screencast") {
       if (typeof d.url === "string") {
-        videoUrl = d.url;
+        videoUrl = withBasePath(d.url);
       } else if (typeof d.path === "string") {
-        videoUrl = `/api/read?path=${encodeURIComponent(d.path as string)}`;
+        videoUrl = withBasePath(`/api/read?path=${encodeURIComponent(d.path as string)}`);
       }
     }
   }
