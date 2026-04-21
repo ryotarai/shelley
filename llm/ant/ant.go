@@ -249,7 +249,13 @@ type systemContent struct {
 // the legacy manual thinking (thinking: {type: "enabled", budget_tokens: N}).
 // Claude Opus 4.7 and later require adaptive thinking.
 func useAdaptiveThinking(model string) bool {
-	return model == Claude47Opus || strings.HasPrefix(model, "claude-opus-4-7-")
+	// Match the last path segment so provider-prefixed IDs
+	// (e.g. "anthropic/claude-opus-4-7", "bedrock/.../claude-opus-4-7") also match.
+	name := model
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	return name == Claude47Opus || strings.HasPrefix(name, "claude-opus-4-7-")
 }
 
 // request represents the request payload for creating a message.
