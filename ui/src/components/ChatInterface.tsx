@@ -483,6 +483,7 @@ interface ConversationStateUpdate {
   conversation_id: string;
   working: boolean;
   model?: string;
+  pending_approval?: boolean;
 }
 
 interface ChatInterfaceProps {

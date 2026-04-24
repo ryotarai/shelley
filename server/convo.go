@@ -110,19 +110,10 @@ func (cm *ConversationManager) SetAgentWorking(working bool) {
 		return
 	}
 	cm.agentWorking = working
-	onStateChange := cm.onStateChange
-	convID := cm.conversationID
-	modelID := cm.modelID
 	cm.mu.Unlock()
 
 	cm.logger.Debug("agent working state changed", "working", working)
-	if onStateChange != nil {
-		onStateChange(ConversationState{
-			ConversationID: convID,
-			Working:        working,
-			Model:          modelID,
-		})
-	}
+	cm.emitState()
 }
 
 // IsAgentWorking returns the current agent working state.
@@ -130,6 +121,31 @@ func (cm *ConversationManager) IsAgentWorking() bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.agentWorking
+}
+
+// HasPendingApproval reports whether any tool call is waiting for user
+// approval. Used by the sidebar/list endpoint to highlight the conversation.
+func (cm *ConversationManager) HasPendingApproval() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return len(cm.pendingApprovals) > 0
+}
+
+// emitState reads the current observable state under the lock and calls
+// onStateChange (if set) so subscribers can react.
+func (cm *ConversationManager) emitState() {
+	cm.mu.Lock()
+	state := ConversationState{
+		ConversationID:  cm.conversationID,
+		Working:         cm.agentWorking,
+		Model:           cm.modelID,
+		PendingApproval: len(cm.pendingApprovals) > 0,
+	}
+	onStateChange := cm.onStateChange
+	cm.mu.Unlock()
+	if onStateChange != nil {
+		onStateChange(state)
+	}
 }
 
 // SetDistilling marks the conversation as distilling. While true, queued
@@ -1126,11 +1142,19 @@ func (cm *ConversationManager) requestToolApproval(ctx context.Context, toolName
 
 	cm.mu.Lock()
 	cm.pendingApprovals[approvalID] = ch
+	firstApproval := len(cm.pendingApprovals) == 1
 	cm.mu.Unlock()
+	if firstApproval {
+		cm.emitState()
+	}
 	defer func() {
 		cm.mu.Lock()
 		delete(cm.pendingApprovals, approvalID)
+		noneLeft := len(cm.pendingApprovals) == 0
 		cm.mu.Unlock()
+		if noneLeft {
+			cm.emitState()
+		}
 	}()
 
 	userData := map[string]any{

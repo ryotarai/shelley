@@ -452,6 +452,15 @@ function ConversationDrawer({
                   <div className="conversation-title">{getConversationPreview(conversation)}</div>
                 )}
               </div>
+              {(conversation as ConversationWithState).pending_approval && (
+                <span
+                  className="drawer-approval-indicator"
+                  title="Waiting for tool approval"
+                  aria-label="Waiting for tool approval"
+                >
+                  !
+                </span>
+              )}
               {(conversation as ConversationWithState).working && (
                 <span
                   className="working-indicator drawer-working-indicator"
