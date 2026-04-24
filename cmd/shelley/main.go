@@ -142,6 +142,7 @@ func runServe(global GlobalConfig, args []string) {
 	systemdActivation := fs.Bool("systemd-activation", false, "Use systemd socket activation (listen on fd from systemd)")
 	requireHeader := fs.String("require-header", "", "Require this header on all API requests (e.g., X-Exedev-Userid)")
 	socketPath := fs.String("socket", client.DefaultSocketPath(), "Path to Unix socket for local CLI client access (set to 'none' to disable)")
+	permissionCheck := fs.String("permission-check", "", "Shell command to run before every tool call. Receives a JSON request on stdin (tool_name, tool_input, working_dir, conversation_id) and must print a JSON response on stdout ({\"decision\":\"allow|deny\",\"reason\":\"...\"}).")
 	fs.Parse(args)
 
 	logger := setupLogging(global.Debug)
@@ -166,6 +167,7 @@ func runServe(global GlobalConfig, args []string) {
 
 	// Create server
 	svr := server.NewServer(database, llmManager, toolSetConfig, logger, global.PredictableOnly, llmConfig.TerminalURL, llmConfig.DefaultModel, *requireHeader, llmConfig.Links)
+	svr.SetPermissionCheckCommand(*permissionCheck)
 	if err := svr.SetBasePath(*basePath); err != nil {
 		logger.Error("Invalid base path", "base_path", *basePath, "error", err)
 		os.Exit(1)
@@ -175,6 +177,12 @@ func runServe(global GlobalConfig, args []string) {
 	svr.SeedNotificationChannelsFromConfig(llmConfig.NotificationChannels)
 	// Load notification channels from DB
 	svr.ReloadNotificationChannels()
+
+	// Mark any tool approval requests still pending from a previous process
+	// as cancelled; their in-memory channels did not survive the restart.
+	if err := svr.CancelOrphanedToolApprovals(context.Background()); err != nil {
+		logger.Error("Failed to cancel orphaned tool approvals", "error", err)
+	}
 
 	// Resolve socket path: "none" disables the Unix socket listener
 	effectiveSocket := *socketPath

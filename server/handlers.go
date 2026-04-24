@@ -636,6 +636,9 @@ func (s *Server) conversationMux() *http.ServeMux {
 	mux.HandleFunc("POST /{id}/cancel-queued", func(w http.ResponseWriter, r *http.Request) {
 		s.handleCancelQueued(w, r, r.PathValue("id"))
 	})
+	mux.HandleFunc("POST /{id}/tool-approval", func(w http.ResponseWriter, r *http.Request) {
+		s.handleToolApproval(w, r, r.PathValue("id"))
+	})
 	return mux
 }
 
@@ -1693,6 +1696,49 @@ func (s *Server) handleSetSetting(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.SetSetting(r.Context(), req.Key, req.Value); err != nil {
 		s.logger.Error("Failed to set setting", "error", err, "key", req.Key)
 		http.Error(w, fmt.Sprintf("Failed to set setting: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleToolApproval handles POST /conversation/<id>/tool-approval.
+// Body: {"approval_id":"...","decision":"approve"|"deny"}.
+func (s *Server) handleToolApproval(w http.ResponseWriter, r *http.Request, conversationID string) {
+	var req struct {
+		ApprovalID string `json:"approval_id"`
+		Decision   string `json:"decision"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.ApprovalID == "" {
+		http.Error(w, "approval_id is required", http.StatusBadRequest)
+		return
+	}
+	var approved bool
+	switch req.Decision {
+	case "approve":
+		approved = true
+	case "deny":
+		approved = false
+	default:
+		http.Error(w, "decision must be 'approve' or 'deny'", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	manager, ok := s.activeConversations[conversationID]
+	s.mu.Unlock()
+	if !ok {
+		http.Error(w, "conversation not found", http.StatusNotFound)
+		return
+	}
+
+	if !manager.ResolveToolApproval(req.ApprovalID, approved) {
+		http.Error(w, "no pending approval with that id", http.StatusNotFound)
 		return
 	}
 

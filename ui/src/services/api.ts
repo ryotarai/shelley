@@ -200,6 +200,24 @@ class ApiService {
     }
   }
 
+  async resolveToolApproval(
+    conversationId: string,
+    approvalId: string,
+    decision: "approve" | "deny",
+  ): Promise<void> {
+    const response = await fetch(
+      `${this.baseUrl}/conversation/${conversationId}/tool-approval`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approval_id: approvalId, decision }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to resolve tool approval: ${response.statusText}`);
+    }
+  }
+
   async validateCwd(path: string): Promise<{ valid: boolean; error?: string }> {
     const response = await fetch(`${this.baseUrl}/validate-cwd?path=${encodeURIComponent(path)}`);
     if (!response.ok) {

@@ -7,6 +7,7 @@ import {
   ConversationListUpdate,
   ToolProgress,
   isDistillStatusMessage,
+  isToolApprovalRequestMessage,
   isQueuedMessage,
 } from "../types";
 import { api } from "../services/api";
@@ -1834,9 +1835,9 @@ function ChatInterface({
 
     // Second pass: process messages and extract tool uses
     messages.forEach((message) => {
-      // Allow system messages with distill_status through, skip others
+      // Allow system messages with distill_status or tool approval requests through, skip others
       if (message.type === "system") {
-        if (!isDistillStatusMessage(message)) {
+        if (!isDistillStatusMessage(message) && !isToolApprovalRequestMessage(message)) {
           return;
         }
         items.push({ type: "message", message });
@@ -1992,6 +1993,7 @@ function ChatInterface({
           <MessageComponent
             key={item.message.message_id}
             message={item.message}
+            conversationId={conversationId ?? undefined}
             onOpenDiffViewer={handleOpenDiffViewer}
             onCommentTextChange={setDiffCommentText}
             onCancelQueued={isQueuedMessage(item.message) ? cancelQueuedMessages : undefined}

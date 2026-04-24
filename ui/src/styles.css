@@ -6727,6 +6727,80 @@ kbd {
   color: var(--error-text);
 }
 
+.msg-approval-container {
+  padding: 0.75rem 1rem;
+  font-size: 0.875rem;
+  border: 1px solid var(--warning-border, var(--border-color));
+  background: var(--warning-bg, var(--bg-secondary));
+  border-radius: 0.375rem;
+  margin: 0.5rem 0;
+}
+
+.msg-approval-header {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.msg-approval-reason {
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+}
+
+.msg-approval-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.25rem;
+  padding: 0.5rem;
+  font-size: 0.8rem;
+  overflow-x: auto;
+  max-height: 12rem;
+  margin: 0 0 0.5rem 0;
+}
+
+.msg-approval-buttons {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.msg-approval-btn {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.875rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.msg-approval-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.msg-approval-btn-approve {
+  background: var(--green-text, #16a34a);
+  color: white;
+  border-color: var(--green-text, #16a34a);
+}
+
+.msg-approval-btn-deny {
+  background: var(--error-text, #dc2626);
+  color: white;
+  border-color: var(--error-text, #dc2626);
+}
+
+.msg-approval-resolved {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.msg-approval-error {
+  margin-top: 0.5rem;
+  color: var(--error-text);
+  font-size: 0.8rem;
+}
+
 .msg-spinner-inline {
   display: inline-block;
   margin-right: 6px;

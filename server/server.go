@@ -241,6 +241,7 @@ type Server struct {
 	shutdownCh          chan struct{} // Signals background routines to stop
 	basePath            string
 	listenPort          int           // TCP port the server is listening on
+	permissionCheckCmd  string        // external command run before every tool call (optional)
 }
 
 // NewServer creates a new server instance
@@ -282,6 +283,28 @@ func normalizeBasePath(path string) (string, error) {
 		return "/", nil
 	}
 	return trimmed, nil
+}
+
+// SetPermissionCheckCommand sets an external command that is invoked before
+// every tool call. The command receives a JSON request on stdin and must
+// respond with a JSON decision on stdout. See loop.NewExternalPermissionChecker.
+func (s *Server) SetPermissionCheckCommand(command string) {
+	s.permissionCheckCmd = command
+}
+
+// CancelOrphanedToolApprovals marks any tool-approval-request system messages
+// that are still in the "pending" state as "cancelled". Pending approvals are
+// backed by an in-memory channel on a ConversationManager, so they do not
+// survive a server restart; this cleanup keeps the UI from showing dead
+// Approve/Deny buttons after a restart.
+func (s *Server) CancelOrphanedToolApprovals(ctx context.Context) error {
+	return s.db.Pool().Exec(ctx, `
+		UPDATE messages
+		SET user_data = json_set(user_data, '$.status', 'cancelled')
+		WHERE type = 'system'
+		  AND json_extract(user_data, '$.kind') = 'tool_approval_request'
+		  AND json_extract(user_data, '$.status') = 'pending'
+	`)
 }
 
 func (s *Server) SetBasePath(path string) error {
@@ -725,6 +748,7 @@ func (s *Server) getOrCreateConversationManager(ctx context.Context, conversatio
 
 		manager := NewConversationManager(conversationID, s.db, s.logger, s.toolSetConfig, recordMessage, onStateChange)
 		manager.userEmail = userEmail
+		manager.permissionCheckCmd = s.permissionCheckCmd
 		if err := manager.Hydrate(ctx); err != nil {
 			return nil, err
 		}
@@ -763,6 +787,7 @@ func (s *Server) getOrCreateSubagentConversationManager(ctx context.Context, con
 		subagentConfig.SubagentDepth = s.toolSetConfig.SubagentDepth + 1
 
 		manager := NewConversationManager(conversationID, s.db, s.logger, subagentConfig, recordMessage, onStateChange)
+		manager.permissionCheckCmd = s.permissionCheckCmd
 		if err := manager.Hydrate(ctx); err != nil {
 			return nil, err
 		}

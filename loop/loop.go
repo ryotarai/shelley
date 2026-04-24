@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,7 +45,22 @@ type Config struct {
 	// before the assistant message is recorded. Use this to flush any
 	// buffered stream deltas so they reach the UI before the full message.
 	OnStreamDone func()
+	// CheckToolPermission, if set, is called before every tool invocation.
+	// A non-nil error denies the call and is returned to the LLM as the
+	// tool result (same shape as a tool-reported error).
+	CheckToolPermission ToolPermissionChecker
+	// RequestToolApproval, if set, is called when CheckToolPermission
+	// returns a *PermissionDeniedError. It should block until the user
+	// responds, returning true to allow the call to proceed or false to
+	// confirm the denial. If nil, a *PermissionDeniedError is surfaced
+	// directly as the tool error.
+	RequestToolApproval ToolApprovalRequester
 }
+
+// ToolApprovalRequester asks a human to override an evaluator denial.
+// Returning (true, nil) allows the tool call; (false, nil) denies it.
+// A non-nil error also denies the call and is surfaced as the tool error.
+type ToolApprovalRequester func(ctx context.Context, toolName string, toolInput json.RawMessage, reason string) (bool, error)
 
 // Loop manages a conversation turn with an LLM including tool execution and message recording.
 // Notably, when the turn ends, the "Loop" is over. TODO: maybe rename to Turn?
@@ -64,6 +81,8 @@ type Loop struct {
 	onToolProgress   llm.ToolProgressFunc
 	onStreamDelta    func(llm.StreamDelta)
 	onStreamDone     func()
+	checkPermission  ToolPermissionChecker
+	requestApproval  ToolApprovalRequester
 	notify           chan struct{} // signaled when a message is queued
 }
 
@@ -96,6 +115,8 @@ func NewLoop(config Config) *Loop {
 		onToolProgress:   config.OnToolProgress,
 		onStreamDelta:    config.OnStreamDelta,
 		onStreamDone:     config.OnStreamDone,
+		checkPermission:  config.CheckToolPermission,
+		requestApproval:  config.RequestToolApproval,
 		notify:           make(chan struct{}, 1),
 	}
 }
@@ -498,7 +519,26 @@ func (l *Loop) executeToolCalls(ctx context.Context, content []llm.Content) erro
 		}
 		toolCtx = claudetool.WithToolUseID(toolCtx, c.ID)
 		startTime := time.Now()
-		result := tool.Run(toolCtx, c.ToolInput)
+		var result llm.ToolOut
+		if l.checkPermission != nil {
+			if err := l.checkPermission(ctx, c.ToolName, c.ToolInput); err != nil {
+				var denied *PermissionDeniedError
+				if errors.As(err, &denied) && l.requestApproval != nil {
+					approved, approvalErr := l.requestApproval(ctx, c.ToolName, c.ToolInput, denied.Reason)
+					switch {
+					case approvalErr != nil:
+						result = llm.ErrorToolOut(approvalErr)
+					case !approved:
+						result = llm.ErrorToolOut(err)
+					}
+				} else {
+					result = llm.ErrorToolOut(err)
+				}
+			}
+		}
+		if result.Error == nil {
+			result = tool.Run(toolCtx, c.ToolInput)
+		}
 		endTime := time.Now()
 
 		var toolResultContent []llm.Content
