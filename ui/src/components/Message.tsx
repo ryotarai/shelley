@@ -9,8 +9,10 @@ import {
   Usage,
   ToolProgress,
   isDistillStatusMessage,
+  isToolApprovalRequestMessage,
   isQueuedMessage,
 } from "../types";
+import { api } from "../services/api";
 import BashTool from "./BashTool";
 import PatchTool from "./PatchTool";
 import ScreenshotTool from "./ScreenshotTool";
@@ -57,6 +59,7 @@ interface ToolDisplay {
 
 interface MessageProps {
   message: MessageType;
+  conversationId?: string;
   onOpenDiffViewer?: (commit: string, cwd?: string) => void;
   onCommentTextChange?: (text: string) => void;
   onCancelQueued?: () => void;
@@ -251,8 +254,108 @@ function DistillStatusMessage({ message }: { message: MessageType }) {
   );
 }
 
+function ToolApprovalRequestMessage({
+  message,
+  conversationId,
+}: {
+  message: MessageType;
+  conversationId?: string;
+}) {
+  const [submitting, setSubmitting] = useState<"approve" | "deny" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  let approvalId = "";
+  let toolName = "";
+  let toolInput: unknown = null;
+  let reason = "";
+  let status = "pending";
+  if (message.user_data) {
+    try {
+      const userData =
+        typeof message.user_data === "string"
+          ? JSON.parse(message.user_data)
+          : message.user_data;
+      approvalId = userData.approval_id || "";
+      toolName = userData.tool_name || "";
+      toolInput = userData.tool_input ?? null;
+      reason = userData.reason || "";
+      status = userData.status || "pending";
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  const handleDecision = async (decision: "approve" | "deny") => {
+    if (!conversationId || !approvalId || submitting || status !== "pending") return;
+    setSubmitting(decision);
+    setError(null);
+    try {
+      await api.resolveToolApproval(conversationId, approvalId, decision);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setSubmitting(null);
+    }
+  };
+
+  const pending = status === "pending";
+  const toolInputStr =
+    toolInput == null
+      ? ""
+      : typeof toolInput === "string"
+        ? toolInput
+        : JSON.stringify(toolInput, null, 2);
+
+  return (
+    <div className="message message-gitinfo msg-approval-container">
+      <div className="msg-approval-header">
+        Tool call requires approval: <code>{toolName}</code>
+      </div>
+      {reason && <div className="msg-approval-reason">Evaluator: {reason}</div>}
+      {toolInputStr && (
+        <pre className="msg-approval-input">
+          <code>{toolInputStr}</code>
+        </pre>
+      )}
+      <div className="msg-approval-buttons">
+        {pending ? (
+          <>
+            <button
+              type="button"
+              className="msg-approval-btn msg-approval-btn-approve"
+              disabled={!!submitting}
+              onClick={() => handleDecision("approve")}
+            >
+              {submitting === "approve" ? "Approving…" : "Approve"}
+            </button>
+            <button
+              type="button"
+              className="msg-approval-btn msg-approval-btn-deny"
+              disabled={!!submitting}
+              onClick={() => handleDecision("deny")}
+            >
+              {submitting === "deny" ? "Denying…" : "Deny"}
+            </button>
+          </>
+        ) : (
+          <span className="msg-approval-resolved">
+            {status === "approved"
+              ? "Approved"
+              : status === "denied"
+                ? "Denied"
+                : status === "cancelled"
+                  ? "Cancelled"
+                  : status}
+          </span>
+        )}
+      </div>
+      {error && <div className="msg-approval-error">Error: {error}</div>}
+    </div>
+  );
+}
+
 const Message = React.memo(function Message({
   message,
+  conversationId,
   onOpenDiffViewer,
   onCommentTextChange,
   onCancelQueued,
@@ -264,6 +367,9 @@ const Message = React.memo(function Message({
   if (message.type === "system") {
     if (isDistillStatusMessage(message)) {
       return <DistillStatusMessage message={message} />;
+    }
+    if (isToolApprovalRequestMessage(message)) {
+      return <ToolApprovalRequestMessage message={message} conversationId={conversationId} />;
     }
     return null;
   }

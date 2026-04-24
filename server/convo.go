@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"shelley.exe.dev/claudetool"
 	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
@@ -69,6 +70,15 @@ type ConversationManager struct {
 	// onStateChange is called when the conversation state changes.
 	// This allows the server to broadcast state changes to all subscribers.
 	onStateChange func(state ConversationState)
+
+	// permissionCheckCmd is an optional external command run before every tool
+	// call. Empty means no permission check is performed.
+	permissionCheckCmd string
+
+	// pendingApprovals maps approval IDs to channels that receive the user's
+	// decision. Populated when the loop pauses waiting for an approval; drained
+	// when the approval endpoint delivers a response.
+	pendingApprovals map[string]chan bool
 }
 
 // NewConversationManager constructs a manager with dependencies but defers hydration until needed.
@@ -80,14 +90,15 @@ func NewConversationManager(conversationID string, database *db.DB, baseLogger *
 	logger = logger.With("conversationID", conversationID)
 
 	return &ConversationManager{
-		conversationID: conversationID,
-		db:             database,
-		lastActivity:   time.Now(),
-		recordMessage:  recordMessage,
-		logger:         logger,
-		toolSetConfig:  toolSetConfig,
-		subpub:         subpub.New[StreamResponse](),
-		onStateChange:  onStateChange,
+		conversationID:   conversationID,
+		db:               database,
+		lastActivity:     time.Now(),
+		recordMessage:    recordMessage,
+		logger:           logger,
+		toolSetConfig:    toolSetConfig,
+		subpub:           subpub.New[StreamResponse](),
+		onStateChange:    onStateChange,
+		pendingApprovals: make(map[string]chan bool),
 	}
 }
 
@@ -730,6 +741,7 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 	conversationID := cm.conversationID
 	conversationOpts := cm.conversationOptions
 	database := cm.db
+	permissionCheckCmd := cm.permissionCheckCmd
 	cm.mu.Unlock()
 
 	// Load conversation history fresh from the database. This is the canonical
@@ -810,6 +822,11 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 	// of individual deltas per second from the Anthropic SSE stream.
 	sf := newStreamFlusher(cm.subpub, 50*time.Millisecond)
 
+	var permissionCheck loop.ToolPermissionChecker
+	if permissionCheckCmd != "" {
+		permissionCheck = loop.NewExternalPermissionChecker(permissionCheckCmd, toolSet.WorkingDir().Get, conversationID)
+	}
+
 	loopInstance := loop.NewLoop(loop.Config{
 		LLM:           service,
 		History:       history,
@@ -827,8 +844,10 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 				ToolProgress: &progress,
 			})
 		},
-		OnStreamDelta: sf.Push,
-		OnStreamDone:  sf.Flush,
+		OnStreamDelta:       sf.Push,
+		OnStreamDone:        sf.Flush,
+		CheckToolPermission: permissionCheck,
+		RequestToolApproval: cm.requestToolApproval,
 	})
 
 	cm.mu.Lock()
@@ -1094,6 +1113,109 @@ func (cm *ConversationManager) recordGitStateChange(ctx context.Context, state *
 
 	// Notify subscribers so the UI updates
 	go cm.notifyGitStateChange(context.WithoutCancel(ctx), createdMsg)
+}
+
+// requestToolApproval is used as loop.ToolApprovalRequester. It records a
+// system message describing the pending approval, broadcasts it to the UI,
+// and blocks until the user responds via ResolveToolApproval (or ctx is
+// cancelled). The message's user_data.status is updated to reflect the
+// resolution so the UI disables the buttons.
+func (cm *ConversationManager) requestToolApproval(ctx context.Context, toolName string, toolInput json.RawMessage, reason string) (bool, error) {
+	approvalID := uuid.New().String()
+	ch := make(chan bool, 1)
+
+	cm.mu.Lock()
+	cm.pendingApprovals[approvalID] = ch
+	cm.mu.Unlock()
+	defer func() {
+		cm.mu.Lock()
+		delete(cm.pendingApprovals, approvalID)
+		cm.mu.Unlock()
+	}()
+
+	userData := map[string]any{
+		"kind":        "tool_approval_request",
+		"approval_id": approvalID,
+		"tool_name":   toolName,
+		"tool_input":  json.RawMessage(toolInput),
+		"reason":      reason,
+		"status":      "pending",
+	}
+	msg, err := cm.db.CreateMessage(ctx, db.CreateMessageParams{
+		ConversationID:      cm.conversationID,
+		Type:                db.MessageTypeSystem,
+		UserData:            userData,
+		ExcludedFromContext: true,
+	})
+	if err != nil {
+		return false, fmt.Errorf("record approval request: %w", err)
+	}
+	cm.subpub.Publish(msg.SequenceID, StreamResponse{Messages: toAPIMessages([]generated.Message{*msg})})
+
+	var approved bool
+	select {
+	case approved = <-ch:
+	case <-ctx.Done():
+		cm.finalizeToolApproval(context.WithoutCancel(ctx), msg.MessageID, "cancelled")
+		return false, ctx.Err()
+	}
+
+	status := "denied"
+	if approved {
+		status = "approved"
+	}
+	cm.finalizeToolApproval(ctx, msg.MessageID, status)
+	return approved, nil
+}
+
+// finalizeToolApproval updates the approval message's status field and
+// broadcasts the update so the UI can disable the buttons.
+func (cm *ConversationManager) finalizeToolApproval(ctx context.Context, messageID, status string) {
+	msg, err := cm.db.GetMessageByID(ctx, messageID)
+	if err != nil {
+		cm.logger.Error("get approval message", "messageID", messageID, "error", err)
+		return
+	}
+	var data map[string]any
+	if msg.UserData != nil {
+		_ = json.Unmarshal([]byte(*msg.UserData), &data)
+	}
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["status"] = status
+	updated, err := json.Marshal(data)
+	if err != nil {
+		cm.logger.Error("marshal approval user data", "error", err)
+		return
+	}
+	updatedStr := string(updated)
+	if err := cm.db.UpdateMessageUserData(ctx, messageID, &updatedStr); err != nil {
+		cm.logger.Error("update approval message", "messageID", messageID, "error", err)
+		return
+	}
+	freshMsg, err := cm.db.GetMessageByID(ctx, messageID)
+	if err != nil {
+		return
+	}
+	cm.subpub.Broadcast(StreamResponse{Messages: toAPIMessages([]generated.Message{*freshMsg})})
+}
+
+// ResolveToolApproval delivers a user decision to a pending approval. It
+// returns false if no approval with that ID is pending.
+func (cm *ConversationManager) ResolveToolApproval(approvalID string, approved bool) bool {
+	cm.mu.Lock()
+	ch, ok := cm.pendingApprovals[approvalID]
+	cm.mu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case ch <- approved:
+		return true
+	default:
+		return false
+	}
 }
 
 // notifyGitStateChange publishes a gitinfo message to subscribers.

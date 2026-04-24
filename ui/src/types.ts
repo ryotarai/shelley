@@ -225,6 +225,18 @@ export function isDistillStatusMessage(message: Message): boolean {
   }
 }
 
+// Helper to check if a message is a tool approval request
+export function isToolApprovalRequestMessage(message: Message): boolean {
+  if (message.type !== "system" || !message.user_data) return false;
+  try {
+    const userData =
+      typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
+    return userData.kind === "tool_approval_request";
+  } catch {
+    return false;
+  }
+}
+
 // Helper to check if a user message is queued (waiting for agent to finish)
 export function isQueuedMessage(message: Message): boolean {
   if (message.type !== "user" || !message.user_data) return false;
