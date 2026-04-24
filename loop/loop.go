@@ -522,9 +522,13 @@ func (l *Loop) executeToolCalls(ctx context.Context, content []llm.Content) erro
 		var result llm.ToolOut
 		if l.checkPermission != nil {
 			if err := l.checkPermission(ctx, c.ToolName, c.ToolInput); err != nil {
-				var denied *PermissionDeniedError
-				if errors.As(err, &denied) && l.requestApproval != nil {
-					approved, approvalErr := l.requestApproval(ctx, c.ToolName, c.ToolInput, denied.Reason)
+				if l.requestApproval != nil {
+					reason := err.Error()
+					var denied *PermissionDeniedError
+					if errors.As(err, &denied) {
+						reason = denied.Reason
+					}
+					approved, approvalErr := l.requestApproval(ctx, c.ToolName, c.ToolInput, reason)
 					switch {
 					case approvalErr != nil:
 						result = llm.ErrorToolOut(approvalErr)
