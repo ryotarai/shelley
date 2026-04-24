@@ -389,14 +389,18 @@ function App() {
 
   // Handle conversation state updates (working state changes)
   const handleConversationStateUpdate = useCallback(
-    (state: { conversation_id: string; working: boolean }) => {
+    (state: { conversation_id: string; working: boolean; pending_approval?: boolean }) => {
       // Check if this is a top-level conversation
       setConversations((prev) => {
         const found = prev.find((conv) => conv.conversation_id === state.conversation_id);
         if (found) {
           return prev.map((conv) =>
             conv.conversation_id === state.conversation_id
-              ? { ...conv, working: state.working }
+              ? {
+                  ...conv,
+                  working: state.working,
+                  pending_approval: state.pending_approval ?? conv.pending_approval,
+                }
               : conv,
           );
         }

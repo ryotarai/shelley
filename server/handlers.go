@@ -559,6 +559,7 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 
 	// Get working states for all active conversations
 	workingStates := s.getWorkingConversations()
+	pendingApprovalStates := s.getConversationsWithPendingApproval()
 
 	// Get subagent counts
 	subagentCounts, err := s.db.GetSubagentCounts(ctx)
@@ -574,9 +575,10 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 	result := make([]ConversationWithState, len(conversations))
 	for i, conv := range conversations {
 		cws := ConversationWithState{
-			Conversation:  conv,
-			Working:       workingStates[conv.ConversationID],
-			SubagentCount: subagentCounts[conv.ConversationID],
+			Conversation:    conv,
+			Working:         workingStates[conv.ConversationID],
+			PendingApproval: pendingApprovalStates[conv.ConversationID],
+			SubagentCount:   subagentCounts[conv.ConversationID],
 		}
 		if conv.Cwd != nil {
 			gs, ok := gitStates[*conv.Cwd]
@@ -1047,9 +1049,10 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 			Messages:     apiMessages,
 			Conversation: conversation,
 			ConversationState: &ConversationState{
-				ConversationID: conversationID,
-				Working:        manager.IsAgentWorking(),
-				Model:          manager.GetModel(),
+				ConversationID:  conversationID,
+				Working:         manager.IsAgentWorking(),
+				Model:           manager.GetModel(),
+				PendingApproval: manager.HasPendingApproval(),
 			},
 			ContextWindowSize: ctxSize,
 		}
@@ -1061,9 +1064,10 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 		streamData := StreamResponse{
 			Conversation: conversation,
 			ConversationState: &ConversationState{
-				ConversationID: conversationID,
-				Working:        manager.IsAgentWorking(),
-				Model:          manager.GetModel(),
+				ConversationID:  conversationID,
+				Working:         manager.IsAgentWorking(),
+				Model:           manager.GetModel(),
+				PendingApproval: manager.HasPendingApproval(),
 			},
 			Heartbeat: true,
 		}

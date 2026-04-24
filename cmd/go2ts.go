@@ -91,9 +91,10 @@ type apiMessageForTS struct {
 }
 
 type conversationStateForTS struct {
-	ConversationID string `json:"conversation_id"`
-	Working        bool   `json:"working"`
-	Model          string `json:"model,omitempty"`
+	ConversationID  string `json:"conversation_id"`
+	Working         bool   `json:"working"`
+	Model           string `json:"model,omitempty"`
+	PendingApproval bool   `json:"pending_approval,omitempty"`
 }
 
 type conversationWithStateForTS struct {
@@ -108,6 +109,7 @@ type conversationWithStateForTS struct {
 	Model                *string `json:"model"`
 	ConversationOptions  string  `json:"conversation_options"`
 	Working              bool    `json:"working"`
+	PendingApproval      bool    `json:"pending_approval,omitempty"`
 	GitRepoRoot          string  `json:"git_repo_root,omitempty"`
 	GitWorktreeRoot      string  `json:"git_worktree_root,omitempty"`
 	GitCommit            string  `json:"git_commit,omitempty"`

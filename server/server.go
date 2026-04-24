@@ -47,15 +47,17 @@ type APIMessage struct {
 // ConversationState represents the current state of a conversation.
 // This is broadcast to all subscribers whenever the state changes.
 type ConversationState struct {
-	ConversationID string `json:"conversation_id"`
-	Working        bool   `json:"working"`
-	Model          string `json:"model,omitempty"`
+	ConversationID  string `json:"conversation_id"`
+	Working         bool   `json:"working"`
+	Model           string `json:"model,omitempty"`
+	PendingApproval bool   `json:"pending_approval,omitempty"`
 }
 
 // ConversationWithState combines a conversation with its working state.
 type ConversationWithState struct {
 	generated.Conversation
 	Working         bool   `json:"working"`
+	PendingApproval bool   `json:"pending_approval,omitempty"`
 	GitRepoRoot     string `json:"git_repo_root,omitempty"`
 	GitWorktreeRoot string `json:"git_worktree_root,omitempty"`
 	GitCommit       string `json:"git_commit,omitempty"`
@@ -1174,6 +1176,21 @@ func (s *Server) getWorkingConversations() map[string]bool {
 		}
 	}
 	return working
+}
+
+// getConversationsWithPendingApproval returns a map of conversation IDs
+// that currently have at least one tool call waiting for user approval.
+func (s *Server) getConversationsWithPendingApproval() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pending := make(map[string]bool)
+	for id, manager := range s.activeConversations {
+		if manager.HasPendingApproval() {
+			pending[id] = true
+		}
+	}
+	return pending
 }
 
 // IsAgentWorking returns whether the agent is currently working on the given conversation.
