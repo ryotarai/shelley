@@ -13,6 +13,7 @@ export const ja: TranslationKeys = {
 
   // Overflow Menu
   diffs: "差分",
+  gitGraph: "Git グラフ",
   terminal: "ターミナル",
   archiveConversation: "会話をアーカイブ",
   checkForNewVersion: "新しいバージョンを確認",
@@ -38,6 +39,9 @@ export const ja: TranslationKeys = {
   searchPlaceholder: "会話またはアクションを検索...",
   searching: "検索中...",
   noResults: "結果が見つかりません",
+  searchConversations: "会話を検索...",
+  noSearchResults: "一致する会話はありません",
+  clearSearch: "検索をクリア",
   toNavigate: "移動",
   toSelect: "選択",
   toClose: "閉じる",
@@ -56,6 +60,7 @@ export const ja: TranslationKeys = {
   jumpToPreviousMessage: "前のユーザーメッセージに移動",
   viewDiffs: "差分を表示",
   openGitDiffViewer: "Git差分ビューアを開く",
+  openGitGraphViewer: "Git グラフビューアを開く",
   addRemoveModelsKeys: "モデルとキーの追加・削除",
   configureModels: "AIモデルとAPIキーを設定",
   notificationSettings: "通知設定",
@@ -90,6 +95,7 @@ export const ja: TranslationKeys = {
   hideSubagents: "サブエージェントを非表示",
   showSubagents: "サブエージェントを表示",
   groupConversations: "会話をグループ化",
+  resortNow: "今すぐ並べ替え",
   noGrouping: "グループなし",
   directory: "ディレクトリ",
   gitRepo: "Gitリポジトリ",
@@ -131,6 +137,10 @@ export const ja: TranslationKeys = {
   tagsPlaceholder: "カンマ区切り、例: slug, cheap",
   tagsTooltip:
     'このモデル用のカンマ区切りのタグ。会話タイトル生成用のモデルとしてマークするには"slug"を使用します。"slug"タグを持つモデルがない場合は、会話のモデルが使用されます。',
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "テスト",
   testingButton: "テスト中...",
   save: "保存",
@@ -216,4 +226,5 @@ export const ja: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

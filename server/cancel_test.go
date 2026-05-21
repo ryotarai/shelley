@@ -22,22 +22,7 @@ import (
 // setupTestDB creates a test database
 func setupTestDB(t *testing.T) (*db.DB, func()) {
 	t.Helper()
-	tmpDir := t.TempDir()
-	database, err := db.New(db.Config{DSN: tmpDir + "/test.db"})
-	if err != nil {
-		t.Fatalf("Failed to create test database: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := database.Migrate(ctx); err != nil {
-		t.Fatalf("Failed to migrate test database: %v", err)
-	}
-
-	return database, func() {
-		database.Close()
-	}
+	return db.NewTestDB(t)
 }
 
 // waitFor polls a condition until it returns true or the timeout is reached.
@@ -62,12 +47,16 @@ func newTestServer(t *testing.T) (*Server, *db.DB, *loop.PredictableService) {
 	svr := NewServer(database, &testLLMManager{service: ps},
 		claudetool.ToolSetConfig{EnableBrowser: false},
 		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn})),
-		true, "", "predictable", "", nil)
+		true, "predictable", "")
+	if svr.terminals != nil {
+		svr.terminals.SetSpawner(InProcessSpawner)
+	}
 	return svr, database, ps
 }
 
 // TestCancelWithPredictableModel tests cancellation with the predictable model
 func TestCancelWithPredictableModel(t *testing.T) {
+	t.Parallel()
 	server, database, _ := newTestServer(t)
 
 	// Create conversation
@@ -273,6 +262,7 @@ func TestCancelWithPredictableModel(t *testing.T) {
 
 // TestCancelWithNoActiveConversation tests cancelling when there's no active conversation
 func TestCancelWithNoActiveConversation(t *testing.T) {
+	t.Parallel()
 	server, database, _ := newTestServer(t)
 
 	// Create a conversation but don't start it
@@ -304,6 +294,7 @@ func TestCancelWithNoActiveConversation(t *testing.T) {
 
 // TestCancelDuringTextGeneration tests cancelling during text generation (no tool call)
 func TestCancelDuringTextGeneration(t *testing.T) {
+	t.Parallel()
 	server, database, _ := newTestServer(t)
 
 	conversation, err := database.CreateConversation(context.Background(), nil, true, nil, nil, db.ConversationOptions{})

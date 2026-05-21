@@ -13,6 +13,7 @@ export const zhCN: TranslationKeys = {
 
   // Overflow Menu
   diffs: "差异对比",
+  gitGraph: "Git 图",
   terminal: "终端",
   archiveConversation: "归档对话",
   checkForNewVersion: "检查新版本",
@@ -38,6 +39,9 @@ export const zhCN: TranslationKeys = {
   searchPlaceholder: "搜索对话或操作...",
   searching: "搜索中...",
   noResults: "未找到结果",
+  searchConversations: "搜索对话...",
+  noSearchResults: "没有匹配的对话",
+  clearSearch: "清除搜索",
   toNavigate: "导航",
   toSelect: "选择",
   toClose: "关闭",
@@ -56,6 +60,7 @@ export const zhCN: TranslationKeys = {
   jumpToPreviousMessage: "跳转到上一条用户消息",
   viewDiffs: "查看差异",
   openGitDiffViewer: "打开 Git 差异查看器",
+  openGitGraphViewer: "打开 Git 图查看器",
   addRemoveModelsKeys: "添加/移除模型和密钥",
   configureModels: "配置 AI 模型和 API 密钥",
   notificationSettings: "通知设置",
@@ -90,6 +95,7 @@ export const zhCN: TranslationKeys = {
   hideSubagents: "隐藏子代理",
   showSubagents: "显示子代理",
   groupConversations: "对话分组",
+  resortNow: "立即重新排序",
   noGrouping: "不分组",
   directory: "目录",
   gitRepo: "Git 仓库",
@@ -131,6 +137,10 @@ export const zhCN: TranslationKeys = {
   tagsPlaceholder: "逗号分隔，例如：slug, cheap",
   tagsTooltip:
     '此模型的逗号分隔标签。使用 "slug" 标记此模型用于生成对话标题。如果没有模型带有 "slug" 标签，将使用对话当前的模型。',
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "测试",
   testingButton: "测试中...",
   save: "保存",
@@ -215,4 +225,5 @@ export const zhCN: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

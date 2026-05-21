@@ -7,6 +7,7 @@ package generated
 
 import (
 	"context"
+	"time"
 )
 
 const countMessagesByType = `-- name: CountMessagesByType :one
@@ -39,15 +40,16 @@ func (q *Queries) CountMessagesInConversation(ctx context.Context, conversationI
 }
 
 const createMessage = `-- name: CreateMessage :one
-INSERT INTO messages (message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, display_data, excluded_from_context)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context
+INSERT INTO messages (message_id, conversation_id, sequence_id, generation, type, llm_data, user_data, usage_data, display_data, excluded_from_context)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation
 `
 
 type CreateMessageParams struct {
 	MessageID           string  `json:"message_id"`
 	ConversationID      string  `json:"conversation_id"`
 	SequenceID          int64   `json:"sequence_id"`
+	Generation          int64   `json:"generation"`
 	Type                string  `json:"type"`
 	LlmData             *string `json:"llm_data"`
 	UserData            *string `json:"user_data"`
@@ -61,6 +63,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		arg.MessageID,
 		arg.ConversationID,
 		arg.SequenceID,
+		arg.Generation,
 		arg.Type,
 		arg.LlmData,
 		arg.UserData,
@@ -80,6 +83,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		&i.CreatedAt,
 		&i.DisplayData,
 		&i.ExcludedFromContext,
+		&i.Generation,
 	)
 	return i, err
 }
@@ -105,27 +109,59 @@ func (q *Queries) DeleteMessage(ctx context.Context, messageID string) error {
 }
 
 const getLatestAgentMessagesForConversations = `-- name: GetLatestAgentMessagesForConversations :many
-SELECT m.message_id, m.conversation_id, m.sequence_id, m.type, m.llm_data, m.user_data, m.usage_data, m.created_at, m.display_data, m.excluded_from_context FROM messages m
-INNER JOIN (
-  SELECT msg.conversation_id, MAX(msg.sequence_id) AS max_seq
-  FROM messages msg
-  INNER JOIN conversations c ON msg.conversation_id = c.conversation_id
-  WHERE msg.type = 'agent' AND c.archived = FALSE AND c.parent_conversation_id IS NULL
-  GROUP BY msg.conversation_id
-  ORDER BY max_seq DESC
-  LIMIT 50
-) latest ON m.conversation_id = latest.conversation_id AND m.sequence_id = latest.max_seq
+WITH recent_convs AS (
+  SELECT conversation_id
+  FROM conversations
+  WHERE archived = FALSE
+  ORDER BY updated_at DESC
+  LIMIT 500
+),
+ranked AS (
+  SELECT m.message_id, m.conversation_id, m.sequence_id, m.type,
+         m.llm_data, m.user_data, m.usage_data, m.created_at,
+         m.display_data, m.excluded_from_context, m.generation,
+         ROW_NUMBER() OVER (PARTITION BY m.conversation_id ORDER BY m.sequence_id DESC) AS rn
+  FROM messages m
+  INNER JOIN recent_convs c ON m.conversation_id = c.conversation_id
+  WHERE m.type = 'agent'
+)
+SELECT message_id, conversation_id, sequence_id, type,
+       llm_data, user_data, usage_data, created_at,
+       display_data, excluded_from_context, generation
+FROM ranked
+WHERE rn <= 5
+ORDER BY conversation_id, sequence_id DESC
 `
 
-func (q *Queries) GetLatestAgentMessagesForConversations(ctx context.Context) ([]Message, error) {
+type GetLatestAgentMessagesForConversationsRow struct {
+	MessageID           string    `json:"message_id"`
+	ConversationID      string    `json:"conversation_id"`
+	SequenceID          int64     `json:"sequence_id"`
+	Type                string    `json:"type"`
+	LlmData             *string   `json:"llm_data"`
+	UserData            *string   `json:"user_data"`
+	UsageData           *string   `json:"usage_data"`
+	CreatedAt           time.Time `json:"created_at"`
+	DisplayData         *string   `json:"display_data"`
+	ExcludedFromContext bool      `json:"excluded_from_context"`
+	Generation          int64     `json:"generation"`
+}
+
+// Returns the 5 most recent agent messages per unarchived conversation
+// (parents and subagents). The caller scans these to find the most recent
+// one with a non-empty text block - a tail of tool-only messages doesn't
+// leave the conversation with an empty preview. Bounded to the 500 most
+// recently updated conversations so the patch-stream recompute stays
+// cheap; anything outside the window renders with empty preview fields.
+func (q *Queries) GetLatestAgentMessagesForConversations(ctx context.Context) ([]GetLatestAgentMessagesForConversationsRow, error) {
 	rows, err := q.db.QueryContext(ctx, getLatestAgentMessagesForConversations)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Message{}
+	items := []GetLatestAgentMessagesForConversationsRow{}
 	for rows.Next() {
-		var i Message
+		var i GetLatestAgentMessagesForConversationsRow
 		if err := rows.Scan(
 			&i.MessageID,
 			&i.ConversationID,
@@ -137,6 +173,7 @@ func (q *Queries) GetLatestAgentMessagesForConversations(ctx context.Context) ([
 			&i.CreatedAt,
 			&i.DisplayData,
 			&i.ExcludedFromContext,
+			&i.Generation,
 		); err != nil {
 			return nil, err
 		}
@@ -152,7 +189,7 @@ func (q *Queries) GetLatestAgentMessagesForConversations(ctx context.Context) ([
 }
 
 const getLatestMessage = `-- name: GetLatestMessage :one
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
 WHERE conversation_id = ?
 ORDER BY sequence_id DESC
 LIMIT 1
@@ -172,12 +209,13 @@ func (q *Queries) GetLatestMessage(ctx context.Context, conversationID string) (
 		&i.CreatedAt,
 		&i.DisplayData,
 		&i.ExcludedFromContext,
+		&i.Generation,
 	)
 	return i, err
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
 WHERE message_id = ?
 `
 
@@ -195,6 +233,7 @@ func (q *Queries) GetMessage(ctx context.Context, messageID string) (Message, er
 		&i.CreatedAt,
 		&i.DisplayData,
 		&i.ExcludedFromContext,
+		&i.Generation,
 	)
 	return i, err
 }
@@ -212,8 +251,67 @@ func (q *Queries) GetNextSequenceID(ctx context.Context, conversationID string) 
 	return column_1, err
 }
 
+const listAgentMessagesSinceLastUser = `-- name: ListAgentMessagesSinceLastUser :many
+SELECT m.message_id, m.conversation_id, m.sequence_id, m.type,
+       m.llm_data, m.user_data, m.usage_data, m.created_at,
+       m.display_data, m.excluded_from_context, m.generation
+FROM messages m
+WHERE m.conversation_id = ? AND m.type = 'agent'
+  AND m.sequence_id > COALESCE(
+    (SELECT MAX(u.sequence_id) FROM messages u
+     WHERE u.conversation_id = ? AND u.type = 'user'),
+    0)
+ORDER BY m.sequence_id DESC
+`
+
+type ListAgentMessagesSinceLastUserParams struct {
+	ConversationID   string `json:"conversation_id"`
+	ConversationID_2 string `json:"conversation_id_2"`
+}
+
+// Returns the agent messages produced during the most recent user turn,
+// ordered newest-first. "Most recent user turn" = all agent messages
+// whose sequence_id is greater than the sequence_id of the most recent
+// user message (or all agent messages if there is no user message yet,
+// e.g. orchestrator-spawned conversations). Used by the end-of-turn
+// notification builder to pick a useful body line.
+func (q *Queries) ListAgentMessagesSinceLastUser(ctx context.Context, arg ListAgentMessagesSinceLastUserParams) ([]Message, error) {
+	rows, err := q.db.QueryContext(ctx, listAgentMessagesSinceLastUser, arg.ConversationID, arg.ConversationID_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Message{}
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.MessageID,
+			&i.ConversationID,
+			&i.SequenceID,
+			&i.Type,
+			&i.LlmData,
+			&i.UserData,
+			&i.UsageData,
+			&i.CreatedAt,
+			&i.DisplayData,
+			&i.ExcludedFromContext,
+			&i.Generation,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMessages = `-- name: ListMessages :many
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
 WHERE conversation_id = ?
 ORDER BY sequence_id ASC
 `
@@ -238,6 +336,7 @@ func (q *Queries) ListMessages(ctx context.Context, conversationID string) ([]Me
 			&i.CreatedAt,
 			&i.DisplayData,
 			&i.ExcludedFromContext,
+			&i.Generation,
 		); err != nil {
 			return nil, err
 		}
@@ -253,7 +352,7 @@ func (q *Queries) ListMessages(ctx context.Context, conversationID string) ([]Me
 }
 
 const listMessagesByType = `-- name: ListMessagesByType :many
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
 WHERE conversation_id = ? AND type = ?
 ORDER BY sequence_id ASC
 `
@@ -283,6 +382,7 @@ func (q *Queries) ListMessagesByType(ctx context.Context, arg ListMessagesByType
 			&i.CreatedAt,
 			&i.DisplayData,
 			&i.ExcludedFromContext,
+			&i.Generation,
 		); err != nil {
 			return nil, err
 		}
@@ -298,9 +398,12 @@ func (q *Queries) ListMessagesByType(ctx context.Context, arg ListMessagesByType
 }
 
 const listMessagesForContext = `-- name: ListMessagesForContext :many
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
-WHERE conversation_id = ? AND excluded_from_context = FALSE
-ORDER BY sequence_id ASC
+SELECT m.message_id, m.conversation_id, m.sequence_id, m.type, m.llm_data, m.user_data, m.usage_data, m.created_at, m.display_data, m.excluded_from_context, m.generation FROM messages m
+INNER JOIN conversations c ON m.conversation_id = c.conversation_id
+WHERE m.conversation_id = ?
+  AND m.excluded_from_context = FALSE
+  AND m.generation = c.current_generation
+ORDER BY m.sequence_id ASC
 `
 
 func (q *Queries) ListMessagesForContext(ctx context.Context, conversationID string) ([]Message, error) {
@@ -323,6 +426,7 @@ func (q *Queries) ListMessagesForContext(ctx context.Context, conversationID str
 			&i.CreatedAt,
 			&i.DisplayData,
 			&i.ExcludedFromContext,
+			&i.Generation,
 		); err != nil {
 			return nil, err
 		}
@@ -338,7 +442,7 @@ func (q *Queries) ListMessagesForContext(ctx context.Context, conversationID str
 }
 
 const listMessagesPaginated = `-- name: ListMessagesPaginated :many
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
 WHERE conversation_id = ?
 ORDER BY sequence_id ASC
 LIMIT ? OFFSET ?
@@ -370,6 +474,7 @@ func (q *Queries) ListMessagesPaginated(ctx context.Context, arg ListMessagesPag
 			&i.CreatedAt,
 			&i.DisplayData,
 			&i.ExcludedFromContext,
+			&i.Generation,
 		); err != nil {
 			return nil, err
 		}
@@ -385,7 +490,7 @@ func (q *Queries) ListMessagesPaginated(ctx context.Context, arg ListMessagesPag
 }
 
 const listMessagesSince = `-- name: ListMessagesSince :many
-SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context FROM messages
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
 WHERE conversation_id = ? AND sequence_id > ?
 ORDER BY sequence_id ASC
 `
@@ -415,6 +520,58 @@ func (q *Queries) ListMessagesSince(ctx context.Context, arg ListMessagesSincePa
 			&i.CreatedAt,
 			&i.DisplayData,
 			&i.ExcludedFromContext,
+			&i.Generation,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMessagesTail = `-- name: ListMessagesTail :many
+SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM (
+  SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data, created_at, display_data, excluded_from_context, generation FROM messages
+  WHERE conversation_id = ?
+  ORDER BY sequence_id DESC
+  LIMIT ?
+) ORDER BY sequence_id ASC
+`
+
+type ListMessagesTailParams struct {
+	ConversationID string `json:"conversation_id"`
+	Limit          int64  `json:"limit"`
+}
+
+// Returns the last N messages in ascending order. If fewer than N
+// exist, returns all of them.
+func (q *Queries) ListMessagesTail(ctx context.Context, arg ListMessagesTailParams) ([]Message, error) {
+	rows, err := q.db.QueryContext(ctx, listMessagesTail, arg.ConversationID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Message{}
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.MessageID,
+			&i.ConversationID,
+			&i.SequenceID,
+			&i.Type,
+			&i.LlmData,
+			&i.UserData,
+			&i.UsageData,
+			&i.CreatedAt,
+			&i.DisplayData,
+			&i.ExcludedFromContext,
+			&i.Generation,
 		); err != nil {
 			return nil, err
 		}

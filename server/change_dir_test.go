@@ -22,6 +22,7 @@ import (
 // TestChangeDirAffectsBash tests that change_dir updates the working directory
 // and subsequent bash commands run in that directory.
 func TestChangeDirAffectsBash(t *testing.T) {
+	t.Parallel()
 	// Create a temp directory structure
 	tmpDir := t.TempDir()
 	subDir := filepath.Join(tmpDir, "subdir")
@@ -46,7 +47,7 @@ func TestChangeDirAffectsBash(t *testing.T) {
 	toolSetConfig := claudetool.ToolSetConfig{
 		WorkingDir: tmpDir,
 	}
-	server := NewServer(database, llmManager, toolSetConfig, logger, true, "", "predictable", "", nil)
+	server := NewServer(database, llmManager, toolSetConfig, logger, true, "predictable", "")
 
 	// Create conversation
 	conversation, err := database.CreateConversation(context.Background(), nil, true, nil, nil, db.ConversationOptions{})
@@ -168,6 +169,7 @@ func truncate(s string, maxLen int) string {
 // TestChangeDirBroadcastsCwdUpdate tests that change_dir broadcasts the updated cwd
 // to SSE subscribers so the UI gets the change immediately.
 func TestChangeDirBroadcastsCwdUpdate(t *testing.T) {
+	t.Parallel()
 	// Create a temp directory structure
 	tmpDir := t.TempDir()
 	subDir := filepath.Join(tmpDir, "subdir")
@@ -186,7 +188,7 @@ func TestChangeDirBroadcastsCwdUpdate(t *testing.T) {
 	toolSetConfig := claudetool.ToolSetConfig{
 		WorkingDir: tmpDir,
 	}
-	server := NewServer(database, llmManager, toolSetConfig, logger, true, "", "predictable", "", nil)
+	server := NewServer(database, llmManager, toolSetConfig, logger, true, "predictable", "")
 
 	// Create test server
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +282,7 @@ func TestChangeDirBroadcastsCwdUpdate(t *testing.T) {
 		select {
 		case event := <-events:
 			// Check if this event has the updated cwd
-			if event.Conversation.Cwd != nil && *event.Conversation.Cwd == subDir {
+			if event.Conversation != nil && event.Conversation.Cwd != nil && *event.Conversation.Cwd == subDir {
 				// Success! The UI would receive this update
 				return
 			}
@@ -290,4 +292,68 @@ func TestChangeDirBroadcastsCwdUpdate(t *testing.T) {
 	}
 
 	t.Error("did not receive SSE event with updated cwd")
+}
+
+func TestChangeDirBroadcastsConversationListPatch(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "subdir")
+	if err := os.Mkdir(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+	predictableService := loop.NewPredictableService()
+	llmManager := &testLLMManager{service: predictableService}
+	server := NewServer(database, llmManager, claudetool.ToolSetConfig{WorkingDir: tmpDir}, slog.Default(), true, "predictable", "")
+
+	conversation, err := database.CreateConversation(context.Background(), nil, true, &tmpDir, nil, db.ConversationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+	rec := newFlusherRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/stream", nil).WithContext(streamCtx)
+	done := make(chan struct{})
+	go func() {
+		server.handleStream(rec, req)
+		close(done)
+	}()
+	initial := waitForPatchEventAfter(t, rec, "")
+	state := []ConversationWithState{}
+	state = mustApplyPatch(t, state, initial.Patch)
+	verifyHash(t, state, initial.NewHash)
+	prevHash := initial.NewHash
+
+	// Hydrate may write a system prompt and bump updated_at, producing one or
+	// more interstitial patch events before the cwd write lands. Apply
+	// whatever arrives until the cwd we requested is visible.
+	_, err = server.getOrCreateConversationManager(context.Background(), conversation.ConversationID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateConversationCwd(context.Background(), conversation.ConversationID, subDir); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		patch := waitForPatchEventAfter(t, rec, prevHash)
+		state = mustApplyPatch(t, state, patch.Patch)
+		verifyHash(t, state, patch.NewHash)
+		prevHash = patch.NewHash
+		if len(state) == 1 && state[0].Cwd != nil && *state[0].Cwd == subDir {
+			streamCancel()
+			<-done
+			return
+		}
+	}
+	var got string
+	if len(state) == 1 && state[0].Cwd != nil {
+		got = *state[0].Cwd
+	}
+	t.Fatalf("expected patched cwd %q, got %q (state=%+v)", subDir, got, state)
 }

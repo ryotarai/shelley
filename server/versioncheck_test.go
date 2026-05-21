@@ -13,6 +13,7 @@ import (
 )
 
 func TestExtractSHAFromTag(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		tag      string
 		expected string
@@ -45,6 +46,7 @@ func TestExtractSHAFromTag(t *testing.T) {
 }
 
 func TestParseMinorVersion(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		tag      string
 		expected int
@@ -72,6 +74,7 @@ func TestParseMinorVersion(t *testing.T) {
 }
 
 func TestIsNewerMinor(t *testing.T) {
+	t.Parallel()
 	vc := &VersionChecker{}
 
 	tests := []struct {
@@ -141,6 +144,7 @@ func TestVersionCheckerSkipCheck(t *testing.T) {
 }
 
 func TestVersionCheckerCache(t *testing.T) {
+	t.Parallel()
 	// Create a mock server
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -183,6 +187,7 @@ func TestVersionCheckerCache(t *testing.T) {
 }
 
 func TestFindDownloadURL(t *testing.T) {
+	t.Parallel()
 	vc := &VersionChecker{}
 
 	release := &ReleaseInfo{
@@ -204,6 +209,7 @@ func TestFindDownloadURL(t *testing.T) {
 }
 
 func TestFetchChangelogPrefixMatching(t *testing.T) {
+	t.Parallel()
 	// v0.212.925024401 -> extractSHAFromTag returns "542901" (6 chars)
 	// v0.213.950002063 -> extractSHAFromTag returns "a00433" (6 chars)
 	// commits.json has "542901e" and "a004332" (7 chars)
@@ -272,6 +278,7 @@ func TestFetchChangelogPrefixMatching(t *testing.T) {
 }
 
 func TestFetchChangelogPrefixMatchingMultipleCommits(t *testing.T) {
+	t.Parallel()
 	// Same as above but with commits between current and latest
 	commits := []StaticCommitInfo{
 		{SHA: "a004332", Subject: "fix: latest commit"},
@@ -328,6 +335,7 @@ func hasPrefix(a, b string) bool {
 }
 
 func TestHeadlessShellHasUpdate(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		current  string
@@ -357,6 +365,7 @@ func TestHeadlessShellHasUpdate(t *testing.T) {
 }
 
 func TestIsPermissionError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		err      error

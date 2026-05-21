@@ -21,6 +21,10 @@ export interface EphemeralTerminal {
   command: string;
   cwd: string;
   createdAt: Date;
+  // termId is the server-side dtach session id. Set once the websocket reports
+  // "attached". When reconnecting to a known session, set this up front so the
+  // websocket re-attaches rather than spawning a new session.
+  termId?: string;
 }
 
 interface TerminalPanelProps {
@@ -30,6 +34,9 @@ interface TerminalPanelProps {
   autoFocusId?: string | null;
   onAutoFocusConsumed?: () => void;
   onActiveTerminalExited?: () => void;
+  // onAttached fires when the server tells us which persistent session id this
+  // terminal landed on. Callers can persist the id to survive reloads.
+  onAttached?: (id: string, termId: string) => void;
 }
 
 // Theme colors for xterm.js
@@ -247,6 +254,7 @@ export default function TerminalPanel({
   autoFocusId,
   onAutoFocusConsumed,
   onActiveTerminalExited,
+  onAttached,
 }: TerminalPanelProps) {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [height, setHeight] = useState(300);
@@ -612,6 +620,7 @@ export default function TerminalPanel({
             onStatusChange={handleStatusChange}
             onRegister={registerXterm}
             onUnregister={unregisterXterm}
+            onAttached={onAttached}
           />
         ))}
       </div>
@@ -627,6 +636,7 @@ function TerminalInstanceWithRegistry({
   onStatusChange,
   onRegister,
   onUnregister,
+  onAttached,
 }: {
   term: EphemeralTerminal;
   isVisible: boolean;
@@ -634,6 +644,7 @@ function TerminalInstanceWithRegistry({
   onStatusChange: (id: string, status: TermStatus, exitCode: number | null) => void;
   onRegister: (id: string, xterm: Terminal) => void;
   onUnregister: (id: string) => void;
+  onAttached?: (id: string, termId: string) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -649,6 +660,8 @@ function TerminalInstanceWithRegistry({
       fontFamily: 'Consolas, "Liberation Mono", Menlo, Courier, monospace',
       theme: getTerminalTheme(isDark),
       scrollback: 10000,
+      // Kitty keyboard protocol — clients opt in via `CSI = u` so this is safe to leave on.
+      vtExtensions: { kittyKeyboard: true },
     });
     xtermRef.current = xterm;
 
@@ -677,9 +690,35 @@ function TerminalInstanceWithRegistry({
     fitAddon.fit();
     onRegister(term.id, xterm);
 
+    // Mobile soft-keyboard fix: on touch devices the xterm helper textarea
+    // can't be focused by tapping (it has pointer-events: none so the
+    // viewport remains scrollable). Listen for pointerdown inside the
+    // terminal area and focus xterm programmatically — this happens inside
+    // a user gesture, which is what iOS/Android require to open the keyboard.
+    const handlePointerDown = (e: PointerEvent) => {
+      // Only handle touch — pen/stylus shouldn't auto-summon the OSK, and
+      // mouse already focuses xterm through its own handlers.
+      if (e.pointerType !== "touch") return;
+      xterm.focus();
+    };
+    containerRef.current.addEventListener("pointerdown", handlePointerDown);
+
+    // Show the command as a banner so users can see and copy/paste what they
+    // ran. Written client-side on every attach (the xterm buffer is fresh on
+    // each mount, so there's no duplication).
+    xterm.write(`\x1b[2m$ ${term.command}\x1b[0m\r\n`);
+
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    // If we already have a persistent session id, reattach to it. Otherwise
+    // spawn a new one by sending cmd+cwd.
+    const params = new URLSearchParams();
+    if (term.termId) {
+      params.set("term_id", term.termId);
+    }
+    params.set("cmd", term.command);
+    params.set("cwd", term.cwd);
     const wsPath = withBasePath("/api/exec-ws");
-    const wsUrl = `${protocol}//${window.location.host}${wsPath}?cmd=${encodeURIComponent(term.command)}&cwd=${encodeURIComponent(term.cwd)}`;
+    const wsUrl = `${protocol}//${window.location.host}${wsPath}?${params.toString()}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -693,6 +732,8 @@ function TerminalInstanceWithRegistry({
         const msg = JSON.parse(event.data);
         if (msg.type === "output" && msg.data) {
           xterm.write(base64ToUint8Array(msg.data));
+        } else if (msg.type === "attached" && msg.term_id) {
+          onAttached?.(term.id, msg.term_id);
         } else if (msg.type === "exit") {
           const code = parseInt(msg.data, 10) || 0;
           onStatusChange(term.id, "exited", code);
@@ -731,8 +772,10 @@ function TerminalInstanceWithRegistry({
     });
     ro.observe(containerRef.current);
 
+    const container = containerRef.current;
     return () => {
       ro.disconnect();
+      container?.removeEventListener("pointerdown", handlePointerDown);
       ws.close();
       xterm.dispose();
       onUnregister(term.id);

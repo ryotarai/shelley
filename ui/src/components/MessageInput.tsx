@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useI18n } from "../i18n";
 import { withBasePath } from "../services/paths";
+import { pickPlaceholderHint } from "../utils/placeholderHints";
 
 // Web Speech API types
 interface SpeechRecognitionEvent extends Event {
@@ -68,6 +69,40 @@ interface MessageInputProps {
 
 const PERSIST_KEY_PREFIX = "shelley_draft_";
 
+function draftStorageKey(persistKey: string): string {
+  return PERSIST_KEY_PREFIX + persistKey;
+}
+
+function draftUpdatedAtStorageKey(persistKey: string): string {
+  return draftStorageKey(persistKey) + "_updated_at";
+}
+
+function notifyDraftChanged(persistKey: string, value: string): void {
+  window.dispatchEvent(
+    new CustomEvent("shelley-draft-changed", {
+      detail: { key: persistKey, value },
+    }),
+  );
+}
+
+function clearPersistedDraft(persistKey: string): void {
+  localStorage.removeItem(draftStorageKey(persistKey));
+  localStorage.removeItem(draftUpdatedAtStorageKey(persistKey));
+  notifyDraftChanged(persistKey, "");
+}
+
+interface Attachment {
+  id: string;
+  name: string;
+  isImage: boolean;
+  /** Object URL for image preview thumbnail; revoked on remove/unmount. */
+  previewUrl?: string;
+  status: "uploading" | "ready" | "error";
+  /** Server-returned path; only present once status === "ready". */
+  path?: string;
+  error?: string;
+}
+
 function MessageInput({
   onSend,
   onQueue,
@@ -87,12 +122,14 @@ function MessageInput({
   const [message, setMessage] = useState(() => {
     // Load persisted draft if persistKey is set
     if (persistKey) {
-      return localStorage.getItem(PERSIST_KEY_PREFIX + persistKey) || "";
+      return localStorage.getItem(draftStorageKey(persistKey)) || "";
     }
     return "";
   });
   const [submitting, setSubmitting] = useState(false);
-  const [uploadsInProgress, setUploadsInProgress] = useState(0);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const uploadsInProgress = attachments.filter((a) => a.status === "uploading").length;
+  const readyAttachments = attachments.filter((a) => a.status === "ready" && a.path);
   const [dragCounter, setDragCounter] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [isSmallScreen, setIsSmallScreen] = useState(() => {
@@ -112,11 +149,21 @@ function MessageInput({
   const speechRecognitionAvailable =
     typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
 
-  // Responsive placeholder text
-  const placeholderText = useMemo(
-    () => (isSmallScreen ? t("messagePlaceholderShort") : t("messagePlaceholder")),
-    [isSmallScreen, t],
-  );
+  // Pick a placeholder hint per mount; re-pick when the platform (mobile/desktop) flips.
+  const [hint, setHint] = useState(() => pickPlaceholderHint(isSmallScreen));
+  const initialPlatformRef = useRef(isSmallScreen);
+  useEffect(() => {
+    if (isSmallScreen === initialPlatformRef.current) return; // skip initial mount; useState already rolled
+    initialPlatformRef.current = isSmallScreen;
+    setHint(pickPlaceholderHint(isSmallScreen));
+  }, [isSmallScreen]);
+
+  // Responsive placeholder text. The "default" hint defers to the i18n string;
+  // other hints carry literal text and are not translated.
+  const placeholderText = useMemo(() => {
+    if (hint.id !== "default" && hint.text) return hint.text;
+    return isSmallScreen ? t("messagePlaceholderShort") : t("messagePlaceholder");
+  }, [hint, isSmallScreen, t]);
 
   // Track screen size for responsive placeholder
   useEffect(() => {
@@ -229,10 +276,13 @@ function MessageInput({
   }, [canQueue, autoQueue]);
 
   const uploadFile = async (file: File) => {
-    // Add a loading indicator at the end of the current message
-    const loadingText = `[uploading ${file.name}...]`;
-    setMessage((prev) => (prev ? prev + " " : "") + loadingText);
-    setUploadsInProgress((prev) => prev + 1);
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const isImage = file.type.startsWith("image/");
+    const previewUrl = isImage ? URL.createObjectURL(file) : undefined;
+    setAttachments((prev) => [
+      ...prev,
+      { id, name: file.name, isImage, previewUrl, status: "uploading" },
+    ]);
 
     try {
       const formData = new FormData();
@@ -244,21 +294,74 @@ function MessageInput({
       });
 
       if (!response.ok) {
-        throw new Error(`Upload failed: ${response.statusText}`);
+        const errorText = await response.text();
+        let message = response.statusText;
+        if (errorText.trim()) {
+          try {
+            const payload = JSON.parse(errorText) as { message?: unknown };
+            if (typeof payload.message === "string" && payload.message.trim()) {
+              message = payload.message.trim();
+            }
+          } catch {
+            message = errorText.trim();
+          }
+        }
+        throw new Error(`Upload failed: ${message}`);
       }
 
       const data = await response.json();
 
-      // Replace the loading placeholder with the actual file path
-      setMessage((currentMessage) => currentMessage.replace(loadingText, `[${data.path}]`));
+      setAttachments((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, status: "ready", path: data.path } : a)),
+      );
     } catch (error) {
       console.error("Failed to upload file:", error);
-      // Replace loading indicator with error message
-      const errorText = `[upload failed: ${error instanceof Error ? error.message : "unknown error"}]`;
-      setMessage((currentMessage) => currentMessage.replace(loadingText, errorText));
-    } finally {
-      setUploadsInProgress((prev) => prev - 1);
+      const msg = error instanceof Error ? error.message : "unknown error";
+      setAttachments((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, status: "error", error: msg } : a)),
+      );
     }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((prev) => {
+      const found = prev.find((a) => a.id === id);
+      if (found?.previewUrl) URL.revokeObjectURL(found.previewUrl);
+      return prev.filter((a) => a.id !== id);
+    });
+  };
+
+  // Revoke any remaining object URLs on unmount. We track current attachments
+  // through a ref so the unmount cleanup sees the latest list (a plain []
+  // deps useEffect would close over the initial empty array and leak URLs).
+  const attachmentsRef = useRef(attachments);
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+  useEffect(() => {
+    return () => {
+      attachmentsRef.current.forEach((a) => {
+        if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+      });
+    };
+  }, []);
+
+  /**
+   * Compose the final message text by appending `[path]` tokens for each
+   * ready attachment. Used at send time; thumbnails are shown until then.
+   */
+  const composeMessageWithAttachments = (text: string): string => {
+    if (readyAttachments.length === 0) return text;
+    const tokens = readyAttachments.map((a) => `[${a.path}]`).join(" ");
+    const trimmed = text.trimEnd();
+    return trimmed.length > 0 ? `${trimmed} ${tokens}` : tokens;
+  };
+
+  const clearAttachments = () => {
+    attachments.forEach((a) => {
+      if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+    });
+    setAttachments([]);
   };
 
   const handlePaste = (event: React.ClipboardEvent) => {
@@ -303,10 +406,13 @@ function MessageInput({
     event.stopPropagation();
     setDragCounter(0);
 
+    // Snapshot the file list synchronously. After the first `await`, the
+    // DataTransfer enters "protected mode" and `event.dataTransfer.files`
+    // becomes empty, so iterating over it across awaits would only ever
+    // upload the first file.
     if (event.dataTransfer && event.dataTransfer.files.length > 0) {
-      // Process all dropped files
-      for (let i = 0; i < event.dataTransfer.files.length; i++) {
-        const file = event.dataTransfer.files[i];
+      const files = Array.from(event.dataTransfer.files);
+      for (const file of files) {
         await uploadFile(file);
       }
     }
@@ -342,9 +448,11 @@ function MessageInput({
     }
   }, [injectedText, onClearInjectedText]);
 
+  const hasContent = message.trim().length > 0 || readyAttachments.length > 0;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (message.trim() && !disabled && !submitting && uploadsInProgress === 0) {
+    if (hasContent && !disabled && !submitting && uploadsInProgress === 0) {
       // Stop listening if we were recording
       if (isListening) {
         stopListening();
@@ -352,10 +460,11 @@ function MessageInput({
 
       // Auto-queue when distilling or when explicitly requested
       if (autoQueue && onQueue) {
-        const messageToQueue = message.trim();
+        const messageToQueue = composeMessageWithAttachments(message).trim();
         setMessage("");
+        clearAttachments();
         if (persistKey) {
-          localStorage.removeItem(PERSIST_KEY_PREFIX + persistKey);
+          clearPersistedDraft(persistKey);
         }
         try {
           await onQueue(messageToQueue);
@@ -365,15 +474,16 @@ function MessageInput({
         return;
       }
 
-      const messageToSend = message;
+      const messageToSend = composeMessageWithAttachments(message);
       setSubmitting(true);
       try {
         await onSend(messageToSend);
         // Only clear on success
         setMessage("");
+        clearAttachments();
         // Clear persisted draft on successful send
         if (persistKey) {
-          localStorage.removeItem(PERSIST_KEY_PREFIX + persistKey);
+          clearPersistedDraft(persistKey);
         }
       } catch {
         // Keep the message on error so user can retry
@@ -384,14 +494,15 @@ function MessageInput({
   };
 
   const handleQueueMessage = async () => {
-    if (message.trim() && onQueue) {
+    if (hasContent && onQueue) {
       if (isListening) {
         stopListening();
       }
-      const messageToQueue = message.trim();
+      const messageToQueue = composeMessageWithAttachments(message).trim();
       setMessage("");
+      clearAttachments();
       if (persistKey) {
-        localStorage.removeItem(PERSIST_KEY_PREFIX + persistKey);
+        clearPersistedDraft(persistKey);
       }
       setShowQueueMenu(false);
       try {
@@ -405,14 +516,15 @@ function MessageInput({
 
   /** Send now (bypass auto-queue) — used from the dropdown during distill mode */
   const handleSendNow = async () => {
-    if (message.trim() && !disabled && !submitting && uploadsInProgress === 0) {
+    if (hasContent && !disabled && !submitting && uploadsInProgress === 0) {
       if (isListening) {
         stopListening();
       }
-      const messageToSend = message.trim();
+      const messageToSend = composeMessageWithAttachments(message).trim();
       setMessage("");
+      clearAttachments();
       if (persistKey) {
-        localStorage.removeItem(PERSIST_KEY_PREFIX + persistKey);
+        clearPersistedDraft(persistKey);
       }
       setShowQueueMenu(false);
       setSubmitting(true);
@@ -468,14 +580,23 @@ function MessageInput({
     }
   }, [submitting]);
 
-  // Persist draft to localStorage when persistKey is set
+  // Persist draft to localStorage when persistKey is set, alongside a sibling
+  // 'updated_at' timestamp so the ConversationDrawer's draft entry can show
+  // a real timestamp in its meta row (same as actual conversations).
   useEffect(() => {
     if (persistKey) {
+      const tsKey = draftUpdatedAtStorageKey(persistKey);
       if (message) {
-        localStorage.setItem(PERSIST_KEY_PREFIX + persistKey, message);
+        localStorage.setItem(draftStorageKey(persistKey), message);
+        localStorage.setItem(tsKey, new Date().toISOString());
       } else {
-        localStorage.removeItem(PERSIST_KEY_PREFIX + persistKey);
+        localStorage.removeItem(draftStorageKey(persistKey));
+        localStorage.removeItem(tsKey);
       }
+      // Notify listeners (e.g. ConversationDrawer's draft entry) so they can
+      // refresh without polling. localStorage's 'storage' event only fires
+      // cross-tab, hence this custom event for same-tab updates.
+      notifyDraftChanged(persistKey, message);
     }
   }, [message, persistKey]);
 
@@ -515,7 +636,7 @@ function MessageInput({
   }, []);
 
   const isDisabled = disabled;
-  const canSubmit = message.trim() && !isDisabled && !submitting && uploadsInProgress === 0;
+  const canSubmit = hasContent && !isDisabled && !submitting && uploadsInProgress === 0;
 
   const isDraggingOver = dragCounter > 0;
   // Check if user is typing a shell command (starts with !)
@@ -545,6 +666,60 @@ function MessageInput({
           accept="image/*,video/*,audio/*,.pdf,.txt,.md,.json,.csv,.xml,.html,.css,.js,.ts,.tsx,.jsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.yaml,.yml,.toml,.sql,.log,*"
           aria-hidden="true"
         />
+        {attachments.length > 0 && (
+          <div className="message-attachments" data-testid="message-attachments">
+            {attachments.map((a) => (
+              <div
+                key={a.id}
+                className={`message-attachment message-attachment-${a.status}`}
+                title={a.status === "error" ? `${a.name}: ${a.error}` : a.name}
+              >
+                {a.isImage && a.previewUrl ? (
+                  <img src={a.previewUrl} alt={a.name} className="message-attachment-thumb" />
+                ) : (
+                  <div className="message-attachment-file">
+                    <svg
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      viewBox="0 0 24 24"
+                      width="20"
+                      height="20"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"
+                      />
+                      <polyline
+                        points="14 2 14 8 20 8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                    <span className="message-attachment-name">{a.name}</span>
+                  </div>
+                )}
+                {a.status === "uploading" && (
+                  <div className="message-attachment-overlay">
+                    <div className="spinner spinner-small"></div>
+                  </div>
+                )}
+                {a.status === "error" && <div className="message-attachment-error-badge">!</div>}
+                <button
+                  type="button"
+                  className="message-attachment-remove"
+                  onClick={() => removeAttachment(a.id)}
+                  aria-label={`Remove ${a.name}`}
+                >
+                  <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="textarea-wrapper">
           {isShellMode && (
             <div className="shell-mode-indicator" title="This will run as a shell command">

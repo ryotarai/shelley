@@ -54,7 +54,14 @@ func checkStaleness() {
 		return
 	}
 
-	buildTime := time.UnixMilli(buildInfo.Timestamp)
+	// Allow a small grace window. Filesystem mtime granularity is at most
+	// 1s on NFS/older extN, and CI ordering between git checkout and the
+	// in-process Date.now() captured by the UI build script can land a
+	// freshly-built source a sub-second after that timestamp even though
+	// nothing actually edited it. 5s comfortably covers both without
+	// hiding genuinely stale builds.
+	const staleSlack = 5 * time.Second
+	buildTime := time.UnixMilli(buildInfo.Timestamp).Add(staleSlack)
 
 	// Check if source directory exists (we might be in a deployed binary without source)
 	srcDir := buildInfo.SrcDir

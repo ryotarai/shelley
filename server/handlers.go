@@ -22,6 +22,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
+	"shelley.exe.dev/claudetool"
 	"shelley.exe.dev/claudetool/browse"
 	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
@@ -59,7 +62,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	// Clean and enforce prefix restriction
 	clean := filepath.Clean(p)
-	if !(strings.HasPrefix(clean, browse.ScreenshotDir+"/") || strings.HasPrefix(clean, browse.ConsoleLogsDir+"/") || strings.HasPrefix(clean, browse.ScreencastDir+"/")) {
+	if !isReadableUIFile(clean) {
 		http.Error(w, "path not allowed", http.StatusForbidden)
 		return
 	}
@@ -99,6 +102,52 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	// Reasonable short-term caching for assets, allow quick refresh during sessions
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	io.Copy(w, f)
+}
+
+func isReadableUIFile(path string) bool {
+	return strings.HasPrefix(path, browse.ScreenshotDir+"/") ||
+		strings.HasPrefix(path, browse.UploadDir+"/") ||
+		strings.HasPrefix(path, browse.ConsoleLogsDir+"/") ||
+		strings.HasPrefix(path, browse.ScreencastDir+"/") ||
+		isDistillationTempFile(path)
+}
+
+func isDistillationTempFile(path string) bool {
+	dir := filepath.Join(os.TempDir(), "shelley-distillations")
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(resolvedPath, resolvedDir+string(os.PathSeparator))
+}
+
+// handleUserAgentsMd returns the current content of the user's AGENTS.md.
+// The modal uses this instead of the page-load snapshot so that reopening the
+// editor shows freshly-saved content rather than whatever was on disk when the
+// page was first loaded.
+func (s *Server) handleUserAgentsMd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	path, err := userAgentsMdPath()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	content := ""
+	if b, err := os.ReadFile(path); err == nil {
+		content = string(b)
+	} else if !os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("failed to read file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"path": path, "content": content})
 }
 
 // handleWriteFile writes content to a file (for diff viewer edit mode)
@@ -149,67 +198,214 @@ func userAgentsMdPath() (string, error) {
 	return filepath.Join(home, ".config", "shelley", "AGENTS.md"), nil
 }
 
-// handleUpload handles file uploads via POST /api/upload
-// Files are saved to the ScreenshotDir with a random filename
+const maxUploadBytes = 1 << 30 // 1 GiB
+
+type uploadErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+// handleUpload handles file uploads via POST /api/upload.
+// Files are saved to the UploadDir with a random filename.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Limit to 10MB file size
-	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
-
-	// Parse the multipart form
-	if err := r.ParseMultipartForm(10 * 1024 * 1024); err != nil {
-		http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Get the file from the multipart form
-	file, handler, err := r.FormFile("file")
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	mr, err := r.MultipartReader()
 	if err != nil {
-		http.Error(w, "failed to get uploaded file: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	// Generate a unique ID (8 random bytes converted to 16 hex chars)
-	randBytes := make([]byte, 8)
-	if _, err := rand.Read(randBytes); err != nil {
-		http.Error(w, "failed to generate random filename: "+err.Error(), http.StatusInternalServerError)
+		writeUploadParseError(w, "failed to parse form: ", err)
 		return
 	}
 
-	// Get file extension from the original filename
-	ext := filepath.Ext(handler.Filename)
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			writeUploadError(w, http.StatusBadRequest, "missing_file", "failed to get uploaded file: http: no such file")
+			return
+		}
+		if err != nil {
+			writeUploadParseError(w, "failed to parse form: ", err)
+			return
+		}
+		if part.FormName() != "file" || part.FileName() == "" {
+			part.Close()
+			continue
+		}
 
-	// Create a unique filename in the ScreenshotDir
-	filename := filepath.Join(browse.ScreenshotDir, fmt.Sprintf("upload_%s%s", hex.EncodeToString(randBytes), ext))
+		path, err := saveUploadFile(part.FileName(), part)
+		part.Close()
+		if err != nil {
+			writeUploadSaveError(w, err)
+			return
+		}
+		writeUploadResponse(w, path)
+		return
+	}
+}
 
-	// Ensure the directory exists
-	if err := os.MkdirAll(browse.ScreenshotDir, 0o755); err != nil {
-		http.Error(w, "failed to create directory: "+err.Error(), http.StatusInternalServerError)
+// handleUploadRawProbe answers a GET on the raw upload endpoint with an
+// empty 200 so clients can detect support without sending a body. Older
+// servers return 404/405; newer clients use the probe to decide between
+// raw and multipart transports.
+func (s *Server) handleUploadRawProbe(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleUploadRaw handles file uploads via POST /api/upload/raw?filename=...
+// The request body is the file content.
+func (s *Server) handleUploadRaw(w http.ResponseWriter, r *http.Request) {
+	filename := r.URL.Query().Get("filename")
+	if filename == "" {
+		writeUploadError(w, http.StatusBadRequest, "filename_required", "filename required")
 		return
 	}
 
-	// Create the destination file
-	destFile, err := os.Create(filename)
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	path, err := saveUploadFile(filename, r.Body)
 	if err != nil {
-		http.Error(w, "failed to create destination file: "+err.Error(), http.StatusInternalServerError)
+		writeUploadSaveError(w, err)
 		return
 	}
-	defer destFile.Close()
+	writeUploadResponse(w, path)
+}
 
-	// Copy the file contents to the destination file
-	if _, err := io.Copy(destFile, file); err != nil {
-		http.Error(w, "failed to save file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Return the path to the saved file
+func writeUploadResponse(w http.ResponseWriter, path string) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"path": filename})
+	_ = json.NewEncoder(w).Encode(map[string]string{"path": path})
+}
+
+func writeUploadError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(uploadErrorResponse{
+		Error:   code,
+		Message: message,
+	})
+}
+
+func writeUploadParseError(w http.ResponseWriter, prefix string, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeUploadError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "request body too large")
+		return
+	}
+	writeUploadError(w, http.StatusBadRequest, "invalid_multipart", prefix+err.Error())
+}
+
+func writeUploadSaveError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeUploadError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "request body too large")
+		return
+	}
+	writeUploadError(w, http.StatusInternalServerError, "upload_save_failed", "failed to save file: "+err.Error())
+}
+
+// saveUploadFile writes src into browse.UploadDir under a sanitized name
+// derived from originalFilename. Writes are scoped via os.Root so a hostile
+// client can't escape the upload directory via traversal or symlinks. Names
+// that collide with an existing file get a random suffix instead of
+// overwriting the existing entry. Names that pass through filepath.Base
+// as an unusable value (".", "..", empty) fall back to a fully random name.
+func saveUploadFile(originalFilename string, src io.Reader) (string, error) {
+	if err := os.MkdirAll(browse.UploadDir, 0o755); err != nil {
+		return "", fmt.Errorf("create upload directory: %w", err)
+	}
+	root, err := os.OpenRoot(browse.UploadDir)
+	if err != nil {
+		return "", fmt.Errorf("open upload root: %w", err)
+	}
+	defer root.Close()
+
+	preferred := sanitizedUploadBasename(originalFilename)
+	if preferred != "" {
+		if path, err := createAndCopy(root, preferred, src); err == nil {
+			return path, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+
+	ext := filepath.Ext(preferred)
+	stem := strings.TrimSuffix(preferred, ext)
+	if stem == "" {
+		stem = "upload"
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		randBytes := make([]byte, 8)
+		if _, err := rand.Read(randBytes); err != nil {
+			return "", fmt.Errorf("generate random filename: %w", err)
+		}
+		name := fmt.Sprintf("%s_%s%s", stem, hex.EncodeToString(randBytes), ext)
+		path, err := createAndCopy(root, name, src)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("generate unique upload filename")
+}
+
+// sanitizedUploadBasename returns a filename safe to use directly inside the
+// upload directory and embedded as a [path] token in model-facing chat text:
+// just the basename, restricted to a conservative ASCII whitelist with
+// everything else mapped to '_'. Traversal-only or empty results return ""
+// so the caller knows to fall back to a random name.
+func sanitizedUploadBasename(originalFilename string) string {
+	base := filepath.Base(originalFilename)
+	switch base {
+	case ".", "..", "/", `\`, "":
+		return ""
+	}
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case 'a' <= r && r <= 'z',
+			'A' <= r && r <= 'Z',
+			'0' <= r && r <= '9',
+			r == '.', r == '-', r == '_', r == ' ':
+			return r
+		}
+		return '_'
+	}, base)
+	// Cap length to leave room for a collision-avoidance random suffix while
+	// preserving the extension. Filesystem limit is typically 255 bytes.
+	const maxLen = 200
+	if len(safe) > maxLen {
+		ext := filepath.Ext(safe)
+		if len(ext) > 20 {
+			ext = ""
+		}
+		stem := strings.TrimSuffix(safe, ext)
+		if len(stem) > maxLen-len(ext) {
+			stem = stem[:maxLen-len(ext)]
+		}
+		safe = stem + ext
+	}
+	return safe
+}
+
+func createAndCopy(root *os.Root, name string, src io.Reader) (string, error) {
+	destFile, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", err
+	}
+	_, copyErr := io.Copy(destFile, src)
+	closeErr := destFile.Close()
+	if copyErr != nil {
+		root.Remove(name)
+		return "", copyErr
+	}
+	if closeErr != nil {
+		root.Remove(name)
+		return "", closeErr
+	}
+	return filepath.Join(browse.UploadDir, name), nil
 }
 
 // staticHandler serves files from the provided filesystem.
@@ -219,12 +415,86 @@ func isConversationSlugPath(path string) bool {
 }
 
 func isSPARoute(path string) bool {
-	return path == "/inbox" || path == "/new"
+	return path == "/new"
 }
 
 // acceptsGzip reports whether r accepts gzip encoding.
 func acceptsGzip(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+}
+
+// pickStreamEncoding chooses an encoding for SSE responses. Prefers zstd
+// then gzip, then identity. Honours Accept-Encoding q-values per RFC 9110
+// §12.5.3: an entry with q=0 means the client refuses that encoding.
+//
+// Returns ("zstd"|"gzip"|"", acceptable). The second return is false only
+// when the client accepts no encoding we can produce — e.g. explicit
+// `identity;q=0` with neither gzip nor zstd offered — in which case the
+// caller should reply 406 Not Acceptable.
+func pickStreamEncoding(r *http.Request) (string, bool) {
+	ae := r.Header.Get("Accept-Encoding")
+	if strings.TrimSpace(ae) == "" {
+		// Absent header: any encoding is acceptable, default to identity.
+		return "", true
+	}
+	prefs := parseAcceptEncoding(ae)
+	// `*` is a catch-all that applies to any coding not explicitly listed.
+	codingAcceptable := func(name string) bool {
+		if q, ok := prefs[name]; ok {
+			return q > 0
+		}
+		if q, ok := prefs["*"]; ok {
+			return q > 0
+		}
+		return false
+	}
+	if codingAcceptable("zstd") {
+		return "zstd", true
+	}
+	if codingAcceptable("gzip") {
+		return "gzip", true
+	}
+	// Neither compressed encoding is acceptable. Identity is acceptable
+	// unless explicitly refused via `identity;q=0` or a catch-all `*;q=0`
+	// (with no overriding `identity;q>0`).
+	if q, ok := prefs["identity"]; ok {
+		return "", q > 0
+	}
+	if q, ok := prefs["*"]; ok && q == 0 {
+		return "", false
+	}
+	return "", true
+}
+
+// parseAcceptEncoding parses an Accept-Encoding header into a coding->q map.
+// Unknown parameters are ignored; entries without an explicit q default to 1.
+// Lower-cases coding names. Returns an empty map for an empty header.
+func parseAcceptEncoding(h string) map[string]float64 {
+	out := map[string]float64{}
+	for _, part := range strings.Split(h, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		coding, params, _ := strings.Cut(part, ";")
+		coding = strings.ToLower(strings.TrimSpace(coding))
+		if coding == "" {
+			continue
+		}
+		q := 1.0
+		for _, p := range strings.Split(params, ";") {
+			p = strings.TrimSpace(p)
+			name, val, ok := strings.Cut(p, "=")
+			if !ok || strings.ToLower(strings.TrimSpace(name)) != "q" {
+				continue
+			}
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil {
+				q = parsed
+			}
+		}
+		out[coding] = q
+	}
+	return out
 }
 
 // etagMatches checks if the client's If-None-Match header matches the given ETag.
@@ -392,32 +662,7 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 
 	// Build initialization data
 	modelList := s.getModelList()
-
-	// Select default model - use configured default if available, otherwise first ready model
-	// If no models are available, default_model should be empty
-	defaultModel := ""
-	if len(modelList) > 0 {
-		defaultModel = s.defaultModel
-		if defaultModel == "" {
-			defaultModel = models.Default().ID
-		}
-		defaultModelAvailable := false
-		for _, m := range modelList {
-			if m.ID == defaultModel && m.Ready {
-				defaultModelAvailable = true
-				break
-			}
-		}
-		if !defaultModelAvailable {
-			// Fall back to first ready model
-			for _, m := range modelList {
-				if m.Ready {
-					defaultModel = m.ID
-					break
-				}
-			}
-		}
-	}
+	defaultModel := s.effectiveDefaultModel(modelList)
 
 	// Get hostname (add .exe.xyz suffix if no dots, matching system_prompt.go)
 	hostname := "localhost"
@@ -439,26 +684,33 @@ func (s *Server) serveIndexWithInit(w http.ResponseWriter, r *http.Request, fs h
 	homeDir, _ := os.UserHomeDir()
 
 	userAgentsMdPath, _ := userAgentsMdPath()
-	userAgentsMdContent := ""
-	if b, err := os.ReadFile(userAgentsMdPath); err == nil {
-		userAgentsMdContent = string(b)
-	}
 
+	// Note: AGENTS.md content is NOT embedded in init data. It is fetched fresh
+	// via /api/user-agents-md when the editor modal opens so that reopening
+	// after a save shows current disk state, not stale page-load content.
 	initData := map[string]interface{}{
-		"models":                 modelList,
-		"default_model":          defaultModel,
-		"hostname":               hostname,
-		"default_cwd":            defaultCwd,
-		"home_dir":               homeDir,
-		"base_path":              s.basePath,
-		"user_agents_md_path":    userAgentsMdPath,
-		"user_agents_md_content": userAgentsMdContent,
+		"models":              modelList,
+		"default_model":       defaultModel,
+		"hostname":            hostname,
+		"default_cwd":         defaultCwd,
+		"home_dir":            homeDir,
+		"base_path":           s.basePath,
+		"user_agents_md_path": userAgentsMdPath,
 	}
-	if s.terminalURL != "" {
-		initData["terminal_url"] = s.terminalURL
-	}
-	if len(s.links) > 0 {
-		initData["links"] = s.links
+	// On exe.dev VMs (where /exe.dev exists), auto-derive the terminal URL and
+	// default links from the current hostname so they pick up hostname changes
+	// on reload.
+	if _, err := os.Stat("/exe.dev"); err == nil {
+		short := strings.SplitN(hostname, ".", 2)[0]
+		initData["terminal_url"] = "https://" + short + ".xterm.exe.xyz"
+		// Home icon — used historically by the "Back to exe.dev" link.
+		const homeIcon = "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"
+		// External-link icon for the box's own web page.
+		const extIcon = "M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
+		initData["links"] = []Link{
+			{Title: hostname, URL: "https://" + hostname, IconSVG: extIcon},
+			{Title: "Back to exe.dev", URL: "https://exe.dev", IconSVG: homeIcon},
+		}
 	}
 
 	// Inject notification channel type metadata for the settings modal
@@ -516,12 +768,8 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ctx := r.Context()
 	limit := 5000
 	offset := 0
-	var query string
-
-	// Parse query parameters
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
 			limit = l
@@ -532,72 +780,160 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 			offset = o
 		}
 	}
-	query = r.URL.Query().Get("q")
-	searchContent := r.URL.Query().Get("search_content") == "true"
 
-	// Get conversations from database
-	var conversations []generated.Conversation
-	var err error
-
-	if query != "" {
-		if searchContent {
-			// Search in both slug and message content
-			conversations, err = s.db.SearchConversationsWithMessages(ctx, query, int64(limit), int64(offset))
-		} else {
-			// Search only in slug
-			conversations, err = s.db.SearchConversations(ctx, query, int64(limit), int64(offset))
-		}
-	} else {
-		conversations, err = s.db.ListConversations(ctx, int64(limit), int64(offset))
-	}
-
+	conversations, err := s.conversationListWithState(r.Context(), limit, offset, r.URL.Query().Get("q"), r.URL.Query().Get("search_content") == "true")
 	if err != nil {
 		s.logger.Error("Failed to get conversations", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get working states for all active conversations
-	workingStates := s.getWorkingConversations()
-	pendingApprovalStates := s.getConversationsWithPendingApproval()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(conversations)
+}
 
-	// Get subagent counts
+// ConversationListSnapshot is the seed payload returned by
+// GET /api/conversations/snapshot. Clients use Hash to resume the unified
+// stream patch stream from this exact state.
+type ConversationListSnapshot struct {
+	Conversations []ConversationWithState `json:"conversations"`
+	Hash          string                  `json:"hash"`
+}
+
+// handleConversationsSnapshot returns the current unarchived conversation
+// list (parents + subagents) together with the patch-stream hash that
+// anchors it. Each row includes working state, git info, subagent count,
+// and a trailing agent-message preview. Archived conversations are
+// served separately by /api/conversations/archived.
+//
+// The hash exists so a client can fetch the current state once and then
+// resume incremental updates over /api/stream without racing concurrent
+// Tx commits.
+func (s *Server) handleConversationsSnapshot(w http.ResponseWriter, r *http.Request) {
+	list, hash, err := s.conversationListStream.snapshot(r.Context())
+	if err != nil {
+		s.logger.Error("Failed to compute conversation list snapshot", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if list == nil {
+		list = []ConversationWithState{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ConversationListSnapshot{Conversations: list, Hash: hash})
+}
+
+func (s *Server) conversationListWithState(ctx context.Context, limit, offset int, query string, searchContent bool) ([]ConversationWithState, error) {
+	return s.conversationListWithStateInternal(ctx, limit, offset, query, searchContent, false)
+}
+
+// searchConversationsFTSWithState performs a full-text search across active
+// AND archived top-level conversations and decorates the results with the
+// same working/subagent/preview metadata as the regular list.
+func (s *Server) searchConversationsFTSWithState(ctx context.Context, query string, limit, offset int) ([]ConversationWithState, error) {
+	hits, err := s.db.SearchConversationsFTS(ctx, query, int64(limit), int64(offset))
+	if err != nil {
+		return nil, err
+	}
+	conversations := make([]generated.Conversation, len(hits))
+	for i, h := range hits {
+		conversations[i] = h.Conversation
+	}
+	decorated, err := s.decorateConversations(ctx, conversations)
+	if err != nil {
+		return nil, err
+	}
+	for i := range decorated {
+		decorated[i].SearchSnippet = hits[i].Snippet
+	}
+	return decorated, nil
+}
+
+// conversationListWithStateInternal backs both the public list endpoint and the
+// patch stream. When includeSubagents is true the result also contains
+// subagent conversations so the UI can render and diff their working state.
+func (s *Server) conversationListWithStateInternal(ctx context.Context, limit, offset int, query string, searchContent, includeSubagents bool) ([]ConversationWithState, error) {
+	var conversations []generated.Conversation
+	var err error
+	if query != "" {
+		if searchContent {
+			conversations, err = s.db.SearchConversationsWithMessages(ctx, query, int64(limit), int64(offset))
+		} else {
+			conversations, err = s.db.SearchConversations(ctx, query, int64(limit), int64(offset))
+		}
+	} else if includeSubagents {
+		conversations, err = s.db.ListAllConversations(ctx, int64(limit), int64(offset))
+	} else {
+		conversations, err = s.db.ListConversations(ctx, int64(limit), int64(offset))
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.decorateConversations(ctx, conversations)
+}
+
+// decorateConversations wraps a list of raw conversation rows with the
+// preview/working/subagent/git metadata used by the conversation list UI.
+func (s *Server) decorateConversations(ctx context.Context, conversations []generated.Conversation) ([]ConversationWithState, error) {
+	// Working state lives on the conversation row itself (see
+	// ResetAllAgentWorking on startup + SetConversationAgentWorking on every
+	// transition), so we don't have to consult the in-memory manager map.
+	// PendingApproval, however, is in-memory only — fetch it from the
+	// active manager map so the sidebar can highlight conversations that
+	// are blocked waiting on user approval.
 	subagentCounts, err := s.db.GetSubagentCounts(ctx)
 	if err != nil {
 		s.logger.Error("Failed to get subagent counts", "error", err)
-		// Non-fatal, continue with zero counts
 		subagentCounts = make(map[string]int64)
 	}
 
-	// Build response with working state included
-	// Cache git info by cwd to avoid redundant git subprocess calls
-	gitStates := make(map[string]*gitstate.GitState)
+	previews, err := s.loadConversationPreviews(ctx)
+	if err != nil {
+		s.logger.Error("Failed to load conversation previews", "error", err)
+		previews = nil
+	}
+
+	pendingApprovalStates := s.getConversationsWithPendingApproval()
+
+	now := time.Now()
 	result := make([]ConversationWithState, len(conversations))
 	for i, conv := range conversations {
+		pv := previews[conv.ConversationID]
 		cws := ConversationWithState{
-			Conversation:    conv,
-			Working:         workingStates[conv.ConversationID],
-			PendingApproval: pendingApprovalStates[conv.ConversationID],
-			SubagentCount:   subagentCounts[conv.ConversationID],
+			Conversation:     conv,
+			Working:          conv.AgentWorking,
+			PendingApproval:  pendingApprovalStates[conv.ConversationID],
+			SubagentCount:    subagentCounts[conv.ConversationID],
+			Preview:          pv.text,
+			PreviewUpdatedAt: pv.updatedAt,
 		}
 		if conv.Cwd != nil {
-			gs, ok := gitStates[*conv.Cwd]
+			entry, ok := s.conversationListGitCache.get(*conv.Cwd, now)
 			if !ok {
-				gs = gitstate.GetGitState(*conv.Cwd)
-				gitStates[*conv.Cwd] = gs
+				gs := gitstate.GetGitState(*conv.Cwd)
+				entry = conversationListGitCacheEntry{
+					state:     gs,
+					expiresAt: now.Add(conversationListGitCacheTTL),
+				}
+				if gs.IsRepo {
+					entry.worktree = getGitWorktreeRoot(gs.Worktree)
+					if gitDir, err := resolveGitDir(gs.Worktree); err == nil {
+						entry.gitDir = gitDir
+						entry.fingerprint = gitFingerprint(gitDir)
+					}
+				}
+				s.conversationListGitCache.set(*conv.Cwd, entry)
 			}
-			if gs.IsRepo {
-				cws.GitRepoRoot = gs.Worktree
-				cws.GitWorktreeRoot = getGitWorktreeRoot(gs.Worktree)
-				cws.GitCommit = gs.Commit
-				cws.GitSubject = gs.Subject
+			if entry.state.IsRepo {
+				cws.GitRepoRoot = entry.state.Worktree
+				cws.GitWorktreeRoot = entry.worktree
+				cws.GitCommit = entry.state.Commit
+				cws.GitSubject = entry.state.Subject
 			}
 		}
 		result[i] = cws
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	return result, nil
 }
 
 // conversationMux returns a mux for /api/conversation/<id>/* routes
@@ -607,15 +943,18 @@ func (s *Server) conversationMux() *http.ServeMux {
 	mux.Handle("GET /{id}", gzipHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleGetConversation(w, r, r.PathValue("id"))
 	})))
-	// GET /api/conversation/<id>/stream - SSE stream (do NOT compress)
-	// TODO: Consider gzip for SSE in the future. Would reduce bandwidth
-	// for large tool outputs, but needs flush after each event.
+	// GET /api/conversation/<id>/stream - legacy SSE stream. Compression is
+	// negotiated inside the handler (zstd/gzip per Accept-Encoding) with a
+	// compressor flush after every event so messages stream promptly.
 	mux.HandleFunc("GET /{id}/stream", func(w http.ResponseWriter, r *http.Request) {
 		s.handleStreamConversation(w, r, r.PathValue("id"))
 	})
 	// POST endpoints - small responses, no compression needed
 	mux.HandleFunc("POST /{id}/chat", func(w http.ResponseWriter, r *http.Request) {
 		s.handleChatConversation(w, r, r.PathValue("id"))
+	})
+	mux.HandleFunc("POST /{id}/hooks", func(w http.ResponseWriter, r *http.Request) {
+		s.handleRegisterConversationHook(w, r, r.PathValue("id"))
 	})
 	mux.HandleFunc("POST /{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		s.handleCancelConversation(w, r, r.PathValue("id"))
@@ -640,6 +979,9 @@ func (s *Server) conversationMux() *http.ServeMux {
 	})
 	mux.HandleFunc("POST /{id}/tool-approval", func(w http.ResponseWriter, r *http.Request) {
 		s.handleToolApproval(w, r, r.PathValue("id"))
+	})
+	mux.HandleFunc("POST /{id}/new-generation", func(w http.ResponseWriter, r *http.Request) {
+		s.handleStartNewGeneration(w, r, r.PathValue("id"))
 	})
 	return mux
 }
@@ -679,10 +1021,18 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request, c
 	apiMessages := toAPIMessages(messages)
 	json.NewEncoder(w).Encode(StreamResponse{
 		Messages:     apiMessages,
-		Conversation: conversation,
+		Conversation: &conversation,
 		// ConversationState is sent via the streaming endpoint, not on initial load
 		ContextWindowSize: calculateContextWindowSize(apiMessages),
 	})
+}
+
+// derefString returns the value pointed to by p, or "" if p is nil.
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // ChatRequest represents a chat message from the user
@@ -718,7 +1068,7 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 	// Get LLM service for the requested model
 	modelID := req.Model
 	if modelID == "" {
-		modelID = s.defaultModel
+		modelID = s.effectiveDefaultModel(s.getModelList())
 	}
 
 	llmService, err := s.llmManager.GetService(modelID)
@@ -751,8 +1101,10 @@ func (s *Server) handleChatConversation(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Queue mode: record the message to DB but don't interrupt the agent.
-	// The message will be sent when the agent finishes its current turn.
-	if req.Queue {
+	// The message will be sent when the agent finishes its current turn or
+	// current distillation. Force queueing during distillation even if the
+	// client has not seen the distill status update yet.
+	if req.Queue || manager.IsDistilling() {
 		if err := manager.QueueMessage(ctx, s, modelID, userMessage); err != nil {
 			s.logger.Error("Failed to queue user message", "conversationID", conversationID, "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -816,7 +1168,7 @@ func (s *Server) handleNewConversation(w http.ResponseWriter, r *http.Request) {
 	// Get LLM service for the requested model
 	modelID := req.Model
 	if modelID == "" {
-		modelID = s.defaultModel
+		modelID = s.effectiveDefaultModel(s.getModelList())
 	}
 
 	llmService, err := s.llmManager.GetService(modelID)
@@ -842,6 +1194,18 @@ func (s *Server) handleNewConversation(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Invalid subagent_backend: %s; must be one of: shelley, claude-cli, codex-cli", convOpts.SubagentBackend), http.StatusBadRequest)
 			return
 		}
+		for name, v := range convOpts.ToolOverrides {
+			if v != "on" && v != "off" {
+				http.Error(w, fmt.Sprintf("Invalid tool_overrides[%s]=%q; must be \"on\" or \"off\"", name, v), http.StatusBadRequest)
+				return
+			}
+		}
+		for _, hook := range convOpts.EndOfTurnHooks {
+			if err := validateConversationHookURL(hook.URL); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid end_of_turn_hooks url %q: %v", hook.URL, err), http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	conversation, err := s.db.CreateConversation(ctx, nil, true, cwdPtr, &modelID, convOpts)
@@ -851,6 +1215,51 @@ func (s *Server) handleNewConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conversationID := conversation.ConversationID
+
+	// Run new-conversation hook, which may override prompt, model, and cwd
+	hookResult := RunNewConversationHookIn(s.hooksDir, NewConversationHookInput{
+		Prompt: req.Message,
+		Model:  modelID,
+		Cwd:    derefString(cwdPtr),
+		Readonly: NewConversationReadonly{
+			ConversationID: conversationID,
+			IsOrchestrator: convOpts.IsOrchestrator(),
+		},
+	})
+	if hookResult.Cwd != derefString(cwdPtr) {
+		if err := s.db.UpdateConversationCwd(ctx, conversationID, hookResult.Cwd); err != nil {
+			s.logger.Error("Failed to update cwd from hook", "error", err)
+		} else {
+			conversation.Cwd = &hookResult.Cwd
+		}
+	}
+	if hookResult.Model != modelID {
+		newService, svcErr := s.llmManager.GetService(hookResult.Model)
+		if svcErr != nil {
+			s.logger.Error("Hook returned unsupported model, keeping original", "hookModel", hookResult.Model, "error", svcErr)
+		} else {
+			modelID = hookResult.Model
+			llmService = newService
+			if err := s.db.ForceUpdateConversationModel(ctx, conversationID, modelID); err != nil {
+				s.logger.Error("Failed to update model from hook", "error", err)
+			}
+		}
+	}
+	req.Message = hookResult.Prompt
+
+	// If the hook supplied a slug, apply it now (synchronously) so that the
+	// first-message goroutine below can skip its async LLM slug generation.
+	// On failure (sanitize-to-empty, unique collision, DB error) we silently
+	// fall back to the async slug; that path also handles uniqueness via
+	// numeric suffixes.
+	hookSlugApplied := false
+	if sanitized := slug.Sanitize(hookResult.Slug); sanitized != "" {
+		if _, err := s.db.UpdateConversationSlug(ctx, conversationID, sanitized); err != nil {
+			s.logger.Warn("Failed to apply slug from new-conversation hook; falling back to async slug", "conversationID", conversationID, "slug", sanitized, "error", err)
+		} else {
+			hookSlugApplied = true
+		}
+	}
 
 	// Notify conversation list subscribers about the new conversation
 	go s.publishConversationListUpdate(ConversationListUpdate{
@@ -891,7 +1300,7 @@ func (s *Server) handleNewConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if firstMessage {
+	if firstMessage && !hookSlugApplied {
 		ctxNoCancel := context.WithoutCancel(ctx)
 		go func() {
 			slugCtx, cancel := context.WithTimeout(ctxNoCancel, 15*time.Second)
@@ -946,23 +1355,75 @@ func (s *Server) handleCancelConversation(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]string{"status": "cancelled"})
 }
 
-// handleStreamConversation handles GET /conversation/<id>/stream
-// Query parameters:
-//   - last_sequence_id: Resume from this sequence ID (skip messages up to and including this ID)
+// handleStreamConversation handles GET /conversation/<id>/stream.
+// See API.md for query params; see handleStream for the unified stream.
 func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request, conversationID string) {
+	s.runStream(w, r, conversationID, false)
+}
+
+// handleStream handles GET /api/stream — the unified SSE stream that
+// combines per-conversation messages with conversation-list patch
+// events. See API.md for query params.
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	s.runStream(w, r, r.URL.Query().Get("conversation"), true)
+}
+
+func (s *Server) runStream(w http.ResponseWriter, r *http.Request, conversationID string, includeConversationListPatches bool) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	ctx := r.Context()
+	ctx, cancelStream := context.WithCancel(r.Context())
+	defer cancelStream()
 
-	// Parse last_sequence_id for resuming streams
-	lastSeqID := int64(-1)
-	if lastSeqStr := r.URL.Query().Get("last_sequence_id"); lastSeqStr != "" {
-		if parsed, err := strconv.ParseInt(lastSeqStr, 10, 64); err == nil {
-			lastSeqID = parsed
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	query := r.URL.Query()
+	var listInitial []ConversationListPatchEvent
+	var listNext func() (ConversationListPatchEvent, bool)
+	var listRelease func()
+	if includeConversationListPatches {
+		var err error
+		listInitial, listNext, listRelease, err = s.conversationListStream.connect(ctx, query.Get("conversation_list_hash"))
+		if err != nil {
+			s.logger.Error("failed to initialize conversation list patches", "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
 		}
+		defer listRelease()
+	}
+
+	// last_sequence_id: deliver only messages with sequence_id > N.
+	// tail: first frame contains only the last N messages.
+	// The two are mutually exclusive.
+	lastSeqRaw := query.Get("last_sequence_id")
+	tailRaw := query.Get("tail")
+	if lastSeqRaw != "" && tailRaw != "" {
+		http.Error(w, "last_sequence_id and tail are mutually exclusive", http.StatusBadRequest)
+		return
+	}
+	lastSeqID := int64(-1)
+	if lastSeqRaw != "" {
+		parsed, err := strconv.ParseInt(lastSeqRaw, 10, 64)
+		if err != nil || parsed < 0 {
+			http.Error(w, "invalid last_sequence_id", http.StatusBadRequest)
+			return
+		}
+		lastSeqID = parsed
+	}
+	var tailN int64
+	if tailRaw != "" {
+		parsed, err := strconv.ParseInt(tailRaw, 10, 64)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid tail", http.StatusBadRequest)
+			return
+		}
+		tailN = parsed
 	}
 
 	// Set up SSE headers
@@ -970,17 +1431,184 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Vary", "Accept-Encoding")
+
+	// Compress SSE stream when the client accepts gzip or zstd. We keep a
+	// single gzip/zstd stream for the lifetime of the response and Flush()
+	// after every SSE record so the message is on the wire immediately.
+	//
+	// Using a single stream (rather than one independent gzip/zstd frame per
+	// message) avoids a subtle decoder issue: Go's net/http transparently
+	// gunzips gzip responses with multistream enabled, which means it won't
+	// surface the bytes of frame N until it has at least started reading
+	// frame N+1's header — fine for batch downloads, fatal for SSE.
+	//
+	// Critically, we set Content-Encoding and instantiate the compressor
+	// lazily, only when we're about to write the first frame. Code below
+	// can still fail (DB lookups, conversation hydration) and reply with a
+	// plain http.Error; if we'd already set Content-Encoding the client
+	// would try to gunzip that plain-text error body and choke.
+	encoding, acceptable := pickStreamEncoding(r)
+	if !acceptable {
+		http.Error(w, "no acceptable encoding", http.StatusNotAcceptable)
+		return
+	}
+	var (
+		compressedSink  io.Writer = w
+		flushCompressor           = func() error { return nil }
+		closeCompressor           = func() error { return nil }
+		streamStarted   bool
+	)
+	defer func() {
+		if err := closeCompressor(); err != nil {
+			s.logger.Debug("conversation stream compressor close failed", "error", err)
+		}
+	}()
+	initCompression := func() bool {
+		if streamStarted {
+			return true
+		}
+		switch encoding {
+		case "zstd":
+			// NewWriter only fails on invalid options, all of which are
+			// hardcoded here, so treat any error as a server bug.
+			zw, err := zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedDefault))
+			if err != nil {
+				s.logger.Error("zstd writer init failed", "error", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return false
+			}
+			compressedSink = zw
+			flushCompressor = zw.Flush
+			closeCompressor = zw.Close
+			w.Header().Set("Content-Encoding", "zstd")
+		case "gzip":
+			gz := gzip.NewWriter(w)
+			compressedSink = gz
+			flushCompressor = gz.Flush
+			closeCompressor = gz.Close
+			w.Header().Set("Content-Encoding", "gzip")
+		}
+		streamStarted = true
+		return true
+	}
+
+	writeStreamData := func(streamData StreamResponse) bool {
+		if !initCompression() {
+			return false
+		}
+		data, err := json.Marshal(streamData)
+		if err != nil {
+			s.logger.Debug("failed to marshal stream response", "error", err)
+			return false
+		}
+		if _, err := fmt.Fprintf(compressedSink, "data: %s\n\n", data); err != nil {
+			s.logger.Debug("conversation stream write failed", "error", err)
+			return false
+		}
+		if err := flushCompressor(); err != nil {
+			s.logger.Debug("conversation stream compressor flush failed", "error", err)
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	// errAfterStreamStart abandons the stream after a fatal post-write error.
+	// Once any SSE frame has been written, the response is committed and we
+	// must not call http.Error (which would inject uncompressed bytes into the
+	// gzip/zstd body). Simply return; the client treats the closed connection
+	// as a transient drop and reconnects via last_sequence_id.
+	errAfterStreamStart := func(w http.ResponseWriter, msg string) {
+		if streamStarted {
+			s.logger.Debug("abandoning compressed SSE stream after error", "msg", msg)
+			return
+		}
+		http.Error(w, msg, http.StatusInternalServerError)
+	}
+
+	for _, event := range listInitial {
+		patch := event
+		if !writeStreamData(StreamResponse{ConversationListPatch: &patch}) {
+			return
+		}
+	}
+
+	// For per-conversation streams on the unified /api/stream endpoint that
+	// have no list replay to emit, send a bare heartbeat *before* the blocking
+	// per-conversation work (Hydrate, message read) so the client always sees
+	// a first flush within milliseconds. Hydrate walks the working tree for
+	// guidance and skill files, which under load on CI has taken several
+	// seconds — long enough to time out client waits and to look like a hung
+	// connection. We restrict this to the unified endpoint to avoid changing
+	// the first-frame contract of the legacy /api/conversation/<id>/stream
+	// endpoint, where the first frame is expected to carry messages.
+	//
+	// List-only streams (conversationID == "") keep their contract: when a
+	// matching conversation_list_hash means there's nothing to replay, the
+	// stream stays silent until the next real event.
+	if conversationID != "" && includeConversationListPatches && len(listInitial) == 0 {
+		if !writeStreamData(StreamResponse{Heartbeat: true}) {
+			return
+		}
+	}
+
+	updates := make(chan StreamResponse, 10)
+
+	if listNext != nil {
+		go func() {
+			for {
+				event, ok := listNext()
+				if !ok {
+					return
+				}
+				patch := event
+				select {
+				case updates <- StreamResponse{ConversationListPatch: &patch}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	if conversationID == "" {
+		// List-only stream: keep alive with a periodic heartbeat so intermediaries
+		// don't time the connection out, and forward list patches as they arrive.
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !writeStreamData(StreamResponse{Heartbeat: true}) {
+					return
+				}
+			case streamData := <-updates:
+				if !writeStreamData(streamData) {
+					return
+				}
+			}
+		}
+	}
 
 	// For fresh connections, get messages BEFORE calling getOrCreateConversationManager.
 	// This is important because getOrCreateConversationManager may create a system prompt
 	// message during hydration, and we want to return the messages as they were before.
 	var messages []generated.Message
 	var conversation generated.Conversation
-	resuming := lastSeqID >= 0
-	if lastSeqID < 0 {
+	// resuming: client is not asking for the full history, so skip the
+	// context_window_size calculation (which only makes sense over it).
+	resuming := lastSeqID >= 0 || tailN > 0
+	switch {
+	case tailN > 0:
 		err := s.db.Queries(ctx, func(q *generated.Queries) error {
 			var err error
-			messages, err = q.ListMessages(ctx, conversationID)
+			messages, err = q.ListMessagesTail(ctx, generated.ListMessagesTailParams{
+				ConversationID: conversationID,
+				Limit:          tailN,
+			})
 			if err != nil {
 				return err
 			}
@@ -992,12 +1620,30 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		// Update lastSeqID based on messages we're sending
+		if len(messages) > 0 {
+			lastSeqID = messages[len(messages)-1].SequenceID
+		} else {
+			lastSeqID = 0
+		}
+	case lastSeqID < 0:
+		err := s.db.Queries(ctx, func(q *generated.Queries) error {
+			var err error
+			messages, err = q.ListMessages(ctx, conversationID)
+			if err != nil {
+				return err
+			}
+			conversation, err = q.GetConversation(ctx, conversationID)
+			return err
+		})
+		if err != nil {
+			s.logger.Error("Failed to get conversation data", "conversationID", conversationID, "error", err)
+			errAfterStreamStart(w, "Internal server error")
+			return
+		}
 		if len(messages) > 0 {
 			lastSeqID = messages[len(messages)-1].SequenceID
 		}
-	} else {
-		// Resuming - fetch any messages we missed while disconnected
+	default:
 		err := s.db.Queries(ctx, func(q *generated.Queries) error {
 			var err error
 			messages, err = q.ListMessagesSince(ctx, generated.ListMessagesSinceParams{
@@ -1012,20 +1658,18 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 		})
 		if err != nil {
 			s.logger.Error("Failed to get conversation data", "conversationID", conversationID, "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			errAfterStreamStart(w, "Internal server error")
 			return
 		}
-		// Update lastSeqID so the subscription starts after these messages
 		if len(messages) > 0 {
 			lastSeqID = messages[len(messages)-1].SequenceID
 		}
 	}
 
-	// Get or create conversation manager to access working state
 	manager, err := s.getOrCreateConversationManager(ctx, conversationID, "")
 	if err != nil {
 		s.logger.Error("Failed to get conversation manager", "conversationID", conversationID, "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		errAfterStreamStart(w, "Internal server error")
 		return
 	}
 
@@ -1035,7 +1679,6 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 	// response are queued rather than lost.
 	next := manager.subpub.Subscribe(ctx, lastSeqID)
 
-	// Send initial response (all messages for fresh connections, missed messages for resumes)
 	if len(messages) > 0 {
 		apiMessages := toAPIMessages(messages)
 		// Only send context_window_size for fresh connections where we have all messages.
@@ -1047,7 +1690,7 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 		}
 		streamData := StreamResponse{
 			Messages:     apiMessages,
-			Conversation: conversation,
+			Conversation: &conversation,
 			ConversationState: &ConversationState{
 				ConversationID:  conversationID,
 				Working:         manager.IsAgentWorking(),
@@ -1056,13 +1699,13 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 			},
 			ContextWindowSize: ctxSize,
 		}
-		data, _ := json.Marshal(streamData)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		w.(http.Flusher).Flush()
+		if !writeStreamData(streamData) {
+			return
+		}
 	} else {
 		// Either resuming or no messages yet - send current state as heartbeat
 		streamData := StreamResponse{
-			Conversation: conversation,
+			Conversation: &conversation,
 			ConversationState: &ConversationState{
 				ConversationID:  conversationID,
 				Working:         manager.IsAgentWorking(),
@@ -1071,9 +1714,15 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 			},
 			Heartbeat: true,
 		}
-		data, _ := json.Marshal(streamData)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		w.(http.Flusher).Flush()
+		if !writeStreamData(streamData) {
+			return
+		}
+	}
+
+	// Marker between the initial replay and live updates. Sent once
+	// per connection; the connection stays open and live frames follow.
+	if !writeStreamData(StreamResponse{SnapshotComplete: true}) {
+		return
 	}
 
 	// Start heartbeat goroutine - sends state every 30 seconds if no other messages
@@ -1100,7 +1749,7 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 				}
 
 				heartbeat := StreamResponse{
-					Conversation: conv,
+					Conversation: &conv,
 					ConversationState: &ConversationState{
 						ConversationID: conversationID,
 						Working:        manager.IsAgentWorking(),
@@ -1114,27 +1763,54 @@ func (s *Server) handleStreamConversation(w http.ResponseWriter, r *http.Request
 	}()
 	defer close(heartbeatDone)
 
-	for {
-		streamData, cont := next()
-		if !cont {
-			break
+	go func() {
+		for {
+			streamData, cont := next()
+			if !cont {
+				return
+			}
+			select {
+			case updates <- streamData:
+			case <-ctx.Done():
+				return
+			}
 		}
-		// Always forward updates, even if only the conversation changed (e.g., slug added)
-		data, _ := json.Marshal(streamData)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		w.(http.Flusher).Flush()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case streamData := <-updates:
+			// Always forward updates, even if only the conversation changed (e.g., slug added).
+			if !writeStreamData(streamData) {
+				return
+			}
+		}
 	}
 }
 
-// handleVersion returns version information as JSON
+// handleVersion returns build information plus the capabilities list as
+// JSON. The capabilities slot exists so clients can negotiate optional,
+// additive features without reshaping the response; the set is currently
+// empty.
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	resp := struct {
+		version.Info
+		Capabilities []string `json:"capabilities"`
+	}{
+		Info:         version.GetInfo(),
+		Capabilities: version.Capabilities(),
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(version.GetInfo())
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		s.logger.Error("Failed to encode version response", "error", err)
+	}
 }
 
 // ModelInfo represents a model in the API response
@@ -1175,6 +1851,35 @@ func (s *Server) getModelList() []ModelInfo {
 	return modelList
 }
 
+// effectiveDefaultModel returns the model id to use when the client
+// hasn't picked one. It tries `s.defaultModel`, then the process-wide
+// default from package models, then the first ready model in
+// `modelList`. Returns "" only when no model is ready, which is the
+// same signal `getModelList` produces when the host has no working
+// LLM service at all.
+func (s *Server) effectiveDefaultModel(modelList []ModelInfo) string {
+	if len(modelList) == 0 {
+		return ""
+	}
+	candidates := []string{s.defaultModel, models.Default().ID}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		for _, m := range modelList {
+			if m.ID == c && m.Ready {
+				return c
+			}
+		}
+	}
+	for _, m := range modelList {
+		if m.Ready {
+			return m.ID
+		}
+	}
+	return ""
+}
+
 // handleModels returns the list of available models
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -1185,34 +1890,48 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.getModelList())
 }
 
-// handleConversationPreviews handles GET /api/conversations/previews
-// Returns a map of conversation_id -> last agent message text preview
-func (s *Server) handleConversationPreviews(w http.ResponseWriter, r *http.Request) {
+// handleTools returns the list of tools available to conversations.
+func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ctx := r.Context()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"tools": claudetool.ToolRegistry,
+	})
+}
 
-	var messages []generated.Message
+// conversationPreview is the trailing agent message text plus its
+// timestamp, embedded per-row in the conversation list snapshot/stream.
+type conversationPreview struct {
+	text      string
+	updatedAt string
+}
+
+// loadConversationPreviews returns the most recent non-empty agent
+// message text for each unarchived conversation (parents and subagents
+// alike). The query returns the 5 most recent agent messages per
+// conversation (DESC) for the 500 most recently updated conversations;
+// we walk that list and take the first one with a non-empty text block
+// so a tail of tool-only responses doesn't leave the conversation
+// without a preview. Conversations outside that window render with
+// empty preview fields.
+func (s *Server) loadConversationPreviews(ctx context.Context) (map[string]conversationPreview, error) {
+	var messages []generated.GetLatestAgentMessagesForConversationsRow
 	err := s.db.Queries(ctx, func(q *generated.Queries) error {
 		var err error
 		messages, err = q.GetLatestAgentMessagesForConversations(ctx)
 		return err
 	})
 	if err != nil {
-		s.logger.Error("Failed to get conversation previews", "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-
-	// Extract text content from each agent message
-	type Preview struct {
-		Text      string `json:"text"`
-		UpdatedAt string `json:"updated_at"`
-	}
-	result := make(map[string]Preview, len(messages))
+	result := make(map[string]conversationPreview)
 	for _, msg := range messages {
+		if _, done := result[msg.ConversationID]; done {
+			continue // we already have the most recent non-empty preview for this conv
+		}
 		if msg.LlmData == nil {
 			continue
 		}
@@ -1220,8 +1939,9 @@ func (s *Server) handleConversationPreviews(w http.ResponseWriter, r *http.Reque
 		if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
 			continue
 		}
-		// Use the last text block — in agent messages with tool calls,
-		// the final text block is typically the summary/conclusion.
+		// Use the last text block in this message — in agent messages
+		// with tool calls, the final text block is typically the
+		// summary/conclusion.
 		var text string
 		for _, c := range llmMsg.Content {
 			if c.Type == llm.ContentTypeText && c.Text != "" {
@@ -1229,15 +1949,53 @@ func (s *Server) handleConversationPreviews(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		if text != "" {
-			result[msg.ConversationID] = Preview{
-				Text:      text,
-				UpdatedAt: msg.CreatedAt.UTC().Format(time.RFC3339),
+			result[msg.ConversationID] = conversationPreview{
+				text:      text,
+				updatedAt: msg.CreatedAt.UTC().Format(time.RFC3339),
 			}
 		}
 	}
+	return result, nil
+}
 
+// handleSearchConversations handles GET /api/conversations/search?q=...
+// Performs an FTS5 full-text search across active AND archived top-level
+// conversations, returning the same shape as /api/conversations so the UI
+// can render results directly.
+func (s *Server) handleSearchConversations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 200
+	offset := 0
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+		return
+	}
+	results, err := s.searchConversationsFTSWithState(r.Context(), query, limit, offset)
+	if err != nil {
+		s.logger.Error("Failed to search conversations", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if results == nil {
+		results = []ConversationWithState{}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(results)
 }
 
 // handleArchivedConversations handles GET /api/conversations/archived
@@ -1766,4 +2524,117 @@ func (s *Server) handleCancelQueued(w http.ResponseWriter, r *http.Request, conv
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+type RegisterConversationHookRequest struct {
+	URL string `json:"url"`
+}
+
+func (s *Server) handleRegisterConversationHook(w http.ResponseWriter, r *http.Request, conversationID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RegisterConversationHookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateConversationHookURL(req.URL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	manager, err := s.getOrCreateConversationManager(r.Context(), conversationID, r.Header.Get("X-ExeDev-Email"))
+	if errors.Is(err, errConversationModelMismatch) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		s.logger.Error("Failed to get conversation manager", "conversationID", conversationID, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if err := manager.RegisterEndOfTurnHook(r.Context(), db.ConversationHook{URL: req.URL}); err != nil {
+		s.logger.Error("Failed to register conversation hook", "conversationID", conversationID, "hook_url", req.URL, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
+}
+
+// handleStartNewGeneration handles POST /conversation/<id>/new-generation.
+func (s *Server) handleStartNewGeneration(w http.ResponseWriter, r *http.Request, conversationID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	conversation, err := s.startNewGeneration(ctx, conversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "Conversation not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.logger.Error("Failed to start new generation", "conversationID", conversationID, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(conversation)
+}
+
+func (s *Server) startNewGeneration(ctx context.Context, conversationID string) (generated.Conversation, error) {
+	conversation, err := db.WithTxRes(s.db, ctx, func(q *generated.Queries) (generated.Conversation, error) {
+		return q.IncrementConversationGeneration(ctx, conversationID)
+	})
+	if err != nil {
+		return generated.Conversation{}, err
+	}
+
+	s.mu.Lock()
+	manager, ok := s.activeConversations[conversationID]
+	s.mu.Unlock()
+	if !ok {
+		manager, err = s.getOrCreateConversationManager(ctx, conversationID, "")
+		if err != nil {
+			return generated.Conversation{}, fmt.Errorf("hydrate after generation bump: %w", err)
+		}
+	} else {
+		manager.ResetLoop()
+	}
+
+	// (Re-)hydrate so the new generation gets its system prompt created
+	// before we tell anyone about the bump. ResetLoop above cleared the
+	// hydrated flag so this re-runs system prompt creation.
+	if err := manager.Hydrate(ctx); err != nil {
+		return generated.Conversation{}, fmt.Errorf("hydrate after generation bump: %w", err)
+	}
+
+	// Re-fetch the conversation to pick up any timestamp changes from creating
+	// the system prompt.
+	if fresh, ferr := s.db.GetConversationByID(ctx, conversationID); ferr == nil {
+		conversation = *fresh
+	}
+
+	// Broadcast any messages created for the new generation (typically just
+	// the new system prompt) so subscribers see them right away.
+	messages, err := s.db.ListMessages(ctx, conversationID)
+	if err == nil {
+		for i := range messages {
+			if messages[i].Generation == conversation.CurrentGeneration {
+				s.notifySubscribersNewMessage(ctx, conversationID, &messages[i])
+			}
+		}
+	}
+
+	manager.subpub.Broadcast(StreamResponse{Conversation: &conversation})
+	s.publishConversationListUpdate(ConversationListUpdate{Type: "update", Conversation: &conversation})
+
+	return conversation, nil
 }

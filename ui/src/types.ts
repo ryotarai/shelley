@@ -38,6 +38,8 @@ export interface LLMContent {
   // Other fields from Go struct
   MediaType?: string;
   DisplayImageURL?: string;
+  DisplayWidth?: number;
+  DisplayHeight?: number;
   Thinking?: string;
   Data?: string;
   Signature?: string;
@@ -64,6 +66,8 @@ export interface ChatRequest {
   conversation_options?: {
     type?: "normal" | "orchestrator";
     subagent_backend?: "shelley" | "claude-cli" | "codex-cli";
+    tool_overrides?: Record<string, "on" | "off">;
+    disable_all_tools?: boolean;
   };
   queue?: boolean;
 }
@@ -90,9 +94,9 @@ export interface StreamDelta {
 
 // StreamResponse represents the streaming response format
 export interface StreamResponse extends Omit<StreamResponseForTS, "messages"> {
-  messages: Message[];
+  messages?: Message[];
   context_window_size?: number;
-  conversation_list_update?: ConversationListUpdate;
+  conversation_list_patch?: ConversationListPatchEvent;
   heartbeat?: boolean;
   notification_event?: NotificationEvent;
   tool_progress?: ToolProgress;
@@ -117,7 +121,6 @@ export interface InitData {
   terminal_url?: string;
   links?: Link[];
   user_agents_md_path?: string;
-  user_agents_md_content?: string;
   notification_channel_types?: import("./services/api").ChannelTypeInfo[];
   cli_agents?: string[]; // Available CLI agents (e.g., "claude-cli", "codex-cli")
 }
@@ -138,6 +141,10 @@ export interface GitDiffInfo {
   filesCount: number;
   additions: number;
   deletions: number;
+  // Decorating refs (branches, tags, HEAD), like git log --decorate.
+  refs?: string[];
+  // True if this commit is the merge-base with @{upstream}.
+  isMergeBase?: boolean;
 }
 
 export interface GitFileInfo {
@@ -152,6 +159,41 @@ export interface GitFileDiff {
   path: string;
   oldContent: string;
   newContent: string;
+}
+
+export interface GitGraphCommit {
+  hash: string;
+  shortHash: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  email: string;
+  timestamp: number;
+  refs: string[];
+  isHead: boolean;
+}
+
+export interface GitGraphResponse {
+  commits: GitGraphCommit[];
+  gitRoot: string;
+  currentBranch: string;
+  githubBase?: string;
+}
+
+export interface GitCommitDetailFile {
+  path: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+}
+
+export interface GitCommitDetail {
+  hash: string;
+  subject: string;
+  body: string;
+  files: GitCommitDetailFile[];
+  insTotal: number;
+  delTotal: number;
 }
 
 export interface GitCommitMessage {
@@ -175,13 +217,22 @@ export interface DiffComment {
   diffId: string;
 }
 
-// Conversation list streaming update
-export interface ConversationListUpdate {
-  type: "update" | "delete";
-  conversation?: Conversation;
-  conversation_id?: string; // For deletes
-  git_repo_root?: string;
-  git_worktree_root?: string;
+// Conversation list patch stream payload.
+export interface ConversationListPatchOp {
+  op: "add" | "remove" | "replace" | "move";
+  path: string;
+  from?: string;
+  value?: unknown;
+}
+
+export interface ConversationListPatchEvent {
+  old_hash?: string | null;
+  new_hash: string;
+  patch: ConversationListPatchOp[];
+  at: string;
+  // True when the patch replaces the whole list because the client has no
+  // resumable hash. The generic patch applier handles this as a root replace.
+  reset?: boolean;
 }
 
 // Version check types
@@ -215,7 +266,7 @@ export interface CommitInfo {
 
 // Helper to check if a message is a distill status message
 export function isDistillStatusMessage(message: Message): boolean {
-  if (message.type !== "system" || !message.user_data) return false;
+  if (!message.user_data) return false;
   try {
     const userData =
       typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;

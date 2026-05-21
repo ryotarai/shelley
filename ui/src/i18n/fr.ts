@@ -14,6 +14,7 @@ export const fr: TranslationKeys = {
 
   // Overflow Menu
   diffs: "Différences",
+  gitGraph: "Graphe Git",
   terminal: "Terminal",
   archiveConversation: "Archiver la conversation",
   checkForNewVersion: "Vérifier les mises à jour",
@@ -39,6 +40,9 @@ export const fr: TranslationKeys = {
   searchPlaceholder: "Rechercher des conversations ou des actions...",
   searching: "Recherche en cours...",
   noResults: "Aucun résultat trouvé",
+  searchConversations: "Rechercher des conversations...",
+  noSearchResults: "Aucune conversation correspondante",
+  clearSearch: "Effacer la recherche",
   toNavigate: "pour naviguer",
   toSelect: "pour sélectionner",
   toClose: "pour fermer",
@@ -57,6 +61,7 @@ export const fr: TranslationKeys = {
   jumpToPreviousMessage: "Aller au message utilisateur précédent",
   viewDiffs: "Voir les différences",
   openGitDiffViewer: "Ouvrir le visualiseur de différences Git",
+  openGitGraphViewer: "Ouvrir le visualiseur du graphe Git",
   addRemoveModelsKeys: "Ajouter/Supprimer des modèles et des clés",
   configureModels: "Configurer les modèles d'IA et les clés API",
   notificationSettings: "Paramètres de notification",
@@ -91,6 +96,7 @@ export const fr: TranslationKeys = {
   hideSubagents: "Masquer les sous-agents",
   showSubagents: "Afficher les sous-agents",
   groupConversations: "Grouper les conversations",
+  resortNow: "Trier maintenant",
   noGrouping: "Aucun regroupement",
   directory: "Répertoire",
   gitRepo: "Dépôt Git",
@@ -132,6 +138,10 @@ export const fr: TranslationKeys = {
   tagsPlaceholder: "séparées par des virgules, ex : slug, cheap",
   tagsTooltip:
     "Étiquettes séparées par des virgules pour ce modèle. Utilisez « slug » pour marquer ce modèle pour la génération de titres de conversation. Si aucun modèle n'a l'étiquette « slug », le modèle de la conversation sera utilisé.",
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "Tester",
   testingButton: "Test en cours...",
   save: "Enregistrer",
@@ -217,4 +227,5 @@ export const fr: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

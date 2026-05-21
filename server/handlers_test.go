@@ -14,32 +14,52 @@ import (
 )
 
 func TestHandleVersion(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
-	// Test successful GET request
-	req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+	mux := http.NewServeMux()
+	h.server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/version", nil)
 	w := httptest.NewRecorder()
-	h.server.handleVersion(w, req)
+	mux.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("Expected status code %d, got %d", http.StatusOK, w.Code)
+		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %s", ct)
 	}
 
-	if w.Header().Get("Content-Type") != "application/json" {
-		t.Errorf("Expected Content-Type application/json, got %s", w.Header().Get("Content-Type"))
+	var body struct {
+		Capabilities *[]string `json:"capabilities"`
+		Modified     *bool     `json:"modified"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	// capabilities is an empty list today, but the field must be present
+	// so clients can rely on its shape.
+	if body.Capabilities == nil {
+		t.Errorf("expected capabilities field in response, got nil")
+	} else if len(*body.Capabilities) != 0 {
+		t.Errorf("expected empty capabilities, got %v", *body.Capabilities)
+	}
+	if body.Modified != nil {
+		t.Errorf("unexpected modified field in response: %v", *body.Modified)
 	}
 
-	// Test method not allowed
-	req = httptest.NewRequest(http.MethodPost, "/api/version", nil)
+	// Non-GET requests should be rejected by the handler itself.
+	req = httptest.NewRequest(http.MethodPost, "/version", nil)
 	w = httptest.NewRecorder()
 	h.server.handleVersion(w, req)
-
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status code %d, got %d", http.StatusMethodNotAllowed, w.Code)
 	}
 }
 
 func TestHandleArchivedConversations(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
 	// Create a test conversation and archive it
@@ -97,6 +117,7 @@ func TestHandleArchivedConversations(t *testing.T) {
 }
 
 func TestHandleArchiveConversation(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
 	// Create a test conversation
@@ -149,6 +170,7 @@ func TestHandleArchiveConversation(t *testing.T) {
 }
 
 func TestHandleUnarchiveConversation(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
 	// Create a test conversation and archive it
@@ -206,6 +228,7 @@ func TestHandleUnarchiveConversation(t *testing.T) {
 }
 
 func TestHandleDeleteConversation(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
 	// Create a test conversation
@@ -264,6 +287,7 @@ func TestHandleDeleteConversation(t *testing.T) {
 }
 
 func TestHandleRenameConversation(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
 	// Create a test conversation
@@ -350,6 +374,7 @@ func TestHandleRenameConversation(t *testing.T) {
 }
 
 func TestHandleWriteFile(t *testing.T) {
+	t.Parallel()
 	h := NewTestHarness(t)
 
 	// Test successful POST request
@@ -411,5 +436,41 @@ func TestHandleWriteFile(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("Expected status code %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+func TestHandleTools(t *testing.T) {
+	t.Parallel()
+	h := NewTestHarness(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/tools", nil)
+	w := httptest.NewRecorder()
+	h.server.handleTools(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp struct {
+		Tools []struct {
+			Name      string `json:"name"`
+			Summary   string `json:"summary"`
+			DefaultOn bool   `json:"default_on"`
+		} `json:"tools"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tools) == 0 {
+		t.Fatalf("expected non-empty tools list")
+	}
+	var hasBash bool
+	for _, tt := range resp.Tools {
+		if tt.Name == "bash" {
+			hasBash = true
+			if !tt.DefaultOn {
+				t.Fatalf("bash should be default on")
+			}
+		}
+	}
+	if !hasBash {
+		t.Fatalf("bash missing from registry")
 	}
 }

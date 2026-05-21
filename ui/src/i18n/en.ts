@@ -13,6 +13,7 @@ export const en: TranslationKeys = {
 
   // Overflow Menu
   diffs: "Diffs",
+  gitGraph: "Git Graph",
   terminal: "Terminal",
   archiveConversation: "Archive Conversation",
   checkForNewVersion: "Check for New Version",
@@ -38,6 +39,9 @@ export const en: TranslationKeys = {
   searchPlaceholder: "Search conversations or actions...",
   searching: "Searching...",
   noResults: "No results found",
+  searchConversations: "Search conversations...",
+  noSearchResults: "No matching conversations",
+  clearSearch: "Clear search",
   toNavigate: "to navigate",
   toSelect: "to select",
   toClose: "to close",
@@ -56,6 +60,7 @@ export const en: TranslationKeys = {
   jumpToPreviousMessage: "Jump to the previous user message",
   viewDiffs: "View Diffs",
   openGitDiffViewer: "Open the git diff viewer",
+  openGitGraphViewer: "Open the git graph viewer",
   addRemoveModelsKeys: "Add/Remove Models & Keys",
   configureModels: "Configure AI models and API keys",
   notificationSettings: "Notification Settings",
@@ -90,6 +95,7 @@ export const en: TranslationKeys = {
   hideSubagents: "Hide subagents",
   showSubagents: "Show subagents",
   groupConversations: "Group conversations",
+  resortNow: "Re-sort now",
   noGrouping: "No grouping",
   directory: "Directory",
   gitRepo: "Git Repo",
@@ -131,6 +137,10 @@ export const en: TranslationKeys = {
   tagsPlaceholder: "comma-separated, e.g., slug, cheap",
   tagsTooltip:
     'Comma-separated tags for this model. Use "slug" to mark this model for generating conversation titles. If no model has the "slug" tag, the conversation\'s model will be used.',
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "Test",
   testingButton: "Testing...",
   save: "Save",
@@ -215,4 +225,5 @@ export const en: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

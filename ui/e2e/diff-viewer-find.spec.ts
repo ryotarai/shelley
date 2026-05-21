@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { createConversationViaAPI } from "./helpers";
 
 // This test exercises the Ctrl+F find widget inside the diff viewer.
 // It verifies that:
@@ -22,26 +23,7 @@ test.describe("Diff viewer find widget", () => {
     const gitRoot = cwdData.gitRoot;
     expect(gitRoot).toBeTruthy();
 
-    // Create a conversation with CWD set to the git root so the diff button appears.
-    const newResp = await request.post("/api/conversations/new", {
-      data: { message: "Hello", model: "predictable", cwd: gitRoot },
-    });
-    expect(newResp.ok()).toBeTruthy();
-    const { conversation_id } = await newResp.json();
-
-    // Wait for agent reply so the conversation is fully loaded.
-    let slug = "";
-    await expect(async () => {
-      const resp = await request.get(`/api/conversation/${conversation_id}`);
-      const body = await resp.json();
-      const done = body.messages?.some(
-        (m: { type: string; end_of_turn?: boolean }) =>
-          m.type === "agent" && m.end_of_turn === true,
-      );
-      expect(done).toBeTruthy();
-      slug = body.conversation?.slug || "";
-      expect(slug).toBeTruthy();
-    }).toPass({ timeout: 15000 });
+    const slug = await createConversationViaAPI(request, "Hello", { cwd: gitRoot });
 
     // Navigate to the conversation.
     await page.goto(`/c/${slug}`);
@@ -62,8 +44,10 @@ test.describe("Diff viewer find widget", () => {
 
     // Select the first non-empty commit if working changes are empty.
     // The diff viewer auto-selects, but we need a file to be loaded.
-    // Wait for a file to appear in the file selector.
-    const fileSelect = overlay.locator("select.diff-viewer-select").nth(1);
+    // Wait for a file to appear in the file selector. There's only one
+    // <select> in the header now (the commit selector was replaced with
+    // a button-driven CommitPicker), so .first() targets the file select.
+    const fileSelect = overlay.locator("select.diff-viewer-select").first();
     await expect(async () => {
       const options = await fileSelect.locator("option").count();
       expect(options).toBeGreaterThan(1); // more than just the placeholder

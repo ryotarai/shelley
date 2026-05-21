@@ -34,7 +34,7 @@ test.describe('File Upload via Paste and Drag', () => {
   });
 
   test('shows drop overlay when dragging file over input container', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/new');
     await page.waitForLoadState('domcontentloaded');
 
     const inputContainer = page.locator('.message-input-container');
@@ -104,7 +104,7 @@ test.describe('File Upload via Paste and Drag', () => {
     expect(response.status()).toBe(200);
     const json = await response.json();
     expect(json.path).toBeDefined();
-    expect(json.path).toContain('/tmp/shelley-screenshots/');
+    expect(json.path).toContain('/tmp/shelley-uploads/');
     expect(json.path).toContain('.txt');
   });
 
@@ -142,7 +142,7 @@ test.describe('File Upload via Paste and Drag', () => {
   });
 
   test('message input accepts text input normally', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/new');
     await page.waitForLoadState('domcontentloaded');
 
     const messageInput = page.getByTestId('message-input');
@@ -151,8 +151,8 @@ test.describe('File Upload via Paste and Drag', () => {
     await expect(messageInput).toHaveValue('Hello, this is a test message');
   });
 
-  test('simulated file drop shows loading placeholder then file path', async ({ page }) => {
-    await page.goto('/');
+  test('simulated file drop shows attachment chip', async ({ page }) => {
+    await page.goto('/new');
     await page.waitForLoadState('domcontentloaded');
 
     const messageInput = page.getByTestId('message-input');
@@ -185,19 +185,44 @@ test.describe('File Upload via Paste and Drag', () => {
       }
     });
 
-    // Wait for the upload to complete (should show loading then path)
+    // Wait for the upload to complete. Files now render as attachment chips
+    // above the textarea; the [path] token is only appended at send time.
     await page.waitForTimeout(500);
 
-    // After upload, the input should contain a file path reference
-    const inputValue = await messageInput.inputValue();
+    const attachment = page.locator('.message-attachment');
+    await expect(attachment).toHaveCount(1);
 
-    // Either the file was uploaded successfully (contains path) or there was an error
-    // Both are acceptable as we're testing the UI flow
-    expect(inputValue).toBeTruthy();
+    // The textarea itself should still be empty.
+    await expect(messageInput).toHaveValue('');
+  });
+
+  test('dropping multiple files creates multiple attachments', async ({ page }) => {
+    await page.goto('/new');
+    await page.waitForLoadState('domcontentloaded');
+
+    const messageInput = page.getByTestId('message-input');
+    await expect(messageInput).toBeVisible();
+
+    await page.evaluate(async () => {
+      const dataTransfer = new DataTransfer();
+      for (let i = 0; i < 3; i++) {
+        const blob = new Blob([`content ${i}`], { type: 'text/plain' });
+        dataTransfer.items.add(new File([blob], `drop-${i}.txt`, { type: 'text/plain' }));
+      }
+      const dropEvent = new DragEvent('drop', {
+        bubbles: true,
+        cancelable: true,
+        dataTransfer,
+      });
+      document.querySelector('.message-input-container')?.dispatchEvent(dropEvent);
+    });
+
+    // All three files should produce attachment chips.
+    await expect(page.locator('.message-attachment')).toHaveCount(3);
   });
 
   test('focus is retained in input after pasting image', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/new');
     await page.waitForLoadState('domcontentloaded');
 
     const messageInput = page.getByTestId('message-input');
@@ -241,8 +266,9 @@ test.describe('File Upload via Paste and Drag', () => {
 
     expect(isFocused).toBe(true);
 
-    // Verify the input has the uploaded file path
-    const inputValue = await messageInput.inputValue();
-    expect(inputValue).toContain('Testing paste focus:');
+    // The pre-existing text should remain; the pasted image is tracked as an
+    // attachment chip and is only inlined into the message at send time.
+    await expect(messageInput).toHaveValue('Testing paste focus: ');
+    await expect(page.locator('.message-attachment')).toHaveCount(1);
   });
 });

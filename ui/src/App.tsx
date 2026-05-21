@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { WorkerPoolContextProvider } from "@pierre/diffs/react";
 import type { SupportedLanguages } from "@pierre/diffs";
 import ChatInterface from "./components/ChatInterface";
@@ -7,11 +7,15 @@ import ConversationDrawer from "./components/ConversationDrawer";
 import CommandPalette from "./components/CommandPalette";
 import ModelsModal from "./components/ModelsModal";
 import NotificationsModal from "./components/NotificationsModal";
-import HomeFeed from "./components/HomeFeed";
-import { Conversation, ConversationWithState, ConversationListUpdate } from "./types";
+import { focusMessageInputIfUnfocused } from "./utils/focusMessageInput";
+import { Conversation, ConversationWithState, ConversationListPatchEvent } from "./types";
 import { api } from "./services/api";
 import { stripBasePath, withBasePath } from "./services/paths";
 import { conversationCache } from "./services/conversationCache";
+import {
+  applyConversationListPatch,
+  connectConversationListStream,
+} from "./services/conversationListStream";
 import { useI18n } from "./i18n";
 
 // Worker pool configuration for @pierre/diffs syntax highlighting
@@ -71,10 +75,6 @@ function getSlugFromPath(): string | null {
   return null;
 }
 
-function isInboxPath(): boolean {
-  return window.location.pathname === "/inbox";
-}
-
 function isNewPath(): boolean {
   return window.location.pathname === "/new";
 }
@@ -82,7 +82,6 @@ function isNewPath(): boolean {
 // Capture the initial slug from URL BEFORE React renders, so it won't be affected
 // by the useEffect that updates the URL based on current conversation.
 const initialSlugFromUrl = getSlugFromPath();
-const initialIsInbox = isInboxPath();
 const initialIsNew = isNewPath();
 
 // Update the URL to reflect the current conversation slug
@@ -121,26 +120,76 @@ function App() {
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   // Track viewed conversation separately (needed for subagents which aren't in main list)
   const [viewedConversation, setViewedConversation] = useState<Conversation | null>(null);
-  const [showInbox, setShowInbox] = useState(initialIsInbox);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [diffViewerTrigger, setDiffViewerTrigger] = useState(0);
+  const [gitGraphTrigger, setGitGraphTrigger] = useState(0);
   const [modelsModalOpen, setModelsModalOpen] = useState(false);
   const [notificationsModalOpen, setNotificationsModalOpen] = useState(false);
   const [modelsRefreshTrigger, setModelsRefreshTrigger] = useState(0);
+  // Bumped whenever the user picks a cwd via a quick action (e.g. command
+  // palette). ChatInterface re-reads localStorage when this changes so the
+  // selected cwd updates even if we're already on /new.
+  const [cwdSyncTrigger, setCwdSyncTrigger] = useState(0);
   const [navigateUserMessageTrigger, setNavigateUserMessageTrigger] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Global ephemeral terminals - persist across conversation switches
+  // Global ephemeral terminals - persist across conversation switches and
+  // (via dtach sessions on the server) page reloads. We hydrate from the
+  // server's terminal list on mount.
   const [ephemeralTerminals, setEphemeralTerminals] = useState<EphemeralTerminal[]>([]);
-  const [subagentUpdate, setSubagentUpdate] = useState<Conversation | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(withBasePath("/api/terminals"))
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: Array<{ id: string; command: string; cwd: string; created_at: string }>) => {
+        if (cancelled || !Array.isArray(rows) || rows.length === 0) return;
+        setEphemeralTerminals((prev) => {
+          const have = new Set(prev.map((t) => t.termId).filter(Boolean));
+          const restored: EphemeralTerminal[] = rows
+            .filter((r) => !have.has(r.id))
+            .map((r) => ({
+              id: r.id,
+              termId: r.id,
+              command: r.command,
+              cwd: r.cwd,
+              createdAt: new Date(r.created_at || Date.now()),
+            }));
+          return [...restored, ...prev];
+        });
+      })
+      .catch((err) => {
+        console.warn("failed to fetch persistent terminals:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleTerminalAttached = useCallback((id: string, termId: string) => {
+    setEphemeralTerminals((prev) => prev.map((t) => (t.id === id ? { ...t, termId } : t)));
+  }, []);
+
+  const handleTerminalClose = useCallback((id: string) => {
+    setEphemeralTerminals((prev) => {
+      const t = prev.find((x) => x.id === id);
+      if (t && t.termId) {
+        // Best-effort: tell the server to kill the persistent session.
+        fetch(withBasePath(`/api/terminals/${encodeURIComponent(t.termId)}`), {
+          method: "DELETE",
+        }).catch((err) =>
+          console.warn("failed to delete terminal:", err),
+        );
+      }
+      return prev.filter((x) => x.id !== id);
+    });
+  }, []);
   const [showActiveTrigger, setShowActiveTrigger] = useState(0);
-  const [subagentStateUpdate, setSubagentStateUpdate] = useState<{
-    conversation_id: string;
-    working: boolean;
-  } | null>(null);
   const initialSlugResolved = useRef(false);
+  const conversationListHashRef = useRef<string | null>(null);
+  const conversationsRef = useRef<ConversationWithState[]>([]);
 
   // Resolve initial slug from URL - uses the captured initialSlugFromUrl
   // Returns the conversation if found, null otherwise
@@ -176,29 +225,39 @@ function App() {
     loadConversations();
   }, []);
 
+  // The patch stream emits both top-level conversations and their subagents in
+  // a single list so subagent state can be diffed inline. Anything that's
+  // about the user-facing “conversation list” (navigation, default
+  // selection) should ignore subagents.
+  const topLevelConversations = useMemo(
+    () => conversations.filter((c) => !c.parent_conversation_id),
+    [conversations],
+  );
+
   const navigateToNextConversation = useCallback(() => {
-    if (conversations.length === 0) return;
-    const currentIndex = conversations.findIndex(
+    if (topLevelConversations.length === 0) return;
+    const currentIndex = topLevelConversations.findIndex(
       (c) => c.conversation_id === currentConversationId,
     );
     // Next = further down the list (older)
-    const nextIndex = currentIndex < 0 ? 0 : Math.min(currentIndex + 1, conversations.length - 1);
-    const next = conversations[nextIndex];
+    const nextIndex =
+      currentIndex < 0 ? 0 : Math.min(currentIndex + 1, topLevelConversations.length - 1);
+    const next = topLevelConversations[nextIndex];
     setCurrentConversationId(next.conversation_id);
     setViewedConversation(next);
-  }, [conversations, currentConversationId]);
+  }, [topLevelConversations, currentConversationId]);
 
   const navigateToPreviousConversation = useCallback(() => {
-    if (conversations.length === 0) return;
-    const currentIndex = conversations.findIndex(
+    if (topLevelConversations.length === 0) return;
+    const currentIndex = topLevelConversations.findIndex(
       (c) => c.conversation_id === currentConversationId,
     );
     // Previous = further up the list (newer)
     const prevIndex = currentIndex < 0 ? 0 : Math.max(currentIndex - 1, 0);
-    const prev = conversations[prevIndex];
+    const prev = topLevelConversations[prevIndex];
     setCurrentConversationId(prev.conversation_id);
     setViewedConversation(prev);
-  }, [conversations, currentConversationId]);
+  }, [topLevelConversations, currentConversationId]);
 
   const navigateToNextUserMessage = useCallback(() => {
     setNavigateUserMessageTrigger((prev) => Math.abs(prev) + 1);
@@ -291,19 +350,11 @@ function App() {
   // Handle popstate events (browser back/forward and SubagentTool navigation)
   useEffect(() => {
     const handlePopState = async () => {
-      if (isInboxPath()) {
-        setShowInbox(true);
-        setCurrentConversationId(null);
-        setViewedConversation(null);
-        return;
-      }
       if (isNewPath()) {
-        setShowInbox(false);
         setCurrentConversationId(null);
         setViewedConversation(null);
         return;
       }
-      setShowInbox(false);
       const slug = getSlugFromPath();
       if (!slug) {
         return;
@@ -333,85 +384,59 @@ function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, [conversations]);
 
-  // Handle conversation list updates from the message stream
-  const handleConversationListUpdate = useCallback((update: ConversationListUpdate) => {
-    if (update.type === "update" && update.conversation) {
-      // Handle subagent conversations separately
-      if (update.conversation.parent_conversation_id) {
-        setSubagentUpdate(update.conversation);
-        return;
-      }
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
 
-      // If the conversation is archived, remove it from the active list
-      if (update.conversation.archived) {
-        setConversations((prev) =>
-          prev.filter((c) => c.conversation_id !== update.conversation!.conversation_id),
-        );
-        return;
-      }
-
+  const syncConversations = useCallback(
+    (updater: (prev: ConversationWithState[]) => ConversationWithState[]) => {
       setConversations((prev) => {
-        // Check if this conversation already exists
-        const existingIndex = prev.findIndex(
-          (c) => c.conversation_id === update.conversation!.conversation_id,
-        );
-
-        const gitFields = {
-          git_repo_root: update.git_repo_root,
-          git_worktree_root: update.git_worktree_root,
-        };
-        if (existingIndex >= 0) {
-          // Update existing conversation in place, preserving working state and git info
-          // (working state is updated separately via conversation_state)
-          const updated = [...prev];
-          updated[existingIndex] = {
-            ...update.conversation!,
-            ...gitFields,
-            working: prev[existingIndex].working,
-            git_commit: prev[existingIndex].git_commit,
-            git_subject: prev[existingIndex].git_subject,
-            subagent_count: prev[existingIndex].subagent_count,
-          };
-          return updated;
-        } else {
-          // Add new conversation at the top (not working by default)
-          return [
-            { ...update.conversation!, ...gitFields, working: false, subagent_count: 0 },
-            ...prev,
-          ];
-        }
-      });
-    } else if (update.type === "delete" && update.conversation_id) {
-      setConversations((prev) => prev.filter((c) => c.conversation_id !== update.conversation_id));
-      conversationCache.delete(update.conversation_id);
-    }
-  }, []);
-
-  // Handle conversation state updates (working state changes)
-  const handleConversationStateUpdate = useCallback(
-    (state: { conversation_id: string; working: boolean; pending_approval?: boolean }) => {
-      // Check if this is a top-level conversation
-      setConversations((prev) => {
-        const found = prev.find((conv) => conv.conversation_id === state.conversation_id);
-        if (found) {
-          return prev.map((conv) =>
-            conv.conversation_id === state.conversation_id
-              ? {
-                  ...conv,
-                  working: state.working,
-                  pending_approval: state.pending_approval ?? conv.pending_approval,
-                }
-              : conv,
-          );
-        }
-        // Not a top-level conversation, might be a subagent
-        // Pass the state update to the drawer
-        setSubagentStateUpdate(state);
-        return prev;
+        const next = updater(prev);
+        conversationsRef.current = next;
+        return next;
       });
     },
     [],
   );
+
+  const handleConversationListPatch = useCallback(
+    (event: ConversationListPatchEvent) => {
+      const currentHash = conversationListHashRef.current;
+      if (!event.reset && event.old_hash !== currentHash) {
+        return;
+      }
+      syncConversations((prev) => {
+        const next = applyConversationListPatch(prev, event.patch);
+        const nextIds = new Set(next.map((conv) => conv.conversation_id));
+        for (const conv of prev) {
+          if (!nextIds.has(conv.conversation_id)) {
+            conversationCache.delete(conv.conversation_id);
+          }
+        }
+        return next;
+      });
+      conversationListHashRef.current = event.new_hash;
+    },
+    [syncConversations],
+  );
+
+  // Open the standalone list-only stream only when no conversation is
+  // selected. When one is selected, ChatInterface opens the combined stream
+  // (messages + list patches) so the UI never holds more than one
+  // subscription at a time.
+  useEffect(() => {
+    if (currentConversationId) return;
+    const stream = connectConversationListStream({
+      getHash: () => conversationListHashRef.current,
+      onPatch: handleConversationListPatch,
+      onStatusChange: (status) => {
+        if (status !== "connected") {
+          console.warn(`Conversation list stream ${status}`);
+        }
+      },
+    });
+    return () => stream.close();
+  }, [currentConversationId, handleConversationListPatch]);
 
   // Update page title and URL when conversation changes
   useEffect(() => {
@@ -430,33 +455,32 @@ function App() {
     try {
       setLoading(true);
       setError(null);
-      const convs = await api.getConversations();
-      setConversations(convs);
+      const snapshot = await api.getConversationsSnapshot();
+      const streamHash = conversationListHashRef.current;
+      if (!streamHash) {
+        syncConversations(() => snapshot.conversations);
+        conversationListHashRef.current = snapshot.hash;
+      }
+      const currentList = streamHash ? conversationsRef.current : snapshot.conversations;
+      const topLevel = currentList.filter((c) => !c.parent_conversation_id);
 
-      // Try to resolve conversation from URL slug first
-      const slugConv = await resolveInitialSlug(convs);
+      // Try to resolve conversation from URL slug first (slug may match a
+      // subagent, so search the full list).
+      const slugConv = await resolveInitialSlug(currentList);
       if (slugConv) {
         setCurrentConversationId(slugConv.conversation_id);
         setViewedConversation(slugConv);
-      } else if (!showInbox && !initialIsNew && convs.length > 0) {
-        // No slug in URL and not on /inbox or /new — select the most recent conversation
-        setCurrentConversationId(convs[0].conversation_id);
-        setViewedConversation(convs[0]);
+      } else if (!initialIsNew && topLevel.length > 0) {
+        // No slug in URL and not on /new — select the most recent
+        // top-level conversation.
+        setCurrentConversationId(topLevel[0].conversation_id);
+        setViewedConversation(topLevel[0]);
       }
     } catch (err) {
       console.error("Failed to load conversations:", err);
       setError("Failed to load conversations. Please refresh the page.");
     } finally {
       setLoading(false);
-    }
-  };
-
-  const refreshConversations = async () => {
-    try {
-      const convs = await api.getConversations();
-      setConversations(convs);
-    } catch (err) {
-      console.error("Failed to refresh conversations:", err);
     }
   };
 
@@ -468,8 +492,8 @@ function App() {
     // Clear the current conversation - a new one will be created when the user sends their first message
     setCurrentConversationId(null);
     setViewedConversation(null);
-    // Clear URL when starting new conversation
-    window.history.replaceState({}, "", withBasePath("/"));
+    // Navigate to /new so a reload keeps the user in the new-conversation view.
+    window.history.replaceState({}, "", withBasePath("/new"));
     setDrawerOpen(false);
   };
 
@@ -477,24 +501,17 @@ function App() {
     localStorage.setItem("shelley_selected_cwd", cwd);
     setCurrentConversationId(null);
     setViewedConversation(null);
-    window.history.replaceState({}, "", withBasePath("/"));
+    window.history.replaceState({}, "", withBasePath("/new"));
     setDrawerOpen(false);
+    // Force ChatInterface to re-read the cwd from localStorage even if it's
+    // already mounted in the new-conversation view.
+    setCwdSyncTrigger((n) => n + 1);
   };
 
   const selectConversation = (conversation: Conversation) => {
-    const wasOnInbox = showInbox;
     setCurrentConversationId(conversation.conversation_id);
     setViewedConversation(conversation);
-    setShowInbox(false);
     setDrawerOpen(false);
-    // Use pushState when navigating from inbox so back button returns there
-    if (wasOnInbox) {
-      const slug =
-        conversation.slug && !isGeneratedId(conversation.slug) ? conversation.slug : null;
-      if (slug) {
-        window.history.pushState({}, "", `/c/${slug}`);
-      }
-    }
   };
 
   const toggleDrawerCollapsed = () => {
@@ -502,50 +519,28 @@ function App() {
   };
 
   const updateConversation = (updatedConversation: Conversation) => {
-    // Skip subagent conversations for the main list
-    if (updatedConversation.parent_conversation_id) {
-      return;
+    // The top-level conversation list is owned by the patch stream; keep the
+    // currently viewed metadata fresh without changing that list out-of-band.
+    if (updatedConversation.conversation_id === currentConversationId) {
+      setViewedConversation(updatedConversation);
     }
-    setConversations((prev) =>
-      prev.map((conv) =>
-        conv.conversation_id === updatedConversation.conversation_id
-          ? {
-              ...updatedConversation,
-              // Preserve list-level state fields maintained elsewhere
-              working: conv.working,
-              subagent_count: conv.subagent_count,
-              // Preserve git metadata from conversation list updates.
-              // Stream conversation updates don't include these fields.
-              git_repo_root: conv.git_repo_root,
-              git_worktree_root: conv.git_worktree_root,
-              git_commit: conv.git_commit,
-              git_subject: conv.git_subject,
-            }
-          : conv,
-      ),
-    );
   };
 
   const handleConversationArchived = (conversationId: string) => {
-    setConversations((prev) => prev.filter((conv) => conv.conversation_id !== conversationId));
     conversationCache.delete(conversationId);
-    // If the archived conversation was current, switch to another or clear
+    // If the archived conversation was current, switch immediately; the patch
+    // stream will remove it from the list.
     if (currentConversationId === conversationId) {
-      const remaining = conversations.filter((conv) => conv.conversation_id !== conversationId);
+      const remaining = conversationsRef.current.filter(
+        (conv) => conv.conversation_id !== conversationId && !conv.parent_conversation_id,
+      );
       setCurrentConversationId(remaining.length > 0 ? remaining[0].conversation_id : null);
+      setViewedConversation(remaining.length > 0 ? remaining[0] : null);
     }
   };
 
   const handleConversationUnarchived = (conversation: Conversation) => {
-    // Add back to active list if not already present (SSE may also deliver this).
-    // We need this handler in case no SSE connection is active (e.g., when all
-    // conversations are archived). If SSE also delivers the update,
-    // handleConversationListUpdate will find it already present and update in-place.
-    setConversations((prev) =>
-      prev.some((c) => c.conversation_id === conversation.conversation_id)
-        ? prev
-        : [{ ...conversation, working: false, subagent_count: 0 }, ...prev],
-    );
+    // The conversation list patch stream will add it back to the active list.
     // Update viewedConversation so archived state reflects immediately
     if (conversation.conversation_id === currentConversationId) {
       setViewedConversation(conversation);
@@ -555,20 +550,9 @@ function App() {
   };
 
   const handleConversationRenamed = (conversation: Conversation) => {
-    // Update the conversation in the list with the new slug, preserving working/git state
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.conversation_id === conversation.conversation_id
-          ? {
-              ...conversation,
-              working: c.working,
-              git_commit: c.git_commit,
-              git_subject: c.git_subject,
-              subagent_count: c.subagent_count,
-            }
-          : c,
-      ),
-    );
+    if (conversation.conversation_id === currentConversationId) {
+      setViewedConversation(conversation);
+    }
   };
 
   if (loading && conversations.length === 0) {
@@ -605,7 +589,8 @@ function App() {
 
   // Get the CWD from the current conversation, or fall back to the most recent conversation
   const mostRecentCwd =
-    currentConversation?.cwd || (conversations.length > 0 ? conversations[0].cwd : null);
+    currentConversation?.cwd ||
+    (topLevelConversations.length > 0 ? topLevelConversations[0].cwd : null);
 
   const handleFirstMessage = async (
     message: string,
@@ -613,65 +598,48 @@ function App() {
     cwd?: string,
     conversationType?: "normal" | "orchestrator",
     subagentBackend?: "shelley" | "claude-cli" | "codex-cli",
+    toolOverrides?: Record<string, "on" | "off">,
   ) => {
     try {
+      const hasOverrides = toolOverrides && Object.keys(toolOverrides).length > 0;
+      const convOpts =
+        conversationType === "orchestrator" || hasOverrides
+          ? {
+              ...(conversationType === "orchestrator"
+                ? { type: "orchestrator" as const, subagent_backend: subagentBackend || "shelley" }
+                : {}),
+              ...(hasOverrides ? { tool_overrides: toolOverrides } : {}),
+            }
+          : undefined;
       const response = await api.sendMessageWithNewConversation({
         message,
         model,
         cwd,
-        conversation_options:
-          conversationType === "orchestrator"
-            ? { type: "orchestrator", subagent_backend: subagentBackend || "shelley" }
-            : undefined,
+        conversation_options: convOpts,
       });
       const newConversationId = response.conversation_id;
 
-      // Fetch the new conversation details
-      const updatedConvs = await api.getConversations();
-      setConversations(updatedConvs);
-      setShowInbox(false);
       setCurrentConversationId(newConversationId);
     } catch (err) {
       console.error("Failed to send first message:", err);
-      setError("Failed to send message");
+      setError(err instanceof Error ? err.message : "Failed to send message");
       throw err;
     }
   };
 
-  const handleDistillConversation = async (
+  const handleDistillNewGeneration = async (
     sourceConversationId: string,
     model: string,
     cwd?: string,
   ) => {
     try {
-      const response = await api.distillConversation(sourceConversationId, model, cwd);
-      const newConversationId = response.conversation_id;
-
-      // Fetch the new conversation details and switch to the new conversation
+      await api.distillNewGeneration(sourceConversationId, model, cwd);
       const updatedConvs = await api.getConversations();
       setConversations(updatedConvs);
-      setCurrentConversationId(newConversationId);
+      setCurrentConversationId(sourceConversationId);
     } catch (err) {
-      console.error("Failed to distill conversation:", err);
-      setError("Failed to distill conversation");
-      throw err;
-    }
-  };
-
-  const handleDistillReplaceConversation = async (
-    sourceConversationId: string,
-    model: string,
-    cwd?: string,
-  ) => {
-    try {
-      const response = await api.distillReplaceConversation(sourceConversationId, model, cwd);
-      const newConversationId = response.conversation_id;
-      const updatedConvs = await api.getConversations();
-      setConversations(updatedConvs);
-      setCurrentConversationId(newConversationId);
-    } catch (err) {
-      console.error("Failed to distill-replace conversation:", err);
-      setError("Failed to distill-replace conversation");
+      console.error("Failed to distill into new generation:", err);
+      setError("Failed to distill into new generation");
       throw err;
     }
   };
@@ -682,10 +650,9 @@ function App() {
       highlighterOptions={diffsHighlighterOptions}
     >
       <div className="app-container">
-        {/* Conversations drawer - hidden on inbox */}
         <ConversationDrawer
           isOpen={drawerOpen}
-          isCollapsed={showInbox || drawerCollapsed}
+          isCollapsed={drawerCollapsed}
           onClose={() => setDrawerOpen(false)}
           onToggleCollapse={toggleDrawerCollapsed}
           conversations={conversations}
@@ -696,74 +663,50 @@ function App() {
           onConversationArchived={handleConversationArchived}
           onConversationUnarchived={handleConversationUnarchived}
           onConversationRenamed={handleConversationRenamed}
-          subagentUpdate={subagentUpdate}
-          subagentStateUpdate={subagentStateUpdate}
           showActiveTrigger={showActiveTrigger}
         />
 
-        {/* Main content: Home feed or Chat interface */}
+        {/* Main content: Chat interface */}
         <div className="main-content">
-          {showInbox ? (
-            <HomeFeed
-              conversations={conversations}
-              onSelectConversation={selectConversation}
-              onNewConversation={startNewConversation}
-              onArchiveConversation={async (conversationId: string) => {
-                await api.archiveConversation(conversationId);
-                handleConversationArchived(conversationId);
-              }}
-              onFirstMessage={handleFirstMessage}
-              onReplyToConversation={async (conversationId: string, message: string) => {
-                // Send the reply and stay on inbox
-                try {
-                  await api.sendMessage(conversationId, { message });
-                } catch (err) {
-                  console.error("Failed to send reply:", err);
-                }
-              }}
-              mostRecentCwd={mostRecentCwd}
-              onOpenModelsModal={() => setModelsModalOpen(true)}
-              onOpenDrawer={() => setDrawerOpen(true)}
-              models={window.__SHELLEY_INIT__?.models || []}
-              defaultModel={window.__SHELLEY_INIT__?.default_model || ""}
-              hostname={window.__SHELLEY_INIT__?.hostname || "localhost"}
-            />
-          ) : (
-            <ChatInterface
-              conversationId={currentConversationId}
-              onOpenDrawer={() => setDrawerOpen(true)}
-              onNewConversation={startNewConversation}
-              onArchiveConversation={async (conversationId: string) => {
-                await api.archiveConversation(conversationId);
-                handleConversationArchived(conversationId);
-              }}
-              currentConversation={currentConversation}
-              onConversationUpdate={updateConversation}
-              onConversationListUpdate={handleConversationListUpdate}
-              onConversationStateUpdate={handleConversationStateUpdate}
-              onFirstMessage={handleFirstMessage}
-              onDistillConversation={handleDistillConversation}
-              onDistillReplaceConversation={handleDistillReplaceConversation}
-              mostRecentCwd={mostRecentCwd}
-              isDrawerCollapsed={drawerCollapsed}
-              onToggleDrawerCollapse={toggleDrawerCollapsed}
-              openDiffViewerTrigger={diffViewerTrigger}
-              modelsRefreshTrigger={modelsRefreshTrigger}
-              onOpenModelsModal={() => setModelsModalOpen(true)}
-              onReconnect={refreshConversations}
-              ephemeralTerminals={ephemeralTerminals}
-              setEphemeralTerminals={setEphemeralTerminals}
-              navigateUserMessageTrigger={navigateUserMessageTrigger}
-              onConversationUnarchived={handleConversationUnarchived}
-            />
-          )}
+          <ChatInterface
+            conversationId={currentConversationId}
+            onOpenDrawer={() => setDrawerOpen(true)}
+            onNewConversation={startNewConversation}
+            onArchiveConversation={async (conversationId: string) => {
+              await api.archiveConversation(conversationId);
+              handleConversationArchived(conversationId);
+            }}
+            currentConversation={currentConversation}
+            onConversationUpdate={updateConversation}
+            conversationListHash={conversationListHashRef.current}
+            onConversationListPatch={handleConversationListPatch}
+            onFirstMessage={handleFirstMessage}
+            onDistillNewGeneration={handleDistillNewGeneration}
+            mostRecentCwd={mostRecentCwd}
+            isDrawerCollapsed={drawerCollapsed}
+            onToggleDrawerCollapse={toggleDrawerCollapsed}
+            openDiffViewerTrigger={diffViewerTrigger}
+            openGitGraphTrigger={gitGraphTrigger}
+            modelsRefreshTrigger={modelsRefreshTrigger}
+            cwdSyncTrigger={cwdSyncTrigger}
+            onOpenModelsModal={() => setModelsModalOpen(true)}
+            ephemeralTerminals={ephemeralTerminals}
+            setEphemeralTerminals={setEphemeralTerminals}
+            onTerminalAttached={handleTerminalAttached}
+            onTerminalClose={handleTerminalClose}
+            navigateUserMessageTrigger={navigateUserMessageTrigger}
+            onConversationUnarchived={handleConversationUnarchived}
+          />
         </div>
 
         {/* Command Palette */}
         <CommandPalette
           isOpen={commandPaletteOpen}
-          onClose={() => setCommandPaletteOpen(false)}
-          conversations={conversations}
+          onClose={() => {
+            setCommandPaletteOpen(false);
+            focusMessageInputIfUnfocused();
+          }}
+          conversations={topLevelConversations}
           currentConversation={currentConversation || null}
           onNewConversation={() => {
             startNewConversation();
@@ -789,6 +732,10 @@ function App() {
             setDiffViewerTrigger((prev) => prev + 1);
             setCommandPaletteOpen(false);
           }}
+          onOpenGitGraph={() => {
+            setGitGraphTrigger((prev) => prev + 1);
+            setCommandPaletteOpen(false);
+          }}
           onOpenModelsModal={() => {
             setModelsModalOpen(true);
             setCommandPaletteOpen(false);
@@ -801,18 +748,31 @@ function App() {
           onPreviousConversation={navigateToPreviousConversation}
           onNextUserMessage={navigateToNextUserMessage}
           onPreviousUserMessage={navigateToPreviousUserMessage}
-          hasCwd={!!(currentConversation?.cwd || mostRecentCwd)}
+          hasCwd={
+            !!(
+              currentConversation?.cwd ||
+              mostRecentCwd ||
+              localStorage.getItem("shelley_selected_cwd") ||
+              window.__SHELLEY_INIT__?.default_cwd
+            )
+          }
         />
 
         <ModelsModal
           isOpen={modelsModalOpen}
-          onClose={() => setModelsModalOpen(false)}
+          onClose={() => {
+            setModelsModalOpen(false);
+            focusMessageInputIfUnfocused();
+          }}
           onModelsChanged={() => setModelsRefreshTrigger((prev) => prev + 1)}
         />
 
         <NotificationsModal
           isOpen={notificationsModalOpen}
-          onClose={() => setNotificationsModalOpen(false)}
+          onClose={() => {
+            setNotificationsModalOpen(false);
+            focusMessageInputIfUnfocused();
+          }}
         />
 
         {/* Backdrop for mobile drawer */}

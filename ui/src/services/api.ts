@@ -11,6 +11,22 @@ import {
 } from "../types";
 import { withBasePath } from "./paths";
 
+// Extract a useful error message from a failed fetch response. Prefers the
+// response body (which may contain a server-side detail like a hook error),
+// falls back to statusText, then to the numeric status.
+async function responseError(response: Response, prefix: string): Promise<Error> {
+  let detail = "";
+  try {
+    detail = (await response.text()).trim();
+  } catch {
+    // ignore
+  }
+  if (!detail) {
+    detail = response.statusText || `HTTP ${response.status}`;
+  }
+  return new Error(`${prefix}: ${detail}`);
+}
+
 class ApiService {
   private baseUrl = withBasePath("/api");
 
@@ -22,6 +38,17 @@ class ApiService {
     const response = await fetch(`${this.baseUrl}/conversations`);
     if (!response.ok) {
       throw new Error(`Failed to get conversations: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  async getConversationsSnapshot(): Promise<{
+    conversations: ConversationWithState[];
+    hash: string;
+  }> {
+    const response = await fetch(`${this.baseUrl}/conversations/snapshot`);
+    if (!response.ok) {
+      throw new Error(`Failed to get conversations snapshot: ${response.statusText}`);
     }
     return response.json();
   }
@@ -42,12 +69,33 @@ class ApiService {
     return response.json();
   }
 
+  async getTools(): Promise<{
+    tools: Array<{ name: string; summary: string; default_on: boolean }>;
+  }> {
+    const response = await fetch(`${this.baseUrl}/tools`);
+    if (!response.ok) {
+      throw new Error(`Failed to get tools: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
   async searchConversations(query: string): Promise<ConversationWithState[]> {
     const params = new URLSearchParams({
       q: query,
       search_content: "true",
     });
     const response = await fetch(`${this.baseUrl}/conversations?${params}`);
+    if (!response.ok) {
+      throw new Error(`Failed to search conversations: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  // searchConversationsFTS performs a full-text search across both active AND
+  // archived top-level conversations, using SQLite FTS5 over message bodies.
+  async searchConversationsFTS(query: string): Promise<ConversationWithState[]> {
+    const params = new URLSearchParams({ q: query });
+    const response = await fetch(`${this.baseUrl}/conversations/search?${params}`);
     if (!response.ok) {
       throw new Error(`Failed to search conversations: ${response.statusText}`);
     }
@@ -61,17 +109,17 @@ class ApiService {
       body: JSON.stringify(request),
     });
     if (!response.ok) {
-      throw new Error(`Failed to send message: ${response.statusText}`);
+      throw await responseError(response, "Failed to start conversation");
     }
     return response.json();
   }
 
-  async distillConversation(
+  async distillNewGeneration(
     sourceConversationId: string,
     model?: string,
     cwd?: string,
-  ): Promise<{ conversation_id: string }> {
-    const response = await fetch(`${this.baseUrl}/conversations/distill`, {
+  ): Promise<{ conversation_id: string; current_generation: number }> {
+    const response = await fetch(`${this.baseUrl}/conversations/distill-new-generation`, {
       method: "POST",
       headers: this.postHeaders,
       body: JSON.stringify({
@@ -81,27 +129,17 @@ class ApiService {
       }),
     });
     if (!response.ok) {
-      throw new Error(`Failed to distill conversation: ${response.statusText}`);
+      throw new Error(`Failed to distill into new generation: ${response.statusText}`);
     }
     return response.json();
   }
 
-  async distillReplaceConversation(
-    sourceConversationId: string,
-    model?: string,
-    cwd?: string,
-  ): Promise<{ conversation_id: string }> {
-    const response = await fetch(`${this.baseUrl}/conversations/distill-replace`, {
+  async startNewGeneration(conversationId: string): Promise<Conversation> {
+    const response = await fetch(`${this.baseUrl}/conversation/${conversationId}/new-generation`, {
       method: "POST",
-      headers: this.postHeaders,
-      body: JSON.stringify({
-        source_conversation_id: sourceConversationId,
-        model: model || "",
-        cwd: cwd || "",
-      }),
     });
     if (!response.ok) {
-      throw new Error(`Failed to distill-replace conversation: ${response.statusText}`);
+      throw new Error(`Failed to start new generation: ${response.statusText}`);
     }
     return response.json();
   }
@@ -170,16 +208,30 @@ class ApiService {
       body: JSON.stringify(request),
     });
     if (!response.ok) {
-      throw new Error(`Failed to send message: ${response.statusText}`);
+      throw await responseError(response, "Failed to send message");
     }
   }
 
-  createMessageStream(conversationId: string, lastSequenceId?: number): EventSource {
-    let url = `${this.baseUrl}/conversation/${conversationId}/stream`;
-    if (lastSequenceId !== undefined && lastSequenceId >= 0) {
-      url += `?last_sequence_id=${lastSequenceId}`;
+  // createStream opens the unified message + conversation-list-patch SSE stream.
+  // Pass conversationId to receive that conversation's messages and state in
+  // addition to list patches; omit it for a list-only subscription.
+  createStream(opts: {
+    conversationId?: string;
+    lastSequenceId?: number;
+    conversationListHash?: string;
+  }): EventSource {
+    const params = new URLSearchParams();
+    if (opts.conversationId) {
+      params.set("conversation", opts.conversationId);
     }
-    return new EventSource(url);
+    if (opts.lastSequenceId !== undefined && opts.lastSequenceId >= 0) {
+      params.set("last_sequence_id", String(opts.lastSequenceId));
+    }
+    if (opts.conversationListHash) {
+      params.set("conversation_list_hash", opts.conversationListHash);
+    }
+    const query = params.toString();
+    return new EventSource(`${this.baseUrl}/stream${query ? `?${query}` : ""}`);
   }
 
   async cancelConversation(conversationId: string): Promise<void> {
@@ -231,6 +283,11 @@ class ApiService {
     parent: string;
     entries: Array<{ name: string; is_dir: boolean; git_head_subject?: string }>;
     git_head_subject?: string;
+    /** Toplevel of the worktree containing `path` (if any). For a linked
+     *  worktree, this is the worktree's own root, not the main repo. */
+    git_repo_root?: string;
+    /** Main repository root, set only when `git_repo_root` is a linked
+     *  worktree (i.e. different from the main repo). */
     git_worktree_root?: string;
     error?: string;
   }> {
@@ -252,14 +309,6 @@ class ApiService {
     });
     if (!response.ok) {
       throw new Error(`Failed to create directory: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  async getConversationPreviews(): Promise<Record<string, { text: string; updated_at: string }>> {
-    const response = await fetch(`${this.baseUrl}/conversations/previews`);
-    if (!response.ok) {
-      throw new Error(`Failed to get conversation previews: ${response.statusText}`);
     }
     return response.json();
   }
@@ -324,9 +373,36 @@ class ApiService {
     return response.json();
   }
 
-  async getGitDiffFiles(diffId: string, cwd: string): Promise<GitFileInfo[]> {
+  async getGitGraph(
+    cwd: string,
+    limit = 500,
+    scope: "all" | "current" = "all",
+  ): Promise<import("../types").GitGraphResponse> {
     const response = await fetch(
-      `${this.baseUrl}/git/diffs/${diffId}/files?cwd=${encodeURIComponent(cwd)}`,
+      `${this.baseUrl}/git/graph?cwd=${encodeURIComponent(cwd)}&limit=${limit}&scope=${scope}`,
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || response.statusText);
+    }
+    return response.json();
+  }
+
+  async getGitCommitDetail(cwd: string, hash: string): Promise<import("../types").GitCommitDetail> {
+    const response = await fetch(
+      `${this.baseUrl}/git/commit-detail?cwd=${encodeURIComponent(cwd)}&hash=${encodeURIComponent(hash)}`,
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || response.statusText);
+    }
+    return response.json();
+  }
+
+  async getGitDiffFiles(diffId: string, cwd: string, to?: string): Promise<GitFileInfo[]> {
+    const toParam = to ? `&to=${encodeURIComponent(to)}` : "";
+    const response = await fetch(
+      `${this.baseUrl}/git/diffs/${diffId}/files?cwd=${encodeURIComponent(cwd)}${toParam}`,
     );
     if (!response.ok) {
       throw new Error(`Failed to get diff files: ${response.statusText}`);
@@ -334,9 +410,15 @@ class ApiService {
     return response.json();
   }
 
-  async getGitFileDiff(diffId: string, filePath: string, cwd: string): Promise<GitFileDiff> {
+  async getGitFileDiff(
+    diffId: string,
+    filePath: string,
+    cwd: string,
+    to?: string,
+  ): Promise<GitFileDiff> {
+    const toParam = to ? `&to=${encodeURIComponent(to)}` : "";
     const response = await fetch(
-      `${this.baseUrl}/git/file-diff/${diffId}/${filePath}?cwd=${encodeURIComponent(cwd)}`,
+      `${this.baseUrl}/git/file-diff/${diffId}/${filePath}?cwd=${encodeURIComponent(cwd)}${toParam}`,
     );
     if (!response.ok) {
       throw new Error(`Failed to get file diff: ${response.statusText}`);
@@ -347,9 +429,11 @@ class ApiService {
   async getGitCommitMessages(
     cwd: string,
     from: string,
+    to?: string,
   ): Promise<{ hash: string; subject: string; body: string; author: string; isHead: boolean }[]> {
+    const toParam = to ? `&to=${encodeURIComponent(to)}` : "";
     const response = await fetch(
-      `${this.baseUrl}/git/commit-messages?cwd=${encodeURIComponent(cwd)}&from=${encodeURIComponent(from)}`,
+      `${this.baseUrl}/git/commit-messages?cwd=${encodeURIComponent(cwd)}&from=${encodeURIComponent(from)}${toParam}`,
     );
     if (!response.ok) {
       throw new Error(`Failed to get commit messages: ${response.statusText}`);
@@ -495,6 +579,7 @@ export interface CustomModel {
   model_name: string;
   max_tokens: number;
   tags: string; // Comma-separated tags (e.g., "slug" for slug generation)
+  reasoning_effort: string; // Free-form reasoning.effort for OpenAI Responses API
 }
 
 export interface CreateCustomModelRequest {
@@ -505,6 +590,7 @@ export interface CreateCustomModelRequest {
   model_name: string;
   max_tokens: number;
   tags: string; // Comma-separated tags
+  reasoning_effort: string; // Free-form reasoning.effort for OpenAI Responses API
 }
 
 export interface TestCustomModelRequest {
@@ -513,6 +599,7 @@ export interface TestCustomModelRequest {
   endpoint: string;
   api_key: string;
   model_name: string;
+  reasoning_effort?: string;
 }
 
 class CustomModelsApi {

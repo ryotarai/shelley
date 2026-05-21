@@ -87,6 +87,7 @@ type apiMessageForTS struct {
 	UsageData      *string   `json:"usage_data,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	DisplayData    *string   `json:"display_data,omitempty"`
+	Generation     int64     `json:"generation"`
 	EndOfTurn      *bool     `json:"end_of_turn,omitempty"`
 }
 
@@ -108,6 +109,8 @@ type conversationWithStateForTS struct {
 	ParentConversationID *string `json:"parent_conversation_id"`
 	Model                *string `json:"model"`
 	ConversationOptions  string  `json:"conversation_options"`
+	CurrentGeneration    int64   `json:"current_generation"`
+	AgentWorking         bool    `json:"agent_working"`
 	Working              bool    `json:"working"`
 	PendingApproval      bool    `json:"pending_approval,omitempty"`
 	GitRepoRoot          string  `json:"git_repo_root,omitempty"`
@@ -115,11 +118,14 @@ type conversationWithStateForTS struct {
 	GitCommit            string  `json:"git_commit,omitempty"`
 	GitSubject           string  `json:"git_subject,omitempty"`
 	SubagentCount        int64   `json:"subagent_count"`
+	Preview              string  `json:"preview,omitempty"`
+	PreviewUpdatedAt     string  `json:"preview_updated_at,omitempty"`
+	SearchSnippet        string  `json:"search_snippet,omitempty"`
 }
 
 type streamResponseForTS struct {
-	Messages          []apiMessageForTS       `json:"messages"`
-	Conversation      generated.Conversation  `json:"conversation"`
+	Messages          []apiMessageForTS       `json:"messages,omitempty"`
+	Conversation      *generated.Conversation `json:"conversation,omitempty"`
 	ConversationState *conversationStateForTS `json:"conversation_state,omitempty"`
 	Heartbeat         bool                    `json:"heartbeat,omitempty"`
 	NotificationEvent *notificationEventForTS `json:"notification_event,omitempty"`

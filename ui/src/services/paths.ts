@@ -1,5 +1,6 @@
 function normalizedBasePath(): string {
-  const basePath = window.__SHELLEY_INIT__?.base_path || "/";
+  const basePath =
+    typeof window !== "undefined" ? window.__SHELLEY_INIT__?.base_path || "/" : "/";
   if (basePath === "/" || basePath === "") {
     return "";
   }

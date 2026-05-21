@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -23,10 +24,18 @@ const (
 // Service provides Gemini completions.
 // Fields should not be altered concurrently with calling any method on Service.
 type Service struct {
-	HTTPC  *http.Client // defaults to http.DefaultClient if nil
-	URL    string       // Gemini API URL, uses the gemini package default if empty
-	APIKey string       // must be non-empty
-	Model  string       // defaults to DefaultModel if empty
+	HTTPC         *http.Client      // defaults to http.DefaultClient if nil
+	URL           string            // Gemini API URL, uses the gemini package default if empty
+	APIKey        string            // must be non-empty
+	Model         string            // defaults to DefaultModel if empty
+	ThinkingLevel llm.ThinkingLevel // thinking level (ThinkingLevelOff disables thinkingConfig)
+
+	// ReasoningEffort, if non-empty, is used as the thinkingConfig.thinkingLevel
+	// value sent to Gemini 3.x verbatim, overriding ThinkingLevel. Ignored for
+	// Gemini 2.5 (which uses thinkingBudget). This mirrors oai.ResponsesService
+	// so custom-model configurations can pass provider-specific values through
+	// without Shelley needing to know them.
+	ReasoningEffort string
 }
 
 var _ llm.Service = (*Service)(nil)
@@ -188,19 +197,33 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		for _, c := range msg.Content {
 			switch c.Type {
 			case llm.ContentTypeText, llm.ContentTypeThinking, llm.ContentTypeRedactedThinking:
+				// Image content is represented as ContentTypeText with MediaType + Data set.
+				if c.Type == llm.ContentTypeText && c.MediaType != "" && c.Data != "" {
+					content.Parts = append(content.Parts, gemini.Part{
+						InlineData: &gemini.Blob{
+							MimeType: c.MediaType,
+							Data:     c.Data,
+						},
+					})
+					continue
+				}
 				// Text or thinking content
 				part := gemini.Part{}
 				if c.Type == llm.ContentTypeThinking {
 					// For thinking content, use the Thinking field and preserve the signature
 					part.Text = c.Thinking
 					part.ThoughtSignature = c.Signature
+					part.Thought = true
 				} else if c.Type == llm.ContentTypeRedactedThinking {
 					// For redacted thinking, use the Data field (consistent with Anthropic pattern)
 					part.Text = c.Data
 					part.ThoughtSignature = c.Signature
+					part.Thought = true
 				} else {
-					// For regular text, use the Text field
+					// Regular text. Gemini 3 may have attached a thoughtSignature to
+					// the final-answer text — pass it back so reasoning state survives.
 					part.Text = c.Text
+					part.ThoughtSignature = c.Signature
 				}
 				content.Parts = append(content.Parts, part)
 			case llm.ContentTypeToolUse:
@@ -290,6 +313,19 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 						Response: response,
 					},
 				})
+
+				// Images inside tool results aren't supported in FunctionResponse,
+				// so we attach them as additional inlineData parts on the same content.
+				for _, result := range c.ToolResult {
+					if result.MediaType != "" && result.Data != "" {
+						content.Parts = append(content.Parts, gemini.Part{
+							InlineData: &gemini.Blob{
+								MimeType: result.MediaType,
+								Data:     result.Data,
+							},
+						})
+					}
+				}
 			}
 		}
 
@@ -308,7 +344,45 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		}
 	}
 
+	if tc := s.thinkingConfig(); tc != nil {
+		if gemReq.GenerationConfig == nil {
+			gemReq.GenerationConfig = &gemini.GenerationConfig{}
+		}
+		gemReq.GenerationConfig.ThinkingConfig = tc
+	}
+
 	return gemReq, nil
+}
+
+// thinkingConfig builds the Gemini ThinkingConfig from the service settings.
+// Returns nil when no thinking config should be sent (use the model default).
+func (s *Service) thinkingConfig() *gemini.ThinkingConfig {
+	if s.ReasoningEffort == "" && s.ThinkingLevel == llm.ThinkingLevelOff {
+		return nil
+	}
+	model := cmp.Or(s.Model, DefaultModel)
+	if strings.HasPrefix(model, "gemini-3") {
+		level := s.ReasoningEffort
+		if level == "" {
+			level = s.ThinkingLevel.ThinkingEffort()
+		}
+		if level == "" {
+			return nil
+		}
+		// gemini-3-pro-preview accepts only "low" and "high".
+		if model == "gemini-3-pro-preview" {
+			switch level {
+			case "minimal", "low":
+				level = "low"
+			case "medium", "high":
+				level = "high"
+			}
+		}
+		return &gemini.ThinkingConfig{ThinkingLevel: level}
+	}
+	// Gemini 2.5 (and earlier) uses an integer thinkingBudget.
+	budget := s.ThinkingLevel.ThinkingBudgetTokens()
+	return &gemini.ThinkingConfig{ThinkingBudget: &budget}
 }
 
 // convertGeminiResponsesToContent converts a Gemini response to llm.Content
@@ -332,9 +406,10 @@ func convertGeminiResponseToContent(res *gemini.Response) []llm.Content {
 			"has_function_response", part.FunctionResponse != nil)
 
 		if part.Text != "" {
-			// Check if this is thinking content (has a thought signature)
-			if part.ThoughtSignature != "" {
-				// This is thinking content - use ContentTypeThinking
+			// A part is a thought summary only when thought=true. Gemini 3 attaches
+			// thoughtSignature to ordinary final-answer text too, for round-tripping
+			// reasoning state — that signature alone does not make the text a thought.
+			if part.Thought {
 				contents = append(contents, llm.Content{
 					Type:      llm.ContentTypeThinking,
 					Thinking:  part.Text,
@@ -344,10 +419,10 @@ func convertGeminiResponseToContent(res *gemini.Response) []llm.Content {
 					"signature", part.ThoughtSignature,
 					"thinking_length", len(part.Text))
 			} else {
-				// Regular text response
 				contents = append(contents, llm.Content{
-					Type: llm.ContentTypeText,
-					Text: part.Text,
+					Type:      llm.ContentTypeText,
+					Text:      part.Text,
+					Signature: part.ThoughtSignature,
 				})
 			}
 		} else if part.FunctionCall != nil {
@@ -476,8 +551,9 @@ func (s *Service) TokenContextWindow() int {
 
 	// Gemini models generally have large context windows
 	switch model {
-	case "gemini-3-pro-preview", "gemini-3-flash-preview":
-		return 1000000 // 1M tokens for Gemini 3
+	case "gemini-3-pro-preview", "gemini-3-flash-preview",
+		"gemini-3.1-pro-preview", "gemini-3.1-flash-lite-preview":
+		return 1000000 // 1M tokens for Gemini 3 / 3.1
 	case "gemini-2.5-pro", "gemini-2.5-flash":
 		return 1000000 // 1M tokens for Gemini 2.5
 	case "gemini-2.0-flash-exp", "gemini-2.0-flash":
@@ -496,6 +572,16 @@ func (s *Service) TokenContextWindow() int {
 // TODO: determine actual Gemini image dimension limits
 func (s *Service) MaxImageDimension() int {
 	return 0 // No known limit
+}
+
+// MaxImageBytes returns the maximum allowed encoded size for a single image.
+// The Gemini docs only document a 20 MB total inline request payload
+// (https://ai.google.dev/gemini-api/docs/image-understanding); since the
+// request can include multiple images plus prompts, we use 20 MB as a
+// per-image upper bound. Requests over the total still need to use the
+// Files API.
+func (s *Service) MaxImageBytes() int {
+	return 20 * 1024 * 1024
 }
 
 // Do sends a request to Gemini.
@@ -563,12 +649,28 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 
 	// Send the request to Gemini with retry logic
 	startTime := time.Now()
+	retryStart := startTime
 	endTime := startTime // Initialize endTime
 	var gemRes *gemini.Response
 
-	// Retry mechanism for handling server errors and rate limiting
-	backoff := []time.Duration{1 * time.Second, 3 * time.Second, 5 * time.Second, 10 * time.Second}
-	for attempts := 0; attempts <= len(backoff); attempts++ {
+	// Retry mechanism for handling server errors and rate limiting. Long tail
+	// because providers regularly have multi-hour incidents and returning after
+	// twenty seconds is a worse UX than waiting.
+	backoff := []time.Duration{
+		1 * time.Second,
+		3 * time.Second,
+		5 * time.Second,
+		10 * time.Second,
+		30 * time.Second,
+		1 * time.Minute,
+		2 * time.Minute,
+		5 * time.Minute,
+		10 * time.Minute,
+		20 * time.Minute,
+		30 * time.Minute,
+	}
+	const maxAttempts = 16
+	for attempts := 0; attempts < maxAttempts; attempts++ {
 		gemApiErr := error(nil)
 		gemRes, gemApiErr = model.GenerateContent(ctx, gemReq)
 		endTime = time.Now()
@@ -582,23 +684,29 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			break
 		}
 
-		if attempts == len(backoff) {
+		if attempts == maxAttempts-1 {
 			// We've exhausted all retry attempts
-			return nil, fmt.Errorf("gemini: API error after %d attempts (last at %s): %w", attempts, time.Now().Format(time.DateTime), gemApiErr)
+			return nil, fmt.Errorf("gemini: API error after %d attempts (last at %s): %w", attempts+1, time.Now().Format(time.DateTime), gemApiErr)
 		}
 
-		// Check if the error is retryable (e.g., server error or rate limiting)
-		if strings.Contains(gemApiErr.Error(), "429") || strings.Contains(gemApiErr.Error(), "5") {
-			// Rate limited or server error - wait and retry
-			random := time.Duration(rand.Int63n(int64(time.Second)))
-			sleep := backoff[attempts] + random
-			slog.WarnContext(ctx, "gemini_request_retry", "error", gemApiErr.Error(), "attempt", attempts+1, "sleep", sleep)
-			time.Sleep(sleep)
-			continue
+		// Check if the error is retryable (server error or rate limiting).
+		var apiErr *gemini.APIError
+		retryable := errors.As(gemApiErr, &apiErr) && (apiErr.StatusCode == 429 || apiErr.StatusCode >= 500)
+		if !retryable {
+			return nil, fmt.Errorf("gemini: API error: %w", gemApiErr)
 		}
-
-		// Non-retryable error
-		return nil, fmt.Errorf("gemini: API error: %w", gemApiErr)
+		random := time.Duration(rand.Int63n(int64(time.Second)))
+		sleep := backoff[min(attempts, len(backoff)-1)] + random
+		if retryAfter := llm.ParseRetryAfter(apiErr.Header.Get("Retry-After")); retryAfter > sleep {
+			sleep = retryAfter
+		}
+		slog.WarnContext(ctx, "gemini_request_retry", "error", gemApiErr.Error(), "status_code", apiErr.StatusCode, "attempt", attempts+1, "sleep", sleep, "elapsed", time.Since(retryStart).Round(time.Second))
+		select {
+		case <-time.After(sleep):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("gemini: context cancelled during backoff after %d attempts: %w", attempts+1, gemApiErr)
+		}
+		continue
 	}
 
 	content := convertGeminiResponseToContent(gemRes)

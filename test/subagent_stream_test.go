@@ -26,7 +26,7 @@ import (
 // StreamResponse matches server.StreamResponse for testing
 type StreamResponse struct {
 	Messages               []json.RawMessage       `json:"messages"`
-	Conversation           generated.Conversation  `json:"conversation"`
+	Conversation           *generated.Conversation `json:"conversation,omitempty"`
 	ConversationState      *ConversationState      `json:"conversation_state,omitempty"`
 	ConversationListUpdate *ConversationListUpdate `json:"conversation_list_update,omitempty"`
 	Heartbeat              bool                    `json:"heartbeat,omitempty"`
@@ -124,7 +124,7 @@ func setupTestServerForSubagent(t *testing.T) (*server.Server, *db.DB, *httptest
 		EnableBrowser: false,
 	}
 
-	svr := server.NewServer(database, llmManager, toolSetConfig, logger, true, "", "predictable", "", nil)
+	svr := server.NewServer(database, llmManager, toolSetConfig, logger, true, "predictable", "")
 
 	mux := http.NewServeMux()
 	svr.RegisterRoutes(mux)
@@ -216,8 +216,12 @@ func TestSubagentNotificationViaStream(t *testing.T) {
 	if initialEvent == nil {
 		t.Fatal("Expected initial event")
 	}
+	initialConvID := ""
+	if initialEvent.Conversation != nil {
+		initialConvID = initialEvent.Conversation.ConversationID
+	}
 	t.Logf("Initial event: conversation_id=%s, has_state=%v",
-		initialEvent.Conversation.ConversationID,
+		initialConvID,
 		initialEvent.ConversationState != nil)
 
 	// Create a subagent conversation directly in DB (simulating what SubagentTool.Run does)

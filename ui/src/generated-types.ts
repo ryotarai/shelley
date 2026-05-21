@@ -14,6 +14,8 @@ export interface Conversation {
 	parent_conversation_id: string | null;
 	model: string | null;
 	conversation_options: string;
+	current_generation: number;
+	agent_working: boolean;
 }
 
 export interface Usage {
@@ -37,6 +39,7 @@ export interface ApiMessageForTS {
 	usage_data?: string | null;
 	created_at: string;
 	display_data?: string | null;
+	generation: number;
 	end_of_turn?: boolean | null;
 }
 
@@ -55,8 +58,8 @@ export interface NotificationEventForTS {
 }
 
 export interface StreamResponseForTS {
-	messages: ApiMessageForTS[] | null;
-	conversation: Conversation;
+	messages?: ApiMessageForTS[] | null;
+	conversation?: Conversation | null;
 	conversation_state?: ConversationStateForTS | null;
 	heartbeat?: boolean;
 	notification_event?: NotificationEventForTS | null;
@@ -73,6 +76,8 @@ export interface ConversationWithStateForTS {
 	parent_conversation_id: string | null;
 	model: string | null;
 	conversation_options: string;
+	current_generation: number;
+	agent_working: boolean;
 	working: boolean;
 	pending_approval?: boolean;
 	git_repo_root?: string;
@@ -80,6 +85,9 @@ export interface ConversationWithStateForTS {
 	git_commit?: string;
 	git_subject?: string;
 	subagent_count: number;
+	preview?: string;
+	preview_updated_at?: string;
+	search_snippet?: string;
 }
 
 export type MessageType = 'user' | 'agent' | 'tool' | 'error' | 'system' | 'gitinfo';

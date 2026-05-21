@@ -50,6 +50,11 @@ type ConversationManager struct {
 
 	subpub *subpub.SubPub[StreamResponse]
 
+	// hydrateMu serializes Hydrate so concurrent callers don't race on the
+	// fields it populates (cwd, modelID, conversationOptions, toolSetConfig,
+	// hasConversationEvents, agentWorking) between the initial unlocked
+	// hydrated-check and the final write under cm.mu.
+	hydrateMu             sync.Mutex
 	hydrated              bool
 	hasConversationEvents bool
 	cwd                   string // working directory for tools
@@ -63,6 +68,10 @@ type ConversationManager struct {
 	// into this conversation. When true, queued messages should NOT be drained
 	// immediately — they must wait until distillation finishes.
 	distilling bool
+	// distillSetupDone is non-nil while generation setup is creating the first
+	// status/system messages. QueueMessage waits on it so user messages cannot
+	// appear before the distillation status.
+	distillSetupDone chan struct{}
 
 	// pendingMessages holds messages queued to be sent after the current turn ends.
 	pendingMessages []pendingMessage
@@ -102,7 +111,37 @@ func NewConversationManager(conversationID string, database *db.DB, baseLogger *
 	}
 }
 
+// RegisterEndOfTurnHook records a webhook URL to post whenever a top-level turn ends.
+func (cm *ConversationManager) RegisterEndOfTurnHook(ctx context.Context, hook db.ConversationHook) error {
+	if err := cm.Hydrate(ctx); err != nil {
+		return err
+	}
+	opts, err := cm.db.RegisterConversationHook(ctx, cm.conversationID, hook)
+	if err != nil {
+		return err
+	}
+	cm.mu.Lock()
+	cm.conversationOptions = opts
+	cm.mu.Unlock()
+	return nil
+}
+
+// EndOfTurnHooks returns the registered top-level end-of-turn hooks.
+func (cm *ConversationManager) EndOfTurnHooks(ctx context.Context) ([]db.ConversationHook, error) {
+	if err := cm.Hydrate(ctx); err != nil {
+		return nil, err
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	hooks := make([]db.ConversationHook, len(cm.conversationOptions.EndOfTurnHooks))
+	copy(hooks, cm.conversationOptions.EndOfTurnHooks)
+	return hooks, nil
+}
+
 // SetAgentWorking updates the agent working state and notifies the server to broadcast.
+// The new value is also persisted to the conversations table so the
+// conversation list patch stream picks it up via the standard Pool.OnCommit
+// hook (no explicit notify required).
 func (cm *ConversationManager) SetAgentWorking(working bool) {
 	cm.mu.Lock()
 	if cm.agentWorking == working {
@@ -110,9 +149,13 @@ func (cm *ConversationManager) SetAgentWorking(working bool) {
 		return
 	}
 	cm.agentWorking = working
+	convID := cm.conversationID
 	cm.mu.Unlock()
 
 	cm.logger.Debug("agent working state changed", "working", working)
+	if err := cm.db.SetConversationAgentWorking(context.Background(), convID, working); err != nil {
+		cm.logger.Error("failed to persist agent working state", "error", err, "working", working)
+	}
 	cm.emitState()
 }
 
@@ -154,7 +197,50 @@ func (cm *ConversationManager) emitState() {
 func (cm *ConversationManager) SetDistilling(distilling bool) {
 	cm.mu.Lock()
 	cm.distilling = distilling
+	setupDone := cm.distillSetupDone
+	if !distilling {
+		cm.distillSetupDone = nil
+	}
 	cm.mu.Unlock()
+	if !distilling && setupDone != nil {
+		close(setupDone)
+	}
+}
+
+func (cm *ConversationManager) BeginDistillingSetup() {
+	cm.mu.Lock()
+	if !cm.distilling {
+		cm.distilling = true
+	}
+	if cm.distillSetupDone == nil {
+		cm.distillSetupDone = make(chan struct{})
+	}
+	cm.mu.Unlock()
+}
+
+func (cm *ConversationManager) FinishDistillingSetup() {
+	cm.mu.Lock()
+	setupDone := cm.distillSetupDone
+	cm.distillSetupDone = nil
+	cm.mu.Unlock()
+	if setupDone != nil {
+		close(setupDone)
+	}
+}
+
+func (cm *ConversationManager) IsDistilling() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.distilling
+}
+
+func (cm *ConversationManager) waitDistillingSetup() {
+	cm.mu.Lock()
+	setupDone := cm.distillSetupDone
+	cm.mu.Unlock()
+	if setupDone != nil {
+		<-setupDone
+	}
 }
 
 // GetModel returns the model ID used by this conversation.
@@ -169,6 +255,20 @@ func (cm *ConversationManager) GetModel() string {
 // ensureLoop reads messages fresh from the DB when creating a loop so that
 // any messages added asynchronously (e.g. distillation) are always included.
 func (cm *ConversationManager) Hydrate(ctx context.Context) error {
+	cm.mu.Lock()
+	if cm.hydrated {
+		cm.lastActivity = time.Now()
+		cm.mu.Unlock()
+		return nil
+	}
+	cm.mu.Unlock()
+
+	// Serialize Hydrate across concurrent callers. Without this, two goroutines
+	// can both observe hydrated=false above, fall through, and race on the
+	// non-cm.mu-guarded writes below (cwd, conversationOptions, toolSetConfig).
+	// Re-check hydrated after acquiring so we don't redo work.
+	cm.hydrateMu.Lock()
+	defer cm.hydrateMu.Unlock()
 	cm.mu.Lock()
 	if cm.hydrated {
 		cm.lastActivity = time.Now()
@@ -195,6 +295,7 @@ func (cm *ConversationManager) Hydrate(ctx context.Context) error {
 	if conversation.Model != nil {
 		modelID = *conversation.Model
 	}
+	cm.toolSetConfig.ModelID = modelID
 
 	// Load conversation options
 	cm.conversationOptions = db.ParseConversationOptions(conversation.ConversationOptions)
@@ -253,6 +354,10 @@ func (cm *ConversationManager) Hydrate(ctx context.Context) error {
 	cm.lastActivity = time.Now()
 	cm.hydrated = true
 	cm.modelID = modelID
+	// Seed agentWorking from the persisted column so a fresh manager (e.g.
+	// after switching back to a conversation whose loop is still running) sees
+	// the real state instead of the zero value.
+	cm.agentWorking = conversation.AgentWorking
 	cm.mu.Unlock()
 
 	if modelID != "" {
@@ -311,6 +416,8 @@ func (cm *ConversationManager) AcceptUserMessage(ctx context.Context, service ll
 // for delivery after the current agent turn (or distillation) completes.
 // The message is visible in the UI immediately (with queued status).
 func (cm *ConversationManager) QueueMessage(ctx context.Context, s *Server, modelID string, message llm.Message) error {
+	cm.waitDistillingSetup()
+
 	// Record to DB with queued user_data so it appears in the UI.
 	// Mark as excluded_from_context so ensureLoop won't load it into
 	// the loop's history — we'll feed it via QueueUserMessage when draining.
@@ -521,17 +628,16 @@ func (cm *ConversationManager) createSystemPrompt(ctx context.Context) (*generat
 		Type:           db.MessageTypeSystem,
 		LLMData:        systemMessage,
 		UsageData:      llm.Usage{},
-		DisplayData:    systemPromptDisplayData(cm.toolSetConfig),
+		DisplayData:    cm.systemPromptDisplayData(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to store system prompt: %w", err)
 	}
 
-	if err := cm.db.QueriesTx(ctx, func(q *generated.Queries) error {
-		return q.UpdateConversationTimestamp(ctx, cm.conversationID)
-	}); err != nil {
-		cm.logger.Warn("Failed to update conversation timestamp after system prompt", "error", err)
-	}
+	// Intentionally do NOT bump conversation updated_at here: system prompt
+	// generation is internal metadata triggered lazily by Hydrate, and bumping
+	// the timestamp would reorder the conversation list every time a stream
+	// connects to a brand-new conversation.
 
 	cm.logger.Info("Stored system prompt", "length", len(systemPrompt))
 	return created, nil
@@ -568,6 +674,13 @@ func systemPromptDisplayData(cfg claudetool.ToolSetConfig) map[string]any {
 	return toolDisplayData(ts.Tools())
 }
 
+func (cm *ConversationManager) systemPromptDisplayData() map[string]any {
+	cfg := cm.toolSetConfig
+	cfg.ToolOverrides = cm.conversationOptions.ToolOverrides
+	cfg.DisableAllTools = cm.conversationOptions.DisableAllTools
+	return systemPromptDisplayData(cfg)
+}
+
 func (cm *ConversationManager) createSubagentSystemPrompt(ctx context.Context, parentConversationID string) (*generated.Message, error) {
 	systemPrompt, err := GenerateSubagentSystemPrompt(cm.cwd, parentConversationID)
 	if err != nil {
@@ -589,7 +702,7 @@ func (cm *ConversationManager) createSubagentSystemPrompt(ctx context.Context, p
 		Type:           db.MessageTypeSystem,
 		LLMData:        systemMessage,
 		UsageData:      llm.Usage{},
-		DisplayData:    systemPromptDisplayData(cm.toolSetConfig),
+		DisplayData:    cm.systemPromptDisplayData(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to store subagent system prompt: %w", err)
@@ -635,7 +748,10 @@ func (cm *ConversationManager) createOrchestratorSystemPrompt(ctx context.Contex
 		SubagentDB:           cm.toolSetConfig.SubagentDB,
 		ParentConversationID: cm.conversationID,
 		EnableBrowser:        cm.toolSetConfig.EnableBrowser,
+		BuildAvailableModels: cm.toolSetConfig.BuildAvailableModels,
 		CLIAgent:             cm.conversationOptions.SubagentBackend,
+		ToolOverrides:        cm.conversationOptions.ToolOverrides,
+		DisableAllTools:      cm.conversationOptions.DisableAllTools,
 	})
 	defer ts.Cleanup()
 
@@ -675,7 +791,7 @@ func (cm *ConversationManager) createOrchestratorSubagentSystemPrompt(ctx contex
 		Type:           db.MessageTypeSystem,
 		LLMData:        systemMessage,
 		UsageData:      llm.Usage{},
-		DisplayData:    systemPromptDisplayData(cm.toolSetConfig),
+		DisplayData:    cm.systemPromptDisplayData(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to store orchestrator subagent system prompt: %w", err)
@@ -716,10 +832,47 @@ func (cm *ConversationManager) partitionMessages(messages []generated.Message) (
 			continue
 		}
 
+		if msg.Type == string(db.MessageTypeUser) {
+			cm.applyDistillationContentOverride(&llmMsg, msg)
+		}
+
 		history = append(history, llmMsg)
 	}
 
 	return history, system
+}
+
+func (cm *ConversationManager) applyDistillationContentOverride(llmMsg *llm.Message, msg generated.Message) {
+	if msg.UserData == nil {
+		return
+	}
+
+	var userData map[string]string
+	if err := json.Unmarshal([]byte(*msg.UserData), &userData); err != nil {
+		cm.logger.Warn("Failed to parse message user_data", "messageID", msg.MessageID, "error", err)
+		return
+	}
+	if userData["distilled"] != "true" {
+		return
+	}
+
+	content := userData["distillation_content"]
+	if filePath := userData["distillation_file"]; filePath != "" {
+		if !isDistillationTempFile(filePath) {
+			cm.logger.Warn("Distillation file path validation failed", "messageID", msg.MessageID, "path", filePath)
+		} else if fileContent, err := os.ReadFile(filePath); err == nil {
+			content = string(fileContent)
+		} else {
+			cm.logger.Warn("Failed to read editable distillation file; using stored content", "messageID", msg.MessageID, "path", filePath, "error", err)
+		}
+	}
+	for i := range llmMsg.Content {
+		if llmMsg.Content[i].Type == llm.ContentTypeText {
+			llmMsg.Content[i].Text = content
+			return
+		}
+	}
+	llmMsg.Content = append(llmMsg.Content, llm.Content{Type: llm.ContentTypeText, Text: content})
 }
 
 func (cm *ConversationManager) logSystemPromptState(system []llm.SystemContent, messageCount int) {
@@ -805,8 +958,9 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 			return
 		}
 		cm.subpub.Broadcast(StreamResponse{
-			Conversation: conv,
+			Conversation: &conv,
 		})
+		// The list patch stream refreshes from the Pool commit hook.
 	}
 
 	// Create a context with the conversation ID for LLM request recording/prefix dedup
@@ -823,13 +977,17 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 			ParentConversationID: conversationID,
 			ModelID:              modelID,
 			LLMProvider:          toolSetConfig.LLMProvider,
-			AvailableModels:      toolSetConfig.AvailableModels,
+			BuildAvailableModels: toolSetConfig.BuildAvailableModels,
 			WorkingDir:           cwd,
 			OnWorkingDirChange:   toolSetConfig.OnWorkingDirChange,
 			EnableBrowser:        toolSetConfig.EnableBrowser,
 			CLIAgent:             conversationOpts.SubagentBackend,
+			ToolOverrides:        conversationOpts.ToolOverrides,
+			DisableAllTools:      conversationOpts.DisableAllTools,
 		})
 	} else {
+		toolSetConfig.ToolOverrides = conversationOpts.ToolOverrides
+		toolSetConfig.DisableAllTools = conversationOpts.DisableAllTools
 		toolSet = claudetool.NewToolSet(processCtx, toolSetConfig)
 	}
 
@@ -907,6 +1065,15 @@ func (cm *ConversationManager) ensureLoop(service llm.Service, modelID string) e
 }
 
 func (cm *ConversationManager) stopLoop() {
+	cm.resetLoop(false)
+}
+
+// ResetLoop drops the in-memory LLM loop so the next turn hydrates from the DB.
+func (cm *ConversationManager) ResetLoop() {
+	cm.resetLoop(true)
+}
+
+func (cm *ConversationManager) resetLoop(markUnhydrated bool) {
 	cm.mu.Lock()
 	cancel := cm.loopCancel
 	toolSet := cm.toolSet
@@ -915,6 +1082,10 @@ func (cm *ConversationManager) stopLoop() {
 	cm.loop = nil
 	cm.modelID = ""
 	cm.toolSet = nil
+	if markUnhydrated {
+		cm.hydrated = false
+		cm.hasConversationEvents = false
+	}
 	cm.mu.Unlock()
 
 	if cancel != nil {
@@ -1258,7 +1429,7 @@ func (cm *ConversationManager) notifyGitStateChange(ctx context.Context, msg *ge
 	apiMessages := toAPIMessages([]generated.Message{*msg})
 	streamData := StreamResponse{
 		Messages:     apiMessages,
-		Conversation: conversation,
+		Conversation: &conversation,
 	}
 	cm.subpub.Publish(msg.SequenceID, streamData)
 }
