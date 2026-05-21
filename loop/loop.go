@@ -297,8 +297,11 @@ func (l *Loop) processLLMRequest(ctx context.Context) error {
 		}
 		l.logger.Debug("sending LLM request", "message_count", len(messages), "tool_count", len(tools), "system_items", len(system), "system_length", systemLen)
 
-		// Add a timeout for the LLM request to prevent indefinite hangs
-		llmCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		// Add a timeout for the LLM request to prevent indefinite hangs.
+		// Long extended-thinking responses can take well over 5 minutes to
+		// stream, so use a generous upper bound to avoid spurious
+		// "context deadline exceeded" failures during normal operation.
+		llmCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 
 		// Retry LLM requests that fail with retryable errors (EOF, connection reset)
 		const maxRetries = 2
