@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { linkifyText } from "../utils/linkify";
+import { renderInlineText } from "../utils/inlineText";
 import { useMarkdown } from "../contexts/MarkdownContext";
 import MarkdownContent from "./MarkdownContent";
 import {
@@ -35,6 +35,7 @@ import BrowserProfileTool from "./BrowserProfileTool";
 import ThinkingContent from "./ThinkingContent";
 import UsageDetailModal from "./UsageDetailModal";
 import MessageActionBar from "./MessageActionBar";
+import EditableFileModal from "./EditableFileModal";
 import { type MarkdownMode } from "../services/settings";
 
 /** Should we render markdown for this content block? */
@@ -191,8 +192,17 @@ function GitInfoMessage({
           <>
             {" "}
             <a
-              href="#"
+              href={(() => {
+                const params = new URLSearchParams();
+                params.set("diff", commitHash!);
+                if (worktree) params.set("cwd", worktree);
+                return `${window.location.pathname}?${params.toString()}`;
+              })()}
               onClick={(e) => {
+                // Respect modifier/middle-click so users can open in a new tab.
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) {
+                  return;
+                }
                 e.preventDefault();
                 handleDiffClick();
               }}
@@ -363,11 +373,12 @@ const Message = React.memo(function Message({
 }: MessageProps) {
   const { markdownMode } = useMarkdown();
 
-  // Render system messages with distill_status as status indicators
+  // Render distillation status messages as compact agent-side indicators.
+  if (isDistillStatusMessage(message)) {
+    return <DistillStatusMessage message={message} />;
+  }
+
   if (message.type === "system") {
-    if (isDistillStatusMessage(message)) {
-      return <DistillStatusMessage message={message} />;
-    }
     if (isToolApprovalRequestMessage(message)) {
       return <ToolApprovalRequestMessage message={message} conversationId={conversationId} />;
     }
@@ -547,6 +558,9 @@ const Message = React.memo(function Message({
   const isTool = message.type === "tool" || hasToolContent(llmMessage);
   const isError = message.type === "error";
 
+  let distillationFile = "";
+  let distillationContent = "";
+
   // Check if this is a distilled user message (LLM-generated, treat as agent for markdown)
   const isDistilledUser =
     isUser &&
@@ -555,11 +569,21 @@ const Message = React.memo(function Message({
       try {
         const ud =
           typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
-        return ud?.distilled === "true";
+        if (ud?.distilled === "true") {
+          distillationFile = ud.distillation_file || "";
+          distillationContent = ud.distillation_content || "";
+          return true;
+        }
+        return false;
       } catch {
         return false;
       }
     })();
+  const [showDistillationEditor, setShowDistillationEditor] = useState(false);
+  const [distillationContentOverride, setDistillationContentOverride] = useState<string | null>(
+    null,
+  );
+  const displayedDistillationContent = distillationContentOverride ?? distillationContent;
 
   // Check if this is a queued message (waiting for agent to finish)
   const isQueued = isUser && isQueuedMessage(message);
@@ -568,6 +592,7 @@ const Message = React.memo(function Message({
   const messageText = getMessageText();
   const hasCopyAction = !!messageText;
   const hasUsageAction = message.type === "agent" && !!usage;
+  const isCommentable = !isUser && !isError && !isTool;
 
   // Build a map of tool use IDs to their inputs for linking tool_result back to tool_use
   const toolUseMap: Record<string, { name: string; input: unknown }> = {};
@@ -603,7 +628,9 @@ const Message = React.memo(function Message({
           return <MarkdownContent text={content.Text || ""} />;
         }
         return (
-          <div className="whitespace-pre-wrap break-words">{linkifyText(content.Text || "")}</div>
+          <div className="whitespace-pre-wrap break-words">
+            {renderInlineText(content.Text || "")}
+          </div>
         );
       case "tool_use":
         // IMPORTANT: When adding a new tool component here, also add it to:
@@ -612,7 +639,7 @@ const Message = React.memo(function Message({
         // See AGENTS.md in this directory.
 
         // Use specialized component for bash tool
-        if (content.ToolName === "bash") {
+        if (content.ToolName === "bash" || content.ToolName === "shell") {
           return (
             <BashTool
               toolInput={content.ToolInput}
@@ -749,7 +776,7 @@ const Message = React.memo(function Message({
         const toolName = rawToolName;
 
         // Use specialized component for bash tool
-        if (toolName === "bash") {
+        if (toolName === "bash" || toolName === "shell") {
           return (
             <BashTool
               toolInput={toolInput}
@@ -1144,7 +1171,7 @@ const Message = React.memo(function Message({
   };
 
   const getMessageClasses = () => {
-    if (isUser) {
+    if (isUser && !isDistilledUser) {
       return `message message-user${isQueued ? " message-queued" : ""}`;
     }
     if (isError) {
@@ -1197,6 +1224,49 @@ const Message = React.memo(function Message({
       </>
     );
   }
+
+  const renderDistillationEditor = () =>
+    distillationFile ? (
+      <EditableFileModal
+        isOpen={showDistillationEditor}
+        path={distillationFile}
+        title="Edit distillation"
+        onClose={() => setShowDistillationEditor(false)}
+        onSaved={setDistillationContentOverride}
+      />
+    ) : null;
+
+  const openDistillationEditor = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setShowDistillationEditor(true);
+  };
+
+  const renderDistillationBox = () =>
+    isDistilledUser && distillationFile ? (
+      <div className="distillation-file-box" data-testid="distillation-file-box">
+        <div className="distillation-file-box-header">
+          <div className="distillation-file-box-title">Editable distillation</div>
+          <button
+            type="button"
+            className="distillation-edit-button"
+            onClick={openDistillationEditor}
+            title="Edit distillation in modal"
+          >
+            Edit
+          </button>
+        </div>
+        <div className="distillation-file-box-meta">
+          Shown from editable file <code>{distillationFile}</code>.
+        </div>
+        <div className="distillation-file-box-content">
+          {displayedDistillationContent ? (
+            <MarkdownContent text={displayedDistillationContent} />
+          ) : (
+            <span className="distillation-empty">Empty distillation</span>
+          )}
+        </div>
+      </div>
+    ) : null;
 
   // If we have display_data, use that for rendering (more compact, tool-specific)
   if (displayData && displayData.length > 0) {
@@ -1281,6 +1351,8 @@ const Message = React.memo(function Message({
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
         data-testid="message"
+        data-message-id={message.message_id}
+        data-commentable={isCommentable ? "true" : undefined}
         role="article"
       >
         {actionBarVisible && (hasCopyAction || hasUsageAction) && (
@@ -1291,9 +1363,10 @@ const Message = React.memo(function Message({
         )}
         {/* Message content */}
         <div className="message-content" data-testid="message-content">
-          {contentToRender.map((content, index) => (
-            <div key={index}>{renderContent(content)}</div>
-          ))}
+          {renderDistillationBox() ||
+            contentToRender.map((content, index) => (
+              <div key={index}>{renderContent(content)}</div>
+            ))}
           {isQueued && (
             <div className="queued-message-badge" data-testid="queued-badge">
               <span className="queued-message-badge-label">
@@ -1332,6 +1405,7 @@ const Message = React.memo(function Message({
           onClose={() => setShowUsageModal(false)}
         />
       )}
+      {renderDistillationEditor()}
     </>
   );
 });

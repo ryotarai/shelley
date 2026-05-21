@@ -28,7 +28,6 @@ type GlobalConfig struct {
 	Model           string
 	PredictableOnly bool
 	ConfigPath      string
-	TerminalURL     string
 	DefaultModel    string
 }
 
@@ -52,6 +51,7 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  serve [flags]                 Start the web server\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  client [flags] <subcommand>   CLI client (chat, read, list, archive) (experimental)\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  skill <cat|ls|new> [name]     Read, list, or create skills\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  dtach <new|attach> ...        Persistent PTY sessions over a Unix socket\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  unpack-template <name> <dir>  Unpack a project template to a directory\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  version                       Print version information as JSON\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "\nUse '%s <command> -h' for command-specific help\n", os.Args[0])
@@ -74,6 +74,8 @@ func main() {
 		client.Run(args[1:])
 	case "skill":
 		runSkill(args[1:])
+	case "dtach":
+		runDtach(args[1:])
 	case "unpack-template":
 		runUnpackTemplate(args[1:])
 	case "version":
@@ -113,7 +115,11 @@ func runSkill(args []string) {
 	case "ls":
 		all := skills.ListAll(wd, "")
 		for _, s := range all {
-			fmt.Printf("%s\t%s\n", s.Name, s.Description)
+			desc := s.Description
+			if s.When != "" {
+				desc = "[when: " + s.When + "] " + desc
+			}
+			fmt.Printf("%s\t%s\n", s.Name, desc)
 		}
 
 	case "new":
@@ -154,7 +160,7 @@ func runServe(global GlobalConfig, args []string) {
 	server.DBPath = global.DBPath
 
 	// Build LLM configuration
-	llmConfig := buildLLMConfig(logger, global.ConfigPath, global.TerminalURL, global.DefaultModel, database)
+	llmConfig := buildLLMConfig(logger, global.ConfigPath, global.DefaultModel, database)
 
 	// Initialize LLM service manager (includes custom model support via database)
 	llmManager := server.NewLLMServiceManager(llmConfig)
@@ -166,7 +172,7 @@ func runServe(global GlobalConfig, args []string) {
 	toolSetConfig := setupToolSetConfig(llmManager, llmManager)
 
 	// Create server
-	svr := server.NewServer(database, llmManager, toolSetConfig, logger, global.PredictableOnly, llmConfig.TerminalURL, llmConfig.DefaultModel, *requireHeader, llmConfig.Links)
+	svr := server.NewServer(database, llmManager, toolSetConfig, logger, global.PredictableOnly, llmConfig.DefaultModel, *requireHeader)
 	svr.SetPermissionCheckCommand(*permissionCheck)
 	if err := svr.SetBasePath(*basePath); err != nil {
 		logger.Error("Invalid base path", "base_path", *basePath, "error", err)
@@ -246,6 +252,14 @@ func setupDatabase(dbPath string, logger *slog.Logger) *db.DB {
 		os.Exit(1)
 	}
 	logger.Debug("Database migrations completed successfully")
+
+	// agent_working is runtime-only state. If the previous process exited
+	// while a loop was running, the column can be left TRUE for one or more
+	// conversations. Clear them so the conversation list reflects reality.
+	if err := database.ResetAllAgentWorking(context.Background()); err != nil {
+		logger.Error("Failed to reset agent_working state", "error", err)
+		os.Exit(1)
+	}
 	return database
 }
 
@@ -329,33 +343,37 @@ func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager se
 		wd = "/"
 	}
 
-	// Build available models with display names for the subagent tool
-	var availableModels []claudetool.AvailableModel
-	for _, id := range llmManager.GetAvailableModels() {
-		am := claudetool.AvailableModel{ID: id}
-		if info := llmManager.GetModelInfo(id); info != nil && info.DisplayName != "" && info.DisplayName != id {
-			am.DisplayName = info.DisplayName
+	// Resolve the list of available models lazily, each time a ToolSet is
+	// built. This lets newly-added custom models become visible to subagents
+	// (and llm_one_shot) without restarting the server. See issue #195.
+	buildAvailableModels := func() []claudetool.AvailableModel {
+		var out []claudetool.AvailableModel
+		for _, id := range llmManager.GetAvailableModels() {
+			am := claudetool.AvailableModel{ID: id}
+			if info := llmManager.GetModelInfo(id); info != nil && info.DisplayName != "" && info.DisplayName != id {
+				am.DisplayName = info.DisplayName
+			}
+			out = append(out, am)
 		}
-		availableModels = append(availableModels, am)
+		return out
 	}
 
 	return claudetool.ToolSetConfig{
-		WorkingDir:       wd,
-		LLMProvider:      llmProvider,
-		EnableJITInstall: claudetool.EnableBashToolJITInstall,
-		EnableBrowser:    true,
-		AvailableModels:  availableModels,
+		WorkingDir:           wd,
+		LLMProvider:          llmProvider,
+		EnableJITInstall:     claudetool.EnableBashToolJITInstall,
+		EnableBrowser:        true,
+		BuildAvailableModels: buildAvailableModels,
 	}
 }
 
 // buildLLMConfig constructs LLMConfig from environment variables and optional config file
-func buildLLMConfig(logger *slog.Logger, configPath, terminalURL, defaultModel string, database *db.DB) *server.LLMConfig {
+func buildLLMConfig(logger *slog.Logger, configPath, defaultModel string, database *db.DB) *server.LLMConfig {
 	llmCfg := &server.LLMConfig{
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
 		GeminiAPIKey:    os.Getenv("GEMINI_API_KEY"),
 		FireworksAPIKey: os.Getenv("FIREWORKS_API_KEY"),
-		TerminalURL:     terminalURL,
 		DefaultModel:    defaultModel,
 		DB:              database,
 		Logger:          logger,
@@ -372,9 +390,7 @@ func buildLLMConfig(logger *slog.Logger, configPath, terminalURL, defaultModel s
 
 		var cfg struct {
 			LLMGateway           string           `json:"llm_gateway"`
-			TerminalURL          string           `json:"terminal_url"`
 			DefaultModel         string           `json:"default_model"`
-			Links                []server.Link    `json:"links"`
 			NotificationChannels []map[string]any `json:"notification_channels"`
 		}
 		if err := json.Unmarshal(data, &cfg); err != nil {
@@ -402,22 +418,10 @@ func buildLLMConfig(logger *slog.Logger, configPath, terminalURL, defaultModel s
 			}
 		}
 
-		// Override terminal URL from config file if present and not already set via flag
-		if cfg.TerminalURL != "" && llmCfg.TerminalURL == "" {
-			llmCfg.TerminalURL = cfg.TerminalURL
-			logger.Info("Using terminal URL from config", "url", cfg.TerminalURL)
-		}
-
 		// Override default model from config file if present and not already set via flag
 		if cfg.DefaultModel != "" && llmCfg.DefaultModel == "" {
 			llmCfg.DefaultModel = cfg.DefaultModel
 			logger.Info("Using default model from config", "model", cfg.DefaultModel)
-		}
-
-		// Load links from config file if present
-		if len(cfg.Links) > 0 {
-			llmCfg.Links = cfg.Links
-			logger.Info("Loaded links from config", "count", len(cfg.Links))
 		}
 
 		if len(cfg.NotificationChannels) > 0 {

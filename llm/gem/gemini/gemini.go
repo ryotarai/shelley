@@ -52,9 +52,24 @@ type Part struct {
 	CodeExecutionResult *CodeExecutionResult `json:"codeExecutionResult,omitempty"`
 	// ThoughtSignature is required for Gemini 3 models when using function calling.
 	// It must be passed back exactly as received when sending the conversation history.
+	// Note: presence of ThoughtSignature does NOT mean the part is a thought summary —
+	// Gemini 3 attaches it to ordinary final-answer text and tool calls so that
+	// internal reasoning state can be rehydrated on the next turn. Use Thought to
+	// detect a thought summary.
 	ThoughtSignature string `json:"thoughtSignature,omitempty"`
-	// TODO inlineData
+	// Thought is true when the part is a thought summary (only emitted when
+	// thinkingConfig.includeThoughts is true). https://ai.google.dev/gemini-api/docs/thinking
+	Thought    bool  `json:"thought,omitempty"`
+	InlineData *Blob `json:"inlineData,omitempty"`
 	// TODO fileData
+}
+
+// Blob is inline binary data (e.g. an image).
+// https://ai.google.dev/api/caching#Blob
+type Blob struct {
+	MimeType string `json:"mimeType"`
+	// Data is base64-encoded binary content.
+	Data string `json:"data"`
 }
 
 type FunctionCall struct {
@@ -95,8 +110,20 @@ const (
 
 // https://ai.google.dev/api/generate-content#v1beta.GenerationConfig
 type GenerationConfig struct {
-	ResponseMimeType string  `json:"responseMimeType,omitempty"` // text/plain, application/json, or text/x.enum
-	ResponseSchema   *Schema `json:"responseSchema,omitempty"`   // for JSON
+	ResponseMimeType string          `json:"responseMimeType,omitempty"` // text/plain, application/json, or text/x.enum
+	ResponseSchema   *Schema         `json:"responseSchema,omitempty"`   // for JSON
+	ThinkingConfig   *ThinkingConfig `json:"thinkingConfig,omitempty"`
+}
+
+// ThinkingConfig controls extended thinking for Gemini models.
+// ThinkingLevel and ThinkingBudget are mutually exclusive: setting both
+// returns a 400 from the API. Use ThinkingLevel for Gemini 3.x and
+// ThinkingBudget for Gemini 2.5.
+// https://ai.google.dev/gemini-api/docs/thinking
+type ThinkingConfig struct {
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`   // Gemini 3.x: "minimal", "low", "medium", "high"
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`  // Gemini 2.5: token count, -1 dynamic, 0 disable
+	IncludeThoughts bool   `json:"includeThoughts,omitempty"` // include thought summaries in response
 }
 
 // https://ai.google.dev/api/caching#Tool
@@ -141,6 +168,17 @@ const (
 
 const defaultEndpoint = "https://generativelanguage.googleapis.com/v1beta"
 
+// APIError is returned by GenerateContent when the server returns a non-200 status.
+type APIError struct {
+	StatusCode int
+	Body       string
+	Header     http.Header
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("GenerateContent: HTTP status: %d, %s", e.StatusCode, e.Body)
+}
+
 type Model struct {
 	Model    string // e.g. "models/gemini-1.5-flash"
 	APIKey   string
@@ -168,7 +206,7 @@ func (m Model) GenerateContent(ctx context.Context, req *Request) (*Response, er
 		return nil, fmt.Errorf("GenerateContent: reading response body: %w", err)
 	}
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GenerateContent: HTTP status: %d, %s", httpResp.StatusCode, string(body))
+		return nil, &APIError{StatusCode: httpResp.StatusCode, Body: string(body), Header: httpResp.Header}
 	}
 	var res Response
 	if err := json.Unmarshal(body, &res); err != nil {

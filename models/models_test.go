@@ -39,6 +39,9 @@ func TestByID(t *testing.T) {
 		wantID  string
 		wantNil bool
 	}{
+		{id: "gpt-5.5", wantID: "gpt-5.5", wantNil: false},
+		{id: "gpt-5.5-pro", wantNil: true},
+		{id: "deepseek-v4-pro-fireworks", wantID: "deepseek-v4-pro-fireworks", wantNil: false},
 		{id: "gpt-oss-20b-fireworks", wantID: "gpt-oss-20b-fireworks", wantNil: false},
 		{id: "gpt-5.2-codex", wantID: "gpt-5.2-codex", wantNil: false},
 		{id: "claude-sonnet-4.5", wantID: "claude-sonnet-4.5", wantNil: false},
@@ -182,6 +185,29 @@ func TestManagerGetAvailableModelsMatchesAllOrder(t *testing.T) {
 	}
 }
 
+func TestManagerGetAvailableModelsOmitsGPT55Pro(t *testing.T) {
+	cfg := &Config{OpenAIAPIKey: "test-key"}
+
+	manager, err := NewManager(cfg)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	if manager.HasModel("gpt-5.5-pro") {
+		t.Fatal("gpt-5.5-pro should not be available in Shelley's built-in model list")
+	}
+
+	for _, modelID := range manager.GetAvailableModels() {
+		if modelID == "gpt-5.5-pro" {
+			t.Fatalf("gpt-5.5-pro should not appear in available models: %v", manager.GetAvailableModels())
+		}
+	}
+
+	if info := manager.GetModelInfo("gpt-5.5-pro"); info != nil {
+		t.Fatalf("GetModelInfo(gpt-5.5-pro) = %+v, want nil", info)
+	}
+}
+
 func TestLoggingService(t *testing.T) {
 	// Create a mock service for testing
 	mockService := &mockLLMService{}
@@ -260,6 +286,10 @@ func (m *mockLLMService) MaxImageDimension() int {
 		return 2048
 	}
 	return m.maxImageDimension
+}
+
+func (m *mockLLMService) MaxImageBytes() int {
+	return 5 * 1024 * 1024
 }
 
 func (m *mockLLMService) UseSimplifiedPatch() bool {
@@ -443,6 +473,12 @@ func TestGetModelSource(t *testing.T) {
 			want:    "$FIREWORKS_API_KEY",
 		},
 		{
+			name:    "deepseek fireworks with env var only",
+			cfg:     &Config{FireworksAPIKey: "test-key"},
+			modelID: "deepseek-v4-pro-fireworks",
+			want:    "$FIREWORKS_API_KEY",
+		},
+		{
 			name:    "fireworks with gateway implicit key",
 			cfg:     &Config{Gateway: "https://gateway.example.com", FireworksAPIKey: "implicit"},
 			modelID: "gpt-oss-20b-fireworks",
@@ -503,7 +539,7 @@ func TestGetAvailableModelsUnion(t *testing.T) {
 	models := manager.GetAvailableModels()
 
 	// Should have anthropic models and fireworks models, plus predictable
-	expectedModels := []string{"claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5", "claude-sonnet-4.6", "gpt-oss-20b-fireworks", "claude-sonnet-4.5", "claude-haiku-4.5", "predictable"}
+	expectedModels := []string{"claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5", "claude-sonnet-4.6", "deepseek-v4-pro-fireworks", "gpt-oss-20b-fireworks", "claude-sonnet-4.5", "claude-haiku-4.5", "predictable"}
 	for _, expected := range expectedModels {
 		found := false
 		for _, m := range models {

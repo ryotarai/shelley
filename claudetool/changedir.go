@@ -2,7 +2,6 @@ package claudetool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,8 +35,9 @@ const (
 This affects the working directory used by the bash tool. The directory must exist.
 Relative paths are resolved against the current working directory.
 
-Use this to navigate the filesystem persistently across bash commands,
-rather than using 'cd' within each bash command (which doesn't persist).
+Prefer this tool over 'cd <path> && ...' in bash: 'cd' inside a bash
+invocation does not persist, so you'd have to repeat it every call. Call
+change_dir once, then run subsequent commands directly.
 `
 	changeDirInputSchema = `{
   "type": "object",
@@ -61,17 +61,12 @@ func (c *ChangeDirTool) Tool() *llm.Tool {
 		Name:        changeDirName,
 		Description: changeDirDescription,
 		InputSchema: llm.MustSchema(changeDirInputSchema),
-		Run:         c.Run,
+		Run:         llm.RunJSON(c.run),
 	}
 }
 
-// Run executes the change_dir tool.
-func (c *ChangeDirTool) Run(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var req changeDirInput
-	if err := json.Unmarshal(m, &req); err != nil {
-		return llm.ErrorfToolOut("failed to parse change_dir input: %w", err)
-	}
-
+// run executes the change_dir tool.
+func (c *ChangeDirTool) run(ctx context.Context, req changeDirInput) llm.ToolOut {
 	if req.Path == "" {
 		return llm.ErrorfToolOut("path is required")
 	}

@@ -1,4 +1,4 @@
-export type Locale = "en" | "ja" | "fr" | "ru" | "es" | "zh-CN" | "zh-TW" | "upgoer5";
+export type Locale = "en" | "ja" | "fr" | "ru" | "es" | "zh-CN" | "zh-TW" | "upgoer5" | "vi";
 
 export interface TranslationKeys {
   // App-level
@@ -13,6 +13,7 @@ export interface TranslationKeys {
 
   // Overflow Menu
   diffs: string;
+  gitGraph: string;
   terminal: string;
   archiveConversation: string;
   checkForNewVersion: string;
@@ -38,6 +39,9 @@ export interface TranslationKeys {
   searchPlaceholder: string;
   searching: string;
   noResults: string;
+  searchConversations: string;
+  noSearchResults: string;
+  clearSearch: string;
   toNavigate: string;
   toSelect: string;
   toClose: string;
@@ -56,6 +60,7 @@ export interface TranslationKeys {
   jumpToPreviousMessage: string;
   viewDiffs: string;
   openGitDiffViewer: string;
+  openGitGraphViewer: string;
   addRemoveModelsKeys: string;
   configureModels: string;
   notificationSettings: string;
@@ -90,6 +95,7 @@ export interface TranslationKeys {
   hideSubagents: string;
   showSubagents: string;
   groupConversations: string;
+  resortNow: string;
   noGrouping: string;
   directory: string;
   gitRepo: string;
@@ -130,6 +136,9 @@ export interface TranslationKeys {
   tags: string;
   tagsPlaceholder: string;
   tagsTooltip: string;
+  reasoningEffort: string;
+  reasoningEffortPlaceholder: string;
+  reasoningEffortHint: string;
   testButton: string;
   testingButton: string;
   save: string;
@@ -213,4 +222,5 @@ export interface TranslationKeys {
   upgoerFive: string;
   simplifiedChinese: string;
   traditionalChinese: string;
+  vietnamese: string;
 }

@@ -13,6 +13,7 @@ export const zhTW: TranslationKeys = {
 
   // Overflow Menu
   diffs: "差異比較",
+  gitGraph: "Git 圖",
   terminal: "終端機",
   archiveConversation: "封存對話",
   checkForNewVersion: "檢查新版本",
@@ -38,6 +39,9 @@ export const zhTW: TranslationKeys = {
   searchPlaceholder: "搜尋對話或操作...",
   searching: "搜尋中...",
   noResults: "未找到結果",
+  searchConversations: "搜尋對話...",
+  noSearchResults: "沒有匹配的對話",
+  clearSearch: "清除搜尋",
   toNavigate: "導覽",
   toSelect: "選取",
   toClose: "關閉",
@@ -56,6 +60,7 @@ export const zhTW: TranslationKeys = {
   jumpToPreviousMessage: "跳至上一則使用者訊息",
   viewDiffs: "檢視差異",
   openGitDiffViewer: "開啟 Git 差異檢視器",
+  openGitGraphViewer: "開啟 Git 圖檢視器",
   addRemoveModelsKeys: "新增/移除模型與金鑰",
   configureModels: "設定 AI 模型與 API 金鑰",
   notificationSettings: "通知設定",
@@ -90,6 +95,7 @@ export const zhTW: TranslationKeys = {
   hideSubagents: "隱藏子代理",
   showSubagents: "顯示子代理",
   groupConversations: "對話分組",
+  resortNow: "立即重新排序",
   noGrouping: "不分組",
   directory: "目錄",
   gitRepo: "Git 倉庫",
@@ -131,6 +137,10 @@ export const zhTW: TranslationKeys = {
   tagsPlaceholder: "逗號分隔，例如：slug, cheap",
   tagsTooltip:
     '此模型的逗號分隔標籤。使用 "slug" 標記此模型用於產生對話標題。若沒有模型帶有 "slug" 標籤，將使用對話目前的模型。',
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "測試",
   testingButton: "測試中...",
   save: "儲存",
@@ -215,4 +225,5 @@ export const zhTW: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

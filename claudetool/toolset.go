@@ -70,9 +70,17 @@ type ToolSetConfig struct {
 	// A value of 0 means no limit (but SubagentRunner/SubagentDB must still be set).
 	// Set to 1 to allow only top-level conversations (depth 0) to spawn subagents.
 	MaxSubagentDepth int
-	// AvailableModels is the list of models the subagent can choose from.
-	// If nil, the list is built from LLMProvider.GetAvailableModels().
-	AvailableModels []AvailableModel
+	// BuildAvailableModels, if set, is called by NewToolSet to compute the
+	// list of models that subagent / llm_one_shot tools can choose from.
+	// It is invoked each time a ToolSet is built so new conversations pick
+	// up custom models added at runtime, instead of being stuck with a
+	// snapshot taken at server start. If nil, the list is built from
+	// LLMProvider.GetAvailableModels() (without display names).
+	BuildAvailableModels func() []AvailableModel
+	// ToolOverrides maps tool name to "on" or "off". Tools not listed use their default.
+	ToolOverrides map[string]string
+	// DisableAllTools disables every tool by default; ToolOverrides with "on" re-enable.
+	DisableAllTools bool
 }
 
 // ToolSet holds a set of tools for a single conversation.
@@ -114,8 +122,10 @@ type OrchestratorToolSetConfig struct {
 	ModelID string
 	// LLMProvider provides access to LLM services.
 	LLMProvider LLMServiceProvider
-	// AvailableModels is the list of models the subagent can choose from.
-	AvailableModels []AvailableModel
+	// BuildAvailableModels is called to compute the list of models that
+	// the orchestrator's subagent tool can choose from, fresh each time an
+	// orchestrator ToolSet is built. See ToolSetConfig.BuildAvailableModels.
+	BuildAvailableModels func() []AvailableModel
 	// WorkingDir is the initial working directory.
 	WorkingDir string
 	// OnWorkingDirChange is called when change_dir changes the working directory.
@@ -125,6 +135,10 @@ type OrchestratorToolSetConfig struct {
 	// CLIAgent, if non-empty, uses a CLI subagent tool instead of native subagent.
 	// Valid values: "claude-cli", "codex-cli".
 	CLIAgent string
+	// ToolOverrides maps tool name to "on" or "off". Tools not listed use their default.
+	ToolOverrides map[string]string
+	// DisableAllTools disables every tool by default; ToolOverrides with "on" re-enable.
+	DisableAllTools bool
 }
 
 // NewOrchestratorToolSet creates a reduced tool set for orchestrator mode.
@@ -168,8 +182,10 @@ func NewOrchestratorToolSet(ctx context.Context, cfg OrchestratorToolSetConfig) 
 	tools = append(tools, outputIframeTool.Tool())
 
 	// Build available models list
-	availableModels := cfg.AvailableModels
-	if availableModels == nil && cfg.LLMProvider != nil {
+	var availableModels []AvailableModel
+	if cfg.BuildAvailableModels != nil {
+		availableModels = cfg.BuildAvailableModels()
+	} else if cfg.LLMProvider != nil {
 		for _, id := range cfg.LLMProvider.GetAvailableModels() {
 			availableModels = append(availableModels, AvailableModel{ID: id})
 		}
@@ -197,14 +213,8 @@ func NewOrchestratorToolSet(ctx context.Context, cfg OrchestratorToolSetConfig) 
 
 	// Browser tools for read_image (screenshot viewing)
 	var cleanup func()
-	if cfg.EnableBrowser {
-		maxImageDimension := 0
-		if cfg.LLMProvider != nil && cfg.ModelID != "" {
-			if svc, err := cfg.LLMProvider.GetService(cfg.ModelID); err == nil {
-				maxImageDimension = svc.MaxImageDimension()
-			}
-		}
-		browserTools, browserCleanup := browse.RegisterBrowserTools(ctx, maxImageDimension)
+	if cfg.EnableBrowser && IsToolEnabled("read_image", cfg.ToolOverrides, cfg.DisableAllTools) {
+		browserTools, browserCleanup := browse.RegisterBrowserTools(ctx)
 		// Only include read_image from browser tools, not the full browser
 		for _, bt := range browserTools {
 			if bt.Name == "read_image" {
@@ -214,6 +224,7 @@ func NewOrchestratorToolSet(ctx context.Context, cfg OrchestratorToolSetConfig) 
 		cleanup = browserCleanup
 	}
 
+	tools = FilterTools(tools, cfg.ToolOverrides, cfg.DisableAllTools)
 	return &ToolSet{
 		tools:   tools,
 		cleanup: cleanup,
@@ -263,8 +274,17 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 
 	outputIframeTool := &OutputIframeTool{WorkingDir: wd}
 
+	shellTool := &ShellTool{
+		WorkingDir:       wd,
+		LLMProvider:      cfg.LLMProvider,
+		EnableJITInstall: cfg.EnableJITInstall,
+		ConversationID:   cfg.ConversationID,
+		BackgroundCtx:    ctx,
+	}
+
 	tools := []*llm.Tool{
 		bashTool.Tool(),
+		shellTool.Tool(),
 		patchTool.Tool(),
 		keywordTool.Tool(),
 		changeDirTool.Tool(),
@@ -272,8 +292,12 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 	}
 
 	// Build the available models list (shared by subagent and llm_one_shot tools).
-	availableModels := cfg.AvailableModels
-	if availableModels == nil && cfg.LLMProvider != nil {
+	// Resolved fresh on each ToolSet construction so new conversations see
+	// custom models added since server start.
+	var availableModels []AvailableModel
+	if cfg.BuildAvailableModels != nil {
+		availableModels = cfg.BuildAvailableModels()
+	} else if cfg.LLMProvider != nil {
 		for _, id := range cfg.LLMProvider.GetAvailableModels() {
 			availableModels = append(availableModels, AvailableModel{ID: id})
 		}
@@ -306,21 +330,22 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 	}
 
 	var cleanup func()
-	if cfg.EnableBrowser {
-		// Get max image dimension from the LLM service
-		maxImageDimension := 0
-		if cfg.LLMProvider != nil && cfg.ModelID != "" {
-			if svc, err := cfg.LLMProvider.GetService(cfg.ModelID); err == nil {
-				maxImageDimension = svc.MaxImageDimension()
-			}
+	anyBrowserToolEnabled := false
+	for _, name := range []string{"browser", "read_image", "browser_emulate", "browser_network", "browser_accessibility", "browser_profile"} {
+		if IsToolEnabled(name, cfg.ToolOverrides, cfg.DisableAllTools) {
+			anyBrowserToolEnabled = true
+			break
 		}
-		browserTools, browserCleanup := browse.RegisterBrowserTools(ctx, maxImageDimension)
+	}
+	if cfg.EnableBrowser && anyBrowserToolEnabled {
+		browserTools, browserCleanup := browse.RegisterBrowserTools(ctx)
 		if len(browserTools) > 0 {
 			tools = append(tools, browserTools...)
 		}
 		cleanup = browserCleanup
 	}
 
+	tools = FilterTools(tools, cfg.ToolOverrides, cfg.DisableAllTools)
 	return &ToolSet{
 		tools:   tools,
 		cleanup: cleanup,

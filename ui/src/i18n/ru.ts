@@ -13,6 +13,7 @@ export const ru: TranslationKeys = {
 
   // Overflow Menu
   diffs: "Изменения",
+  gitGraph: "Граф Git",
   terminal: "Терминал",
   archiveConversation: "Архивировать диалог",
   checkForNewVersion: "Проверить обновления",
@@ -38,6 +39,9 @@ export const ru: TranslationKeys = {
   searchPlaceholder: "Поиск диалогов или действий...",
   searching: "Поиск...",
   noResults: "Ничего не найдено",
+  searchConversations: "Поиск разговоров...",
+  noSearchResults: "Совпадений не найдено",
+  clearSearch: "Очистить поиск",
   toNavigate: "навигация",
   toSelect: "выбрать",
   toClose: "закрыть",
@@ -56,6 +60,7 @@ export const ru: TranslationKeys = {
   jumpToPreviousMessage: "Перейти к предыдущему сообщению пользователя",
   viewDiffs: "Просмотр изменений",
   openGitDiffViewer: "Открыть просмотр изменений Git",
+  openGitGraphViewer: "Открыть просмотр графа Git",
   addRemoveModelsKeys: "Добавить/Удалить модели и ключи",
   configureModels: "Настроить модели ИИ и API-ключи",
   notificationSettings: "Настройки уведомлений",
@@ -90,6 +95,7 @@ export const ru: TranslationKeys = {
   hideSubagents: "Скрыть субагентов",
   showSubagents: "Показать субагентов",
   groupConversations: "Группировать диалоги",
+  resortNow: "Пересортировать",
   noGrouping: "Без группировки",
   directory: "Каталог",
   gitRepo: "Git-репозиторий",
@@ -131,6 +137,10 @@ export const ru: TranslationKeys = {
   tagsPlaceholder: "через запятую, напр., slug, cheap",
   tagsTooltip:
     'Теги через запятую для этой модели. Используйте "slug", чтобы отметить модель для генерации заголовков диалогов. Если ни одна модель не имеет тега "slug", будет использована модель диалога.',
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "Тест",
   testingButton: "Тестирование...",
   save: "Сохранить",
@@ -215,4 +225,5 @@ export const ru: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

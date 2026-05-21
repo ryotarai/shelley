@@ -1,11 +1,15 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type * as Monaco from "monaco-editor";
 import { api } from "../services/api";
 import { loadMonaco } from "../services/monaco";
 import { isDarkModeActive } from "../services/theme";
 import { withBasePath } from "../services/paths";
+import { useVimEnabled, useMonacoVim } from "../hooks/useMonacoVim";
+import VimToggle from "./VimToggle";
 import { GitDiffInfo, GitFileInfo, GitFileDiff, GitCommitMessage } from "../types";
 import DirectoryPickerModal from "./DirectoryPickerModal";
+import CommitPicker, { RangeToggle } from "./CommitPicker";
+import DiffFileTree, { DiffFileTreeEntry } from "./DiffFileTree";
 
 interface DiffViewerProps {
   cwd: string;
@@ -46,6 +50,13 @@ const NextFileIcon = () => (
 type ViewMode = "comment" | "edit";
 
 const COMMIT_MSG_PREFIX = "commit-message:";
+const MOBILE_LINE_DECORATIONS_WIDTH = 8;
+const DESKTOP_LINE_DECORATIONS_WIDTH = 10;
+const MOBILE_SCROLLBAR_SIZE = 8;
+const DESKTOP_VERTICAL_SCROLLBAR_SIZE = 14;
+const DESKTOP_HORIZONTAL_SCROLLBAR_SIZE = 10;
+const MOBILE_OVERVIEW_RULER_LANES = 1;
+const DESKTOP_OVERVIEW_RULER_LANES = 3;
 
 function isCommitMessageFile(path: string): boolean {
   return path.startsWith(COMMIT_MSG_PREFIX);
@@ -80,6 +91,11 @@ function DiffViewer({
   const [gitRoot, setGitRoot] = useState<string | null>(null);
   const [showDirPicker, setShowDirPicker] = useState(false);
   const [selectedDiff, setSelectedDiff] = useState<string | null>(null);
+  // Right-hand-side bound for the commit range:
+  //   "working": through working tree (default)
+  //   "self":    only the selected commit
+  // Only meaningful when selectedDiff is a commit (not "working").
+  const [selectedTo, setSelectedTo] = useState<"working" | "self">("working");
   const [files, setFiles] = useState<GitFileInfo[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileDiff, setFileDiff] = useState<GitFileDiff | null>(null);
@@ -91,7 +107,6 @@ function DiffViewer({
   const saveTimeoutRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<(() => Promise<void>) | null>(null);
   const scheduleSaveRef = useRef<(() => void) | null>(null);
-  const contentChangeDisposableRef = useRef<Monaco.IDisposable | null>(null);
   const [showCommentDialog, setShowCommentDialog] = useState<{
     line: number;
     side: "left" | "right";
@@ -102,12 +117,60 @@ function DiffViewer({
   const [commentText, setCommentText] = useState("");
   const [mode, setMode] = useState<ViewMode>("comment");
   const [commitMessages, setCommitMessages] = useState<GitCommitMessage[]>([]);
+  // Mirror of commitMessages for reading inside the model-swap effect
+  // without forcing it to re-run (and blow away unsaved edits) when the
+  // list refreshes but the selected file didn't change.
+  const commitMessagesRef = useRef(commitMessages);
+  useEffect(() => {
+    commitMessagesRef.current = commitMessages;
+  }, [commitMessages]);
   const [amendStatus, setAmendStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const amendTimeoutRef = useRef<number | null>(null);
   const [showKeyboardHint, setShowKeyboardHint] = useState(false);
   const hasShownKeyboardHint = useRef(false);
 
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [vimEnabled, setVimEnabled] = useVimEnabled();
+  // Desktop-only layout: "header" puts commit + file selectors in the top
+  // header row; "sidebar" moves them into a left column with the commit
+  // picker stacked above a scrollable list of files. Persisted in
+  // localStorage so it survives reloads.
+  const [layout, setLayoutState] = useState<"header" | "sidebar">(() => {
+    try {
+      const v = localStorage.getItem("diff-viewer-layout");
+      return v === "sidebar" ? "sidebar" : "header";
+    } catch {
+      return "header";
+    }
+  });
+  const setLayout = useCallback((v: "header" | "sidebar") => {
+    setLayoutState(v);
+    try {
+      localStorage.setItem("diff-viewer-layout", v);
+    } catch {
+      // ignore
+    }
+  }, []);
+  // The vim adapter attaches to the modified (right-hand) code editor; we
+  // surface it via state because we have the diff editor in a ref.
+  const [modifiedEditor, setModifiedEditor] = useState<Monaco.editor.IStandaloneCodeEditor | null>(
+    null,
+  );
+  const [vimStatusNode, setVimStatusNode] = useState<HTMLDivElement | null>(null);
+  // :q / :wq / :x and ZZ / ZQ close the diff viewer. The diff viewer's edits
+  // are persisted by other paths (handler comments / auto-save), so we treat
+  // save+quit the same as plain quit. We pass `onClose` directly (not an
+  // inline arrow) so the effect deps stay stable across renders and the
+  // vim adapter isn't torn down on every parent re-render.
+  // Vim mode only applies in edit mode; in comment mode the editor is read-only
+  // and key presses would otherwise be handled by both the comment-mode UI and
+  // the vim adapter, causing strange double-handling.
+  useMonacoVim(modifiedEditor, vimStatusNode, !isMobile && vimEnabled && mode === "edit", onClose);
+  // Mirror of isMobile for handlers attached once at editor-creation time
+  // (those handlers must honor the *current* viewport, not the viewport at
+  // creation time, because we intentionally don't recreate the editor on
+  // resize - see comment on the creation effect below).
+  const isMobileRef = useRef(isMobile);
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneDiffEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
@@ -123,11 +186,12 @@ function DiffViewer({
     // Update editor readOnly state when mode changes
     // (but not for commit message files - those have their own editability logic)
     if (editorRef.current && selectedFile && !isCommitMessageFile(selectedFile)) {
-      const readOnly = mode === "comment";
+      const isWorkingView = selectedDiff === "working" || selectedTo === "working";
+      const readOnly = mode === "comment" || !isWorkingView;
       editorRef.current.updateOptions({ readOnly });
       editorRef.current.getModifiedEditor().updateOptions({ readOnly });
     }
-  }, [mode, selectedFile]);
+  }, [mode, selectedFile, selectedDiff, selectedTo]);
 
   // Track viewport size
   useEffect(() => {
@@ -189,6 +253,7 @@ function DiffViewer({
       setSelectedFile(null);
       setFiles([]);
       setSelectedDiff(null);
+      setSelectedTo("working");
       setDiffs([]);
       setError(null);
       setShowCommentDialog(null);
@@ -199,20 +264,17 @@ function DiffViewer({
         clearTimeout(amendTimeoutRef.current);
         amendTimeoutRef.current = null;
       }
-      // Dispose editor when closing
-      if (editorRef.current) {
-        editorRef.current.dispose();
-        editorRef.current = null;
-      }
+      // The diff editor is disposed by the cleanup of the creation effect
+      // below (keyed on isOpen), so we don't dispose it here.
     }
   }, [isOpen, cwd, initialCommit]);
 
-  // Load files when diff is selected
+  // Load files when diff (or its `to` bound) is selected
   useEffect(() => {
     if (selectedDiff && cwd) {
       loadFiles(selectedDiff);
     }
-  }, [selectedDiff, cwd]);
+  }, [selectedDiff, selectedTo, cwd]);
 
   // Load file diff when file is selected
   useEffect(() => {
@@ -220,107 +282,74 @@ function DiffViewer({
       loadFileDiff(selectedDiff, selectedFile);
       setCurrentChangeIndex(-1); // Reset change index for new file
     }
-  }, [selectedDiff, selectedFile, cwd]);
+  }, [selectedDiff, selectedFile, selectedTo, cwd]);
 
-  // Create/update Monaco editor when fileDiff changes
+  // Track current file context for handlers that outlive model swaps.
+  // These refs avoid the need to recreate the diff editor (and leak monaco
+  // keybinding contributions) every time the user switches files.
+  const currentFileIsHeadCommitRef = useRef(false);
+  const cwdRef = useRef(cwd);
   useEffect(() => {
-    if (!monacoLoaded || !fileDiff || !editorContainerRef.current || !monacoRef.current) {
+    cwdRef.current = cwd;
+  }, [cwd]);
+
+  // Create the Monaco diff editor ONCE per monacoLoaded change.
+  // Recreating on file switch OR on viewport-breakpoint flip leaks monaco's
+  // global keybinding contributions (disposed editors stay referenced by
+  // monaco.editor internals), which causes one keypress to fire N cursor
+  // commands where N is the number of cumulative editors created. That
+  // manifests as backspace deleting multiple characters and arrow keys
+  // jumping. So: model swaps + option updates happen in separate effects.
+  useEffect(() => {
+    if (!isOpen || !monacoLoaded || !editorContainerRef.current || !monacoRef.current) {
       return;
     }
 
     const monaco = monacoRef.current;
 
-    // Dispose previous editor
-    if (editorRef.current) {
-      editorRef.current.dispose();
-      editorRef.current = null;
-    }
-
-    // Determine if this is a commit message file and whether it's the HEAD commit
-    const isCommitMsg = isCommitMessageFile(fileDiff.path);
-    const commitHash = isCommitMsg ? commitHashFromPath(fileDiff.path) : null;
-    const isHeadCommit =
-      isCommitMsg && commitMessages.some((m) => m.hash === commitHash && m.isHead);
-
-    // Get language from file extension (use plaintext for commit messages)
-    let language = "plaintext";
-    if (!isCommitMsg) {
-      const ext = "." + (fileDiff.path.split(".").pop()?.toLowerCase() || "");
-      const languages = monaco.languages.getLanguages();
-      for (const lang of languages) {
-        if (lang.extensions?.includes(ext)) {
-          language = lang.id;
-          break;
-        }
-      }
-    }
-
-    // Create models with unique URIs (include timestamp to avoid conflicts)
-    const timestamp = Date.now();
-    const originalUri = monaco.Uri.file(`original-${timestamp}-${fileDiff.path}`);
-    const modifiedUri = monaco.Uri.file(`modified-${timestamp}-${fileDiff.path}`);
-
-    const originalModel = monaco.editor.createModel(fileDiff.oldContent, language, originalUri);
-    const modifiedModel = monaco.editor.createModel(fileDiff.newContent, language, modifiedUri);
-
-    // Create diff editor with mobile-friendly options
+    // Initial readOnly just needs to be safe-by-default; the model-swap
+    // effect (which runs right after this one) sets the correct value based
+    // on file type (commit message vs regular file) and current mode.
+    const initMobile = isMobileRef.current;
     const diffEditor = monaco.editor.createDiffEditor(editorContainerRef.current, {
       theme: isDarkModeActive() ? "vs-dark" : "vs",
-      readOnly: isCommitMsg ? !isHeadCommit : modeRef.current === "comment",
+      readOnly: true,
       originalEditable: false,
       automaticLayout: true,
-      renderSideBySide: !isMobile,
+      renderSideBySide: !initMobile,
       enableSplitViewResizing: true,
       renderIndicators: true,
       renderMarginRevertIcon: false,
-      lineNumbers: isMobile ? "off" : "on",
+      lineNumbers: initMobile ? "off" : "on",
       minimap: { enabled: false },
       scrollBeyondLastLine: true, // Enable scroll past end for mobile floating buttons
       wordWrap: "on",
-      glyphMargin: !isMobile, // Enable glyph margin for comment indicator on hover
-      lineDecorationsWidth: isMobile ? 0 : 10,
-      lineNumbersMinChars: isMobile ? 0 : 3,
+      glyphMargin: !initMobile, // Enable glyph margin for comment indicator on hover
+      lineDecorationsWidth: initMobile
+        ? MOBILE_LINE_DECORATIONS_WIDTH
+        : DESKTOP_LINE_DECORATIONS_WIDTH,
+      lineNumbersMinChars: initMobile ? 0 : 3,
+      scrollbar: {
+        verticalScrollbarSize: initMobile ? MOBILE_SCROLLBAR_SIZE : DESKTOP_VERTICAL_SCROLLBAR_SIZE,
+        horizontalScrollbarSize: initMobile
+          ? MOBILE_SCROLLBAR_SIZE
+          : DESKTOP_HORIZONTAL_SCROLLBAR_SIZE,
+      },
+      overviewRulerLanes: initMobile ? MOBILE_OVERVIEW_RULER_LANES : DESKTOP_OVERVIEW_RULER_LANES,
       quickSuggestions: false,
       suggestOnTriggerCharacters: false,
       lightbulb: { enabled: false },
       codeLens: false,
       contextmenu: false,
       links: false,
-      folding: !isMobile,
-      padding: isMobile ? { bottom: 80 } : undefined, // Extra padding for floating buttons on mobile
-    });
-
-    diffEditor.setModel({
-      original: originalModel,
-      modified: modifiedModel,
+      folding: !initMobile,
+      padding: initMobile ? { bottom: 80 } : undefined, // Extra padding for floating buttons on mobile
     });
 
     editorRef.current = diffEditor;
-
-    // Auto-scroll to first diff when Monaco finishes computing it (once per file)
-    let hasScrolledToFirstChange = false;
-    const scrollToFirstChange = () => {
-      if (hasScrolledToFirstChange) return;
-      const changes = diffEditor.getLineChanges();
-      if (changes && changes.length > 0) {
-        hasScrolledToFirstChange = true;
-        const firstChange = changes[0];
-        const targetLine = firstChange.modifiedStartLineNumber || 1;
-        const editor = diffEditor.getModifiedEditor();
-        editor.revealLineInCenter(targetLine);
-        editor.setPosition({ lineNumber: targetLine, column: 1 });
-        setCurrentChangeIndex(0);
-      }
-    };
-
-    // Try immediately in case diff is already computed, then listen for update
-    scrollToFirstChange();
-    const diffUpdateDisposable = diffEditor.onDidUpdateDiff(scrollToFirstChange);
-
-    // Add click handler for commenting - clicking on a line in comment mode opens dialog
     const modifiedEditor = diffEditor.getModifiedEditor();
+    setModifiedEditor(modifiedEditor);
 
-    // Handler function for opening comment dialog
     const openCommentDialog = (lineNumber: number) => {
       const model = modifiedEditor.getModel();
       const selection = modifiedEditor.getSelection();
@@ -346,76 +375,71 @@ function DiffViewer({
     };
 
     // Desktop: open comment dialog on mousedown (immediate response).
-    // Mobile uses onMouseUp below to distinguish taps from scrolls.
-    if (!isMobile) {
-      modifiedEditor.onMouseDown((e: Monaco.editor.IEditorMouseEvent) => {
-        const isLineClick =
-          e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
-          e.target.type === monaco.editor.MouseTargetType.CONTENT_EMPTY;
+    // The editor is not recreated on viewport resize, so we gate on
+    // isMobileRef at call time rather than installing only on desktop.
+    modifiedEditor.onMouseDown((e: Monaco.editor.IEditorMouseEvent) => {
+      if (isMobileRef.current) return;
+      const isLineClick =
+        e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
+        e.target.type === monaco.editor.MouseTargetType.CONTENT_EMPTY;
 
-        if (isLineClick && modeRef.current === "comment") {
-          const position = e.target.position;
-          if (position) {
-            openCommentDialog(position.lineNumber);
-          }
+      if (isLineClick && modeRef.current === "comment") {
+        const position = e.target.position;
+        if (position) {
+          openCommentDialog(position.lineNumber);
         }
-      });
-    }
+      }
+    });
 
-    // For mobile: use onMouseUp which fires more reliably on touch devices,
+    // Mobile: use onMouseUp which fires more reliably on touch devices,
     // but only if the user tapped without scrolling (issue #153).
-    // Track touch gestures to distinguish taps from scrolls.
-    let touchCleanup: (() => void) | null = null;
-    if (isMobile) {
-      const editorDom = editorContainerRef.current!;
-      const onTouchStart = (e: TouchEvent) => {
-        touchScrolledRef.current = false;
-        const t = e.touches[0];
-        touchStartPosRef.current = { x: t.clientX, y: t.clientY };
-      };
-      const onTouchMove = (e: TouchEvent) => {
-        if (touchScrolledRef.current || !touchStartPosRef.current) return;
-        const t = e.touches[0];
-        const dx = t.clientX - touchStartPosRef.current.x;
-        const dy = t.clientY - touchStartPosRef.current.y;
-        if (dx * dx + dy * dy > 100) {
-          // 10px threshold
-          touchScrolledRef.current = true;
+    const editorDom = editorContainerRef.current!;
+    const onTouchStart = (e: TouchEvent) => {
+      touchScrolledRef.current = false;
+      const t = e.touches[0];
+      touchStartPosRef.current = { x: t.clientX, y: t.clientY };
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (touchScrolledRef.current || !touchStartPosRef.current) return;
+      const t = e.touches[0];
+      const dx = t.clientX - touchStartPosRef.current.x;
+      const dy = t.clientY - touchStartPosRef.current.y;
+      if (dx * dx + dy * dy > 100) {
+        touchScrolledRef.current = true;
+      }
+    };
+    const onTouchEnd = () => {
+      touchStartPosRef.current = null;
+    };
+    editorDom.addEventListener("touchstart", onTouchStart, { passive: true });
+    editorDom.addEventListener("touchmove", onTouchMove, { passive: true });
+    editorDom.addEventListener("touchend", onTouchEnd, { passive: true });
+    const touchCleanup = () => {
+      editorDom.removeEventListener("touchstart", onTouchStart);
+      editorDom.removeEventListener("touchmove", onTouchMove);
+      editorDom.removeEventListener("touchend", onTouchEnd);
+    };
+
+    modifiedEditor.onMouseUp((e: Monaco.editor.IEditorMouseEvent) => {
+      if (!isMobileRef.current) return;
+      if (modeRef.current !== "comment") return;
+      if (touchScrolledRef.current) return;
+
+      const isLineClick =
+        e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
+        e.target.type === monaco.editor.MouseTargetType.CONTENT_EMPTY;
+
+      if (isLineClick) {
+        const position = e.target.position;
+        if (position) {
+          openCommentDialog(position.lineNumber);
         }
-      };
-      const onTouchEnd = () => {
-        touchStartPosRef.current = null;
-      };
-      editorDom.addEventListener("touchstart", onTouchStart, { passive: true });
-      editorDom.addEventListener("touchmove", onTouchMove, { passive: true });
-      editorDom.addEventListener("touchend", onTouchEnd, { passive: true });
-      touchCleanup = () => {
-        editorDom.removeEventListener("touchstart", onTouchStart);
-        editorDom.removeEventListener("touchmove", onTouchMove);
-        editorDom.removeEventListener("touchend", onTouchEnd);
-      };
+      }
+    });
 
-      modifiedEditor.onMouseUp((e: Monaco.editor.IEditorMouseEvent) => {
-        if (modeRef.current !== "comment") return;
-        if (touchScrolledRef.current) return; // was a scroll, not a tap
-
-        const isLineClick =
-          e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT ||
-          e.target.type === monaco.editor.MouseTargetType.CONTENT_EMPTY;
-
-        if (isLineClick) {
-          const position = e.target.position;
-          if (position) {
-            openCommentDialog(position.lineNumber);
-          }
-        }
-      });
-    }
-
-    // Add hover highlighting with comment indicator (comment mode only)
+    // Hover highlighting with comment indicator (comment mode only)
     let lastHoveredLine = -1;
     modifiedEditor.onMouseMove((e: Monaco.editor.IEditorMouseEvent) => {
-      // Only show hover effects in comment mode
       if (modeRef.current !== "comment") {
         if (hoverDecorationsRef.current.length > 0) {
           hoverDecorationsRef.current = modifiedEditor.deltaDecorations(
@@ -451,7 +475,6 @@ function DiffViewer({
       }
     });
 
-    // Clear decorations when mouse leaves editor
     modifiedEditor.onMouseLeave(() => {
       lastHoveredLine = -1;
       hoverDecorationsRef.current = modifiedEditor.deltaDecorations(
@@ -460,11 +483,9 @@ function DiffViewer({
       );
     });
 
-    // Add content change listener for auto-save (files) or auto-amend (HEAD commit message)
-    contentChangeDisposableRef.current?.dispose();
-    contentChangeDisposableRef.current = modifiedEditor.onDidChangeModelContent(() => {
-      if (isHeadCommit) {
-        // Debounced amend for HEAD commit message
+    // Single content change listener; branches based on current file context.
+    const contentChangeDisposable = modifiedEditor.onDidChangeModelContent(() => {
+      if (currentFileIsHeadCommitRef.current) {
         if (amendTimeoutRef.current) {
           clearTimeout(amendTimeoutRef.current);
         }
@@ -474,7 +495,7 @@ function DiffViewer({
           if (!model) return;
           const newMessage = model.getValue();
           try {
-            await api.amendGitMessage(cwd, newMessage);
+            await api.amendGitMessage(cwdRef.current, newMessage);
             setAmendStatus("saved");
             setTimeout(() => setAmendStatus("idle"), 2000);
           } catch {
@@ -487,18 +508,113 @@ function DiffViewer({
       }
     });
 
-    // Cleanup function
     return () => {
-      diffUpdateDisposable.dispose();
-      contentChangeDisposableRef.current?.dispose();
-      contentChangeDisposableRef.current = null;
-      touchCleanup?.();
-      if (editorRef.current) {
-        editorRef.current.dispose();
-        editorRef.current = null;
+      contentChangeDisposable.dispose();
+      touchCleanup();
+      const model = diffEditor.getModel();
+      diffEditor.dispose();
+      // Dispose the models we created so they don't accumulate.
+      model?.original.dispose();
+      model?.modified.dispose();
+      editorRef.current = null;
+      setModifiedEditor(null);
+    };
+  }, [isOpen, monacoLoaded]);
+
+  // Apply mobile-dependent layout options without recreating the editor.
+  useEffect(() => {
+    isMobileRef.current = isMobile;
+    const diffEditor = editorRef.current;
+    if (!diffEditor) return;
+    diffEditor.updateOptions({
+      renderSideBySide: !isMobile,
+      lineNumbers: isMobile ? "off" : "on",
+      glyphMargin: !isMobile,
+      lineDecorationsWidth: isMobile
+        ? MOBILE_LINE_DECORATIONS_WIDTH
+        : DESKTOP_LINE_DECORATIONS_WIDTH,
+      lineNumbersMinChars: isMobile ? 0 : 3,
+      scrollbar: {
+        verticalScrollbarSize: isMobile ? MOBILE_SCROLLBAR_SIZE : DESKTOP_VERTICAL_SCROLLBAR_SIZE,
+        horizontalScrollbarSize: isMobile
+          ? MOBILE_SCROLLBAR_SIZE
+          : DESKTOP_HORIZONTAL_SCROLLBAR_SIZE,
+      },
+      overviewRulerLanes: isMobile ? MOBILE_OVERVIEW_RULER_LANES : DESKTOP_OVERVIEW_RULER_LANES,
+      folding: !isMobile,
+      padding: isMobile ? { bottom: 80 } : {},
+    });
+  }, [isMobile]);
+
+  // Swap models into the existing editor when the selected file or its diff
+  // changes. This avoids recreating the editor (see comment above).
+  useEffect(() => {
+    if (!monacoLoaded || !fileDiff || !editorRef.current || !monacoRef.current) {
+      return;
+    }
+    const monaco = monacoRef.current;
+    const diffEditor = editorRef.current;
+
+    const isCommitMsg = isCommitMessageFile(fileDiff.path);
+    const commitHash = isCommitMsg ? commitHashFromPath(fileDiff.path) : null;
+    const isHeadCommit =
+      isCommitMsg && commitMessagesRef.current.some((m) => m.hash === commitHash && m.isHead);
+    currentFileIsHeadCommitRef.current = isHeadCommit;
+
+    // Language from extension; plaintext for commit messages.
+    let language = "plaintext";
+    if (!isCommitMsg) {
+      const ext = "." + (fileDiff.path.split(".").pop()?.toLowerCase() || "");
+      const languages = monaco.languages.getLanguages();
+      for (const lang of languages) {
+        if (lang.extensions?.includes(ext)) {
+          language = lang.id;
+          break;
+        }
+      }
+    }
+
+    const timestamp = Date.now();
+    const originalUri = monaco.Uri.file(`original-${timestamp}-${fileDiff.path}`);
+    const modifiedUri = monaco.Uri.file(`modified-${timestamp}-${fileDiff.path}`);
+    const originalModel = monaco.editor.createModel(fileDiff.oldContent, language, originalUri);
+    const modifiedModel = monaco.editor.createModel(fileDiff.newContent, language, modifiedUri);
+
+    // Capture the previous models so we can dispose them after swapping.
+    const prev = diffEditor.getModel();
+    diffEditor.setModel({ original: originalModel, modified: modifiedModel });
+    prev?.original.dispose();
+    prev?.modified.dispose();
+
+    // Update readOnly based on file type, current mode, and whether we're
+    // viewing the working tree (only working-tree views are editable).
+    const isWorkingView = selectedDiff === "working" || selectedTo === "working";
+    const readOnly = isCommitMsg ? !isHeadCommit : modeRef.current === "comment" || !isWorkingView;
+    diffEditor.updateOptions({ readOnly });
+    diffEditor.getModifiedEditor().updateOptions({ readOnly });
+
+    // Auto-scroll to first diff once per file load.
+    let hasScrolledToFirstChange = false;
+    const scrollToFirstChange = () => {
+      if (hasScrolledToFirstChange) return;
+      const changes = diffEditor.getLineChanges();
+      if (changes && changes.length > 0) {
+        hasScrolledToFirstChange = true;
+        const firstChange = changes[0];
+        const targetLine = firstChange.modifiedStartLineNumber || 1;
+        const editor = diffEditor.getModifiedEditor();
+        editor.revealLineInCenter(targetLine);
+        editor.setPosition({ lineNumber: targetLine, column: 1 });
+        setCurrentChangeIndex(0);
       }
     };
-  }, [monacoLoaded, fileDiff, isMobile, commitMessages, cwd]);
+    scrollToFirstChange();
+    const diffUpdateDisposable = diffEditor.onDidUpdateDiff(scrollToFirstChange);
+
+    return () => {
+      diffUpdateDisposable.dispose();
+    };
+  }, [monacoLoaded, fileDiff]);
 
   const loadDiffs = async () => {
     try {
@@ -508,24 +624,45 @@ function DiffViewer({
       setDiffs(response.diffs);
       setGitRoot(response.gitRoot);
 
-      // If initialCommit is set, try to select that commit
+      // If initialCommit is set, select that commit and scope the diff to
+      // just that commit (parent..commit). Without this we'd inherit the
+      // default `selectedTo="working"`, which would show every change
+      // between the commit's parent and the working tree — not what the
+      // user asked for when they clicked "Open diff" on a specific commit.
       if (initialCommit) {
         const matchingDiff = response.diffs.find(
           (d) => d.id === initialCommit || d.id.startsWith(initialCommit),
         );
         if (matchingDiff) {
           setSelectedDiff(matchingDiff.id);
+          setSelectedTo("self");
           return;
         }
       }
 
-      // Auto-select working changes if non-empty
+      // Default selection: the first commit above merge-base with
+      // @{upstream}, with the range running through the working tree.
+      // That's the "my branch's changes (so far)" view, which is by far
+      // the most useful starting point. We fall back to working changes
+      // when there's no merge-base info (detached HEAD, no upstream).
       if (response.diffs.length > 0) {
         const working = response.diffs.find((d) => d.id === "working");
-        if (working && working.filesCount > 0) {
+        const commitsOnly = response.diffs.filter((d) => d.id !== "working");
+        const mbIdx = commitsOnly.findIndex((d) => d.isMergeBase);
+        let topOfBranch: GitDiffInfo | undefined;
+        if (mbIdx > 0) {
+          // commitsOnly is newest-first; commitsOnly[mbIdx - 1] is the
+          // commit one step newer than the merge-base on the branch.
+          topOfBranch = commitsOnly[mbIdx - 1];
+        }
+        if (topOfBranch) {
+          setSelectedDiff(topOfBranch.id);
+          setSelectedTo("working");
+        } else if (working && working.filesCount > 0) {
           setSelectedDiff("working");
-        } else if (response.diffs.length > 1) {
-          setSelectedDiff(response.diffs[1].id);
+        } else if (commitsOnly.length > 0) {
+          setSelectedDiff(commitsOnly[0].id);
+          setSelectedTo("self");
         }
       }
     } catch (err) {
@@ -544,13 +681,14 @@ function DiffViewer({
     try {
       setLoading(true);
       setError(null);
-      const filesData = await api.getGitDiffFiles(diffId, cwd);
+      const toArg = diffId === "working" ? undefined : selectedTo;
+      const filesData = await api.getGitDiffFiles(diffId, cwd, toArg);
 
       // Load commit messages if this is a commit (not working changes)
       let msgs: GitCommitMessage[] = [];
       if (diffId !== "working") {
         try {
-          msgs = await api.getGitCommitMessages(cwd, diffId);
+          msgs = await api.getGitCommitMessages(cwd, diffId, toArg);
           setCommitMessages(msgs);
         } catch {
           // Non-fatal: just don't show commit messages
@@ -605,7 +743,8 @@ function DiffViewer({
         return;
       }
 
-      const diffData = await api.getGitFileDiff(diffId, filePath, cwd);
+      const toArg = diffId === "working" ? undefined : selectedTo;
+      const diffData = await api.getGitFileDiff(diffId, filePath, cwd, toArg);
       setFileDiff(diffData);
     } catch (err) {
       setError(`Failed to load file diff: ${err}`);
@@ -735,13 +874,15 @@ function DiffViewer({
 
   // Save the current file (in edit mode)
   const saveCurrentFile = useCallback(async () => {
+    const isWorkingView = selectedDiff === "working" || selectedTo === "working";
     if (
       !editorRef.current ||
       !selectedFile ||
       isCommitMessageFile(selectedFile) ||
       !fileDiff ||
       modeRef.current !== "edit" ||
-      !gitRoot
+      !gitRoot ||
+      !isWorkingView
     ) {
       return;
     }
@@ -773,7 +914,7 @@ function DiffViewer({
       setSaveStatus("error");
       setTimeout(() => setSaveStatus("idle"), 3000);
     }
-  }, [selectedFile, fileDiff, gitRoot]);
+  }, [selectedFile, fileDiff, gitRoot, selectedDiff, selectedTo]);
 
   // Debounced auto-save
   const scheduleSave = useCallback(() => {
@@ -837,6 +978,31 @@ function DiffViewer({
         const findWidget = editorContainerRef.current?.querySelector(".find-widget.visible");
         if (findWidget) {
           return; // Let Monaco close its find widget
+        }
+        // If a nested overlay (commit picker, dir picker) is open, let it
+        // handle Escape rather than closing the whole diff viewer.
+        if (
+          document.querySelector(".commit-picker-popover") ||
+          document.querySelector(".commit-picker-modal")
+        ) {
+          return;
+        }
+        // If vim mode is active in a non-normal mode (insert/visual/...),
+        // let monaco-vim handle Escape (to drop back to normal) instead of
+        // closing the modal. We detect non-normal mode via the vim status
+        // node, which monaco-vim populates with e.g. "-- INSERT --". Normal
+        // mode renders an empty status, so a second Esc still closes the
+        // modal as users expect. Mobile doesn't attach vim, so skip it.
+        const vimFocused =
+          editorContainerRef.current?.contains(document.activeElement) ||
+          vimStatusNode?.contains(document.activeElement);
+        if (
+          !isMobile &&
+          vimEnabled &&
+          vimFocused &&
+          (vimStatusNode?.textContent ?? "").trim() !== ""
+        ) {
+          return;
         }
         if (showCommentDialog) {
           setShowCommentDialog(null);
@@ -917,7 +1083,10 @@ function DiffViewer({
       }
     };
 
-    // Use capture phase to intercept events before Monaco editor handles them
+    // Use capture phase to intercept events before Monaco editor handles
+    // them. Important for the vim-mode Esc guard: monaco-vim clears the
+    // status bar synchronously when leaving insert/visual mode, so we have
+    // to read it before monaco-vim's own keydown handler runs.
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [
@@ -930,7 +1099,75 @@ function DiffViewer({
     onClose,
     saveImmediately,
     mode,
+    vimEnabled,
+    vimStatusNode,
+    isMobile,
   ]);
+
+  // Sidebar tree input. Computed here — *above* the early `!isOpen`
+  // return — so the hook order stays stable across renders. Commit
+  // messages get slotted under a synthetic "Commit messages" folder;
+  // the short hash (and a HEAD marker) live in the right-aligned
+  // decoration lane so the subject — not the hash — is what gets
+  // truncated when space is tight.
+  const treeEntries = useMemo<DiffFileTreeEntry[]>(() => {
+    // Index commit messages by hash once so the per-file pass stays
+    // linear instead of O(N·M).
+    const msgByHash = new Map(commitMessages.map((m) => [m.hash, m]));
+    // First pass: figure out which (sanitized) subjects collide so we
+    // know which leaves need a hash suffix to stay distinct.
+    const subjectCounts = new Map<string, number>();
+    for (const f of files) {
+      if (!isCommitMessageFile(f.path)) continue;
+      const hash = commitHashFromPath(f.path);
+      const msg = msgByHash.get(hash);
+      const subject = msg ? msg.subject : hash.slice(0, 8);
+      subjectCounts.set(subject, (subjectCounts.get(subject) ?? 0) + 1);
+    }
+    return files.map((f) => {
+      if (isCommitMessageFile(f.path)) {
+        const hash = commitHashFromPath(f.path);
+        const msg = msgByHash.get(hash);
+        const subject = msg ? msg.subject : hash.slice(0, 8);
+        const shortHash = hash.slice(0, 8);
+        // `treePath` is segmented, so `/` in the subject stays inside
+        // the leaf label — no FRACTION-SLASH substitution needed (which
+        // used to fall back to a different system font and look weird).
+        const collides = (subjectCounts.get(subject) ?? 0) > 1;
+        const leaf = collides ? `${subject} (${shortHash})` : subject;
+        return {
+          realPath: f.path,
+          treePath: ["Commit messages", leaf],
+          decoration: msg?.isHead ? "HEAD" : undefined,
+          decorationTitle: msg?.isHead ? `${hash} (HEAD)` : undefined,
+        };
+      }
+      return {
+        realPath: f.path,
+        treePath: f.path.split("/"),
+        status: f.status,
+      };
+    });
+  }, [files, commitMessages]);
+
+  // Title shown in the desktop sidebar layout's header: the open
+  // file's path, or a commit-message subject (with HEAD suffix) when
+  // viewing a synthetic commit-message row. Falls back to a non-
+  // breaking space so the header height stays constant.
+  let currentTitleText: string | null = null;
+  let currentTitleTooltip: string | null = null;
+  if (selectedFile) {
+    if (isCommitMessageFile(selectedFile)) {
+      const hash = commitHashFromPath(selectedFile);
+      const msg = commitMessages.find((m) => m.hash === hash);
+      const subject = msg ? msg.subject : hash.slice(0, 8);
+      currentTitleText = msg?.isHead ? `${subject} — HEAD` : subject;
+      currentTitleTooltip = msg?.isHead ? `${hash} (HEAD)\n\n${subject}` : `${hash}\n\n${subject}`;
+    } else {
+      currentTitleText = selectedFile;
+      currentTitleTooltip = selectedFile;
+    }
+  }
 
   if (!isOpen) return null;
 
@@ -951,25 +1188,184 @@ function DiffViewer({
   const hasNextFile = currentFileIndex < files.length - 1;
   const hasPrevFile = currentFileIndex > 0;
 
-  // Selectors shared between desktop and mobile
+  // Single combined commit picker (replaces the prior pair of <select>s).
   const commitSelector = (
-    <select
-      value={selectedDiff || ""}
-      onChange={(e) => setSelectedDiff(e.target.value || null)}
-      className="diff-viewer-select"
-    >
-      <option value="">Choose base...</option>
-      {diffs.map((diff) => {
-        const stats = `${diff.filesCount} files, +${diff.additions}/-${diff.deletions}`;
+    <CommitPicker
+      diffs={diffs}
+      selectedDiff={selectedDiff}
+      selectedTo={selectedTo}
+      onChange={(diff, to) => {
+        setSelectedDiff(diff);
+        setSelectedTo(to);
+      }}
+      isMobile={isMobile}
+    />
+  );
+
+  // Sidebar commit list. We want a short, scannable list of "interesting"
+  // commits: working tree, then everything up to (and including) the
+  // merge-base with @{upstream}. When there's no merge-base info (e.g.
+  // detached HEAD with no upstream), fall back to the top 10 commits.
+  const sidebarCommits = (() => {
+    const list: GitDiffInfo[] = [];
+    const working = diffs.find((d) => d.id === "working");
+    if (working) list.push(working);
+    const commitsOnly = diffs.filter((d) => d.id !== "working");
+    const mergeBaseIdx = commitsOnly.findIndex((d) => d.isMergeBase);
+    if (mergeBaseIdx >= 0) {
+      // Include up to and including the merge-base. Cap to keep the
+      // sidebar usable for branches with huge divergence.
+      list.push(...commitsOnly.slice(0, Math.min(mergeBaseIdx + 1, 50)));
+    } else {
+      list.push(...commitsOnly.slice(0, 10));
+    }
+    return list;
+  })();
+
+  // Compute which sidebar rows fall inside the active diff range so we
+  // can highlight either the single selected commit or the whole span
+  // through the working tree. `sidebarCommits` is rendered with the
+  // working row first, then commits in newest-first order, matching the
+  // git history's natural top-down layout.
+  const sidebarSelIdx = selectedDiff ? sidebarCommits.findIndex((d) => d.id === selectedDiff) : -1;
+  const inSidebarRange = (idx: number): boolean => {
+    if (sidebarSelIdx < 0) return false;
+    if (selectedDiff === "working") return idx === sidebarSelIdx;
+    if (selectedTo === "self") return idx === sidebarSelIdx;
+    // through working tree: highlight from the working row (idx 0) down
+    // to and including the selected commit row.
+    return idx >= 0 && idx <= sidebarSelIdx;
+  };
+
+  const commitList = (
+    <ul className="diff-viewer-commit-list" role="listbox" aria-label="Commits">
+      {sidebarCommits.length === 0 && <li className="diff-viewer-file-list-empty">No commits</li>}
+      {sidebarCommits.map((d, idx) => {
+        const isWorking = d.id === "working";
+        const isSelected = selectedDiff === d.id;
+        const inRange = inSidebarRange(idx);
+        const subject = isWorking ? "Working Changes" : d.message;
+        const refs = d.refs ?? [];
         return (
-          <option key={diff.id} value={diff.id}>
-            {diff.id === "working"
-              ? `Working Changes (${stats})`
-              : `${truncateWithEllipsis(diff.message, 40)} (${stats})`}
-          </option>
+          <li key={d.id}>
+            <button
+              type="button"
+              className={[
+                "diff-viewer-commit-list-item",
+                isSelected && "selected",
+                inRange && "in-range",
+                isWorking && "working",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              onClick={() => {
+                // Clicking a row picks that commit; keep the current
+                // range mode (only this / through working) so the
+                // header toggle stays in charge of the variant.
+                if (isWorking) {
+                  setSelectedDiff("working");
+                } else {
+                  setSelectedDiff(d.id);
+                }
+              }}
+              title={isWorking ? "Working changes" : `${d.message}\n${d.id}`}
+              role="option"
+              aria-selected={isSelected}
+            >
+              <div className="diff-viewer-commit-list-line1">
+                <span className="diff-viewer-commit-list-subject">{subject}</span>
+              </div>
+              {!isWorking && (refs.length > 0 || d.isMergeBase) && (
+                <div className="diff-viewer-commit-list-refs">
+                  {refs.map((ref) => (
+                    <span
+                      key={ref}
+                      className={`diff-viewer-commit-list-ref${
+                        ref === "HEAD" ? " head" : ""
+                      }${ref.includes("/") ? " remote" : ""}`}
+                    >
+                      {ref}
+                    </span>
+                  ))}
+                  {d.isMergeBase && !refs.some((r) => r.includes("/")) && (
+                    <span
+                      className="diff-viewer-commit-list-ref mergebase"
+                      title="Merge-base with @{upstream}"
+                    >
+                      merge-base
+                    </span>
+                  )}
+                </div>
+              )}
+            </button>
+          </li>
         );
       })}
-    </select>
+    </ul>
+  );
+
+  // Sidebar file list: a simple in-house file tree that mixes real
+  // files with commit-message rows. Commit-message paths are synthetic
+  // ("commit-message:<hash>") and don't belong in the filesystem
+  // layout, so we slot them under a synthetic "Commit messages"
+  // directory in the tree while keeping the rest of the codebase
+  // working with the real paths via DiffFileTreeEntry's realPath /
+  // treePath mapping.
+  const fileList = (
+    <div className="diff-viewer-file-list" aria-label="Files">
+      {files.length === 0 && <div className="diff-viewer-file-list-empty">No files</div>}
+      {files.length > 0 && (
+        <div className="diff-viewer-file-tree-wrap">
+          <DiffFileTree
+            entries={treeEntries}
+            selectedRealPath={selectedFile}
+            onSelect={(path) => setSelectedFile(path)}
+          />
+        </div>
+      )}
+    </div>
+  );
+
+  // Chevron-double sidebar toggle. In header mode (no sidebar) we show
+  // `«` to invite the user to pull a panel in from the left; once the
+  // sidebar is showing, the button at its top edge becomes `»` to push
+  // it back away.
+  const expandSidebarButton = (
+    <button
+      type="button"
+      className="btn-icon diff-viewer-expand-btn"
+      onClick={() => setLayout("sidebar")}
+      aria-label="Show sidebar"
+      title="Show sidebar"
+    >
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="20" height="20">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M11 19l-7-7 7-7m8 14l-7-7 7-7"
+        />
+      </svg>
+    </button>
+  );
+
+  const collapseSidebarButton = (
+    <button
+      type="button"
+      className="btn-icon diff-viewer-collapse-btn"
+      onClick={() => setLayout("header")}
+      aria-label="Hide sidebar"
+      title="Hide sidebar"
+    >
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="20" height="20">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M13 5l7 7-7 7M5 5l7 7-7 7"
+        />
+      </svg>
+    </button>
   );
 
   const fileIndexIndicator =
@@ -1127,16 +1523,37 @@ function DiffViewer({
             </button>
           </div>
         ) : (
-          // Desktop header: selectors expand, controls on right
+          // Desktop header: selectors expand, controls on right.
+          // In sidebar layout, the « collapse button is the leftmost
+          // element in the top bar (sitting directly above the sidebar);
+          // the inline commit/file selectors are hidden in that mode
+          // because the sidebar shows commit and file lists instead.
           <div className="diff-viewer-header">
             <div className="diff-viewer-header-row">
-              <div className="diff-viewer-selectors-row">
-                {commitSelector}
-                {fileSelector}
-              </div>
+              {layout === "sidebar" && collapseSidebarButton}
+              {layout === "header" && expandSidebarButton}
+              {layout === "header" ? (
+                <div className="diff-viewer-selectors-row">
+                  <div className="diff-viewer-selector-group">
+                    <label className="diff-viewer-selector-label">Commits</label>
+                    {commitSelector}
+                  </div>
+                  <div className="diff-viewer-selector-group">
+                    <label className="diff-viewer-selector-label">
+                      Commit messages and changed files
+                    </label>
+                    {fileSelector}
+                  </div>
+                </div>
+              ) : (
+                <div className="diff-viewer-header-title" title={currentTitleTooltip ?? undefined}>
+                  {currentTitleText ?? "\u00a0"}
+                </div>
+              )}
               <div className="diff-viewer-controls-row">
                 {navButtons}
                 {modeToggle}
+                <VimToggle enabled={vimEnabled} onChange={setVimEnabled} />
                 {dirButton}
                 <button className="diff-viewer-close" onClick={onClose} title="Close (Esc)">
                   ×
@@ -1150,34 +1567,72 @@ function DiffViewer({
         {error && <div className="diff-viewer-error">{error}</div>}
 
         {/* Main content */}
-        <div className="diff-viewer-content">
-          {loading && !fileDiff && (
-            <div className="diff-viewer-loading">
-              <div className="spinner"></div>
-              <span>Loading...</span>
-            </div>
+        <div
+          className={`diff-viewer-content${
+            !isMobile && layout === "sidebar" ? " diff-viewer-content-sidebar" : ""
+          }`}
+        >
+          {!isMobile && layout === "sidebar" && (
+            <aside className="diff-viewer-sidebar">
+              <div className="diff-viewer-sidebar-section diff-viewer-sidebar-commits">
+                <div className="diff-viewer-sidebar-label">
+                  <span>Commits</span>
+                </div>
+                <div className="diff-viewer-sidebar-range">
+                  <RangeToggle
+                    selectedDiff={selectedDiff}
+                    selectedTo={selectedTo}
+                    onChange={(diff, to) => {
+                      setSelectedDiff(diff);
+                      setSelectedTo(to);
+                    }}
+                  />
+                </div>
+                <div className="diff-viewer-sidebar-commits-scroll">{commitList}</div>
+              </div>
+              <div className="diff-viewer-sidebar-section diff-viewer-sidebar-files">
+                <div className="diff-viewer-sidebar-label">
+                  <span>Commit Messages and Files</span>
+                  {fileIndexIndicator && (
+                    <span className="diff-viewer-file-index">{fileIndexIndicator}</span>
+                  )}
+                </div>
+                <div className="diff-viewer-sidebar-files-scroll">{fileList}</div>
+              </div>
+            </aside>
           )}
+          <div className="diff-viewer-main">
+            {loading && !fileDiff && (
+              <div className="diff-viewer-loading">
+                <div className="spinner"></div>
+                <span>Loading...</span>
+              </div>
+            )}
 
-          {!loading && !monacoLoaded && !error && (
-            <div className="diff-viewer-loading">
-              <div className="spinner"></div>
-              <span>Loading editor...</span>
-            </div>
-          )}
+            {!loading && !monacoLoaded && !error && (
+              <div className="diff-viewer-loading">
+                <div className="spinner"></div>
+                <span>Loading editor...</span>
+              </div>
+            )}
 
-          {!loading && monacoLoaded && !fileDiff && !error && (
-            <div className="diff-viewer-empty">
-              <p>Select a diff and file to view changes.</p>
-              <p className="diff-viewer-hint">Click on line numbers to add comments.</p>
-            </div>
-          )}
+            {!loading && monacoLoaded && !fileDiff && !error && (
+              <div className="diff-viewer-empty">
+                <p>Select a diff and file to view changes.</p>
+                <p className="diff-viewer-hint">Click on line numbers to add comments.</p>
+              </div>
+            )}
 
-          {/* Monaco editor container */}
-          <div
-            ref={editorContainerRef}
-            className="diff-viewer-editor"
-            style={{ display: fileDiff && monacoLoaded ? "block" : "none" }}
-          />
+            {/* Monaco editor container */}
+            <div
+              ref={editorContainerRef}
+              className="diff-viewer-editor"
+              style={{ display: fileDiff && monacoLoaded ? "block" : "none" }}
+            />
+            {!isMobile && vimEnabled && fileDiff && monacoLoaded && (
+              <div ref={setVimStatusNode} className="monaco-vim-status" />
+            )}
+          </div>
         </div>
 
         {/* Mobile floating nav buttons at bottom */}

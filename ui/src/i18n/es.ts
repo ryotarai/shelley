@@ -13,6 +13,7 @@ export const es: TranslationKeys = {
 
   // Overflow Menu
   diffs: "Diferencias",
+  gitGraph: "Grafo de Git",
   terminal: "Terminal",
   archiveConversation: "Archivar conversación",
   checkForNewVersion: "Buscar nueva versión",
@@ -38,6 +39,9 @@ export const es: TranslationKeys = {
   searchPlaceholder: "Buscar conversaciones o acciones...",
   searching: "Buscando...",
   noResults: "No se encontraron resultados",
+  searchConversations: "Buscar conversaciones...",
+  noSearchResults: "No hay conversaciones coincidentes",
+  clearSearch: "Limpiar búsqueda",
   toNavigate: "para navegar",
   toSelect: "para seleccionar",
   toClose: "para cerrar",
@@ -56,6 +60,7 @@ export const es: TranslationKeys = {
   jumpToPreviousMessage: "Ir al mensaje anterior del usuario",
   viewDiffs: "Ver diferencias",
   openGitDiffViewer: "Abrir el visor de diferencias de Git",
+  openGitGraphViewer: "Abrir el visor de grafo de Git",
   addRemoveModelsKeys: "Agregar/Eliminar modelos y claves",
   configureModels: "Configurar modelos de IA y claves de API",
   notificationSettings: "Configuración de notificaciones",
@@ -90,6 +95,7 @@ export const es: TranslationKeys = {
   hideSubagents: "Ocultar subagentes",
   showSubagents: "Mostrar subagentes",
   groupConversations: "Agrupar conversaciones",
+  resortNow: "Reordenar ahora",
   noGrouping: "Sin agrupación",
   directory: "Directorio",
   gitRepo: "Repositorio Git",
@@ -131,6 +137,10 @@ export const es: TranslationKeys = {
   tagsPlaceholder: "separadas por comas, ej., slug, cheap",
   tagsTooltip:
     'Etiquetas separadas por comas para este modelo. Use "slug" para marcar este modelo para generar títulos de conversación. Si ningún modelo tiene la etiqueta "slug", se usará el modelo de la conversación.',
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "Probar",
   testingButton: "Probando...",
   save: "Guardar",
@@ -216,4 +226,5 @@ export const es: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

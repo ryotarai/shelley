@@ -192,6 +192,13 @@ var (
 		APIKeyEnv: FireworksAPIKeyEnv,
 	}
 
+	DeepseekV4ProFireworks = Model{
+		UserName:  "deepseek-v4-pro-fireworks",
+		ModelName: "accounts/fireworks/models/deepseek-v4-pro",
+		URL:       FireworksURL,
+		APIKeyEnv: FireworksAPIKeyEnv,
+	}
+
 	MoonshotKimiK2 = Model{
 		UserName:  "moonshot-kimi-k2",
 		ModelName: "moonshot-v1-auto",
@@ -213,9 +220,16 @@ var (
 		APIKeyEnv: MistralAPIKeyEnv,
 	}
 
-	GLM47Fireworks = Model{
-		UserName:  "glm-4.7-fireworks",
-		ModelName: "accounts/fireworks/models/glm-4p7",
+	GLM51Fireworks = Model{
+		UserName:  "glm-5.1-fireworks",
+		ModelName: "accounts/fireworks/models/glm-5p1",
+		URL:       FireworksURL,
+		APIKeyEnv: FireworksAPIKeyEnv,
+	}
+
+	KimiK26Fireworks = Model{
+		UserName:  "kimi-k2.6-fireworks",
+		ModelName: "accounts/fireworks/models/kimi-k2p6",
 		URL:       FireworksURL,
 		APIKeyEnv: FireworksAPIKeyEnv,
 	}
@@ -269,6 +283,20 @@ var (
 		APIKeyEnv: OpenAIAPIKeyEnv,
 	}
 
+	GPT55 = Model{
+		UserName:  "gpt-5.5",
+		ModelName: "gpt-5.5",
+		URL:       OpenAIURL,
+		APIKeyEnv: OpenAIAPIKeyEnv,
+	}
+
+	GPT55Pro = Model{
+		UserName:  "gpt-5.5-pro",
+		ModelName: "gpt-5.5-pro",
+		URL:       OpenAIURL,
+		APIKeyEnv: OpenAIAPIKeyEnv,
+	}
+
 	GPT54 = Model{
 		UserName:  "gpt-5.4",
 		ModelName: "gpt-5.4",
@@ -314,6 +342,8 @@ var _ llm.Service = (*Service)(nil)
 // Declaration order is display order — keep current models at top, old models at bottom.
 var ModelsRegistry = []Model{
 	// Current OpenAI
+	GPT55,
+	GPT55Pro,
 	GPT54,
 	GPT5,
 	GPT5Mini,
@@ -335,11 +365,13 @@ var ModelsRegistry = []Model{
 	TogetherMistralSmall,
 	// Fireworks / misc providers
 	FireworksDeepseekV3,
+	DeepseekV4ProFireworks,
 	FireworksLlama4Maverick,
 	MoonshotKimiK2,
 	MistralMedium,
 	DevstralSmall,
-	GLM47Fireworks,
+	GLM51Fireworks,
+	KimiK26Fireworks,
 	GPTOSS120B,
 	GPTOSS20B,
 	LlamaCPP,
@@ -406,10 +438,37 @@ var (
 	}
 )
 
+func isImageContent(c llm.Content) bool {
+	return c.MediaType != "" && c.Data != ""
+}
+
+func openAIImageDataURL(c llm.Content) string {
+	return "data:" + c.MediaType + ";base64," + c.Data
+}
+
+func openAIImagePart(c llm.Content) openai.ChatMessagePart {
+	return openai.ChatMessagePart{
+		Type: openai.ChatMessagePartTypeImageURL,
+		ImageURL: &openai.ChatMessageImageURL{
+			URL: openAIImageDataURL(c),
+		},
+	}
+}
+
+func openAITextPart(text string) openai.ChatMessagePart {
+	return openai.ChatMessagePart{
+		Type: openai.ChatMessagePartTypeText,
+		Text: text,
+	}
+}
+
 // fromLLMContent converts llm.Content to the format expected by OpenAI.
 func fromLLMContent(c llm.Content) (string, []openai.ToolCall) {
 	switch c.Type {
 	case llm.ContentTypeText:
+		if isImageContent(c) {
+			return "", nil
+		}
 		return c.Text, nil
 	case llm.ContentTypeToolUse:
 		// For OpenAI, tool use is sent as a null content with tool_calls in the message
@@ -466,12 +525,16 @@ func fromLLMMessage(msg llm.Message) []openai.ChatCompletionMessage {
 
 	// Process tool results as separate messages, but first
 	for _, tr := range toolResults {
-		// Convert toolresult array to a string for OpenAI
-		// Collect all text from content objects
+		// Tool-role messages cannot carry image parts. Preserve images as a following user
+		// message so vision-capable OpenAI models actually receive them.
 		var texts []string
+		var imageParts []openai.ChatMessagePart
 		for _, result := range tr.ToolResult {
 			if strings.TrimSpace(result.Text) != "" {
 				texts = append(texts, result.Text)
+			}
+			if isImageContent(result) {
+				imageParts = append(imageParts, openAIImagePart(result))
 			}
 		}
 		toolResultContent := strings.Join(texts, "\n")
@@ -491,6 +554,15 @@ func fromLLMMessage(msg llm.Message) []openai.ChatCompletionMessage {
 			ToolCallID: tr.ToolUseID,
 		}
 		messages = append(messages, m)
+
+		if len(imageParts) > 0 {
+			parts := []openai.ChatMessagePart{openAITextPart("Images returned by tool " + tr.ToolUseID + ":")}
+			parts = append(parts, imageParts...)
+			messages = append(messages, openai.ChatCompletionMessage{
+				Role:         "user",
+				MultiContent: parts,
+			})
+		}
 	}
 	// Process regular content second
 	if len(regularContent) > 0 {
@@ -501,8 +573,15 @@ func fromLLMMessage(msg llm.Message) []openai.ChatCompletionMessage {
 		// For assistant messages that contain tool calls
 		var toolCalls []openai.ToolCall
 		var textContent string
+		var multiContent []openai.ChatMessagePart
+		hasImage := false
 
 		for _, c := range regularContent {
+			if isImageContent(c) {
+				multiContent = append(multiContent, openAIImagePart(c))
+				hasImage = true
+				continue
+			}
 			content, tools := fromLLMContent(c)
 			if len(tools) > 0 {
 				toolCalls = append(toolCalls, tools...)
@@ -511,10 +590,15 @@ func fromLLMMessage(msg llm.Message) []openai.ChatCompletionMessage {
 					textContent += "\n"
 				}
 				textContent += content
+				multiContent = append(multiContent, openAITextPart(content))
 			}
 		}
 
-		m.Content = textContent
+		if hasImage {
+			m.MultiContent = multiContent
+		} else {
+			m.Content = textContent
+		}
 		m.ToolCalls = toolCalls
 
 		messages = append(messages, m)
@@ -728,6 +812,8 @@ func (s *Service) TokenContextWindow() int {
 	// OpenAI models generally have 128k context windows
 	// Some newer models have larger windows, but 128k is a safe default
 	switch model.ModelName {
+	case "gpt-5.5", "gpt-5.5-2026-04-23", "gpt-5.5-pro", "gpt-5.5-pro-2026-04-23":
+		return 272000
 	case "gpt-4.1-2025-04-14", "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14":
 		return 200000 // 200k for newer GPT-4.1 models
 	case "gpt-4o-2024-08-06", "gpt-4o-mini-2024-07-18":
@@ -740,6 +826,8 @@ func (s *Service) TokenContextWindow() int {
 		return 256000
 	case "gpt-oss-20b", "gpt-oss-120b":
 		return 128000
+	case "accounts/fireworks/models/deepseek-v4-pro":
+		return 1048576
 	case "gpt-5.1", "gpt-5.1-mini", "gpt-5.1-nano":
 		return 256000
 	default:
@@ -752,6 +840,13 @@ func (s *Service) TokenContextWindow() int {
 // TODO: determine actual OpenAI image dimension limits
 func (s *Service) MaxImageDimension() int {
 	return 0 // No known limit
+}
+
+// MaxImageBytes returns the maximum allowed encoded size for a single image.
+// OpenAI's vision docs cap image inputs at 20 MB per image
+// (https://platform.openai.com/docs/guides/images-vision).
+func (s *Service) MaxImageBytes() int {
+	return 20 * 1024 * 1024
 }
 
 // Do sends a request to OpenAI using the go-openai package.
@@ -806,13 +901,29 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 	// Retry mechanism
 	backoff := s.Backoff
 	if backoff == nil {
-		backoff = []time.Duration{1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second}
+		// Long tail: many model providers have multi-hour incidents, and it is
+		// a much worse UX to return after a couple of minutes than to keep waiting.
+		backoff = []time.Duration{
+			1 * time.Second,
+			2 * time.Second,
+			5 * time.Second,
+			10 * time.Second,
+			30 * time.Second,
+			1 * time.Minute,
+			2 * time.Minute,
+			5 * time.Minute,
+			10 * time.Minute,
+			20 * time.Minute,
+			30 * time.Minute,
+		}
 	}
 
 	// retry loop
-	var errs error // accumulated errors across all attempts
+	retryStart := time.Now()
+	var errs error            // accumulated errors across all attempts
+	var lastErrSummary string // short description of the most recent attempt failure
 	for attempts := 0; ; attempts++ {
-		if attempts > 10 {
+		if attempts > 15 {
 			return nil, fmt.Errorf("openai request failed after %d attempts (url=%s, model=%s): %w", attempts, fullURL, model.ModelName, errs)
 		}
 		if attempts > 0 {
@@ -822,7 +933,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			base := backoff[min(attempts, len(backoff)-1)]
 			jitter := time.Duration(rand.Int64N(max(min(int64(base), int64(time.Second)), 1)))
 			sleep := base + jitter
-			slog.WarnContext(ctx, "openai request sleep before retry", "sleep", sleep, "attempts", attempts)
+			slog.WarnContext(ctx, "openai request sleep before retry", "sleep", sleep, "attempts", attempts, "elapsed", time.Since(retryStart).Round(time.Second), "last_error", lastErrSummary)
 			select {
 			case <-time.After(sleep):
 			case <-ctx.Done():
@@ -872,12 +983,14 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 		switch {
 		case statusCode >= 500:
 			// Server error, try again with backoff
+			lastErrSummary = fmt.Sprintf("status %d: %s", statusCode, llm.Truncate(errMsg, 160))
 			slog.WarnContext(ctx, "openai_request_failed", "error", errMsg, "status_code", statusCode, "url", fullURL, "model", model.ModelName)
 			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 			continue
 
 		case statusCode == 429:
 			// Rate limited, accumulate error and retry
+			lastErrSummary = fmt.Sprintf("status 429 rate limited: %s", llm.Truncate(errMsg, 160))
 			slog.WarnContext(ctx, "openai_request_rate_limited", "error", errMsg, "url", fullURL, "model", model.ModelName)
 			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (rate limited, url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 			continue
@@ -889,6 +1002,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 
 		default:
 			// Other error, accumulate and retry
+			lastErrSummary = fmt.Sprintf("status %d: %s", statusCode, llm.Truncate(errMsg, 160))
 			slog.WarnContext(ctx, "openai_request_failed", "error", errMsg, "status_code", statusCode, "url", fullURL, "model", model.ModelName)
 			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %d (url=%s, model=%s): %s", attempts+1, now, statusCode, fullURL, model.ModelName, errMsg))
 			continue

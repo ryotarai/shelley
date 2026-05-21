@@ -19,6 +19,8 @@ type Conversation struct {
 	ParentConversationID *string   `json:"parent_conversation_id"`
 	Model                *string   `json:"model"`
 	ConversationOptions  string    `json:"conversation_options"`
+	CurrentGeneration    int64     `json:"current_generation"`
+	AgentWorking         bool      `json:"agent_working"`
 }
 
 type LlmRequest struct {
@@ -48,25 +50,21 @@ type Message struct {
 	CreatedAt           time.Time `json:"created_at"`
 	DisplayData         *string   `json:"display_data"`
 	ExcludedFromContext bool      `json:"excluded_from_context"`
-}
-
-type Migration struct {
-	MigrationNumber int64      `json:"migration_number"`
-	MigrationName   string     `json:"migration_name"`
-	ExecutedAt      *time.Time `json:"executed_at"`
+	Generation          int64     `json:"generation"`
 }
 
 type Model struct {
-	ModelID      string    `json:"model_id"`
-	DisplayName  string    `json:"display_name"`
-	ProviderType string    `json:"provider_type"`
-	Endpoint     string    `json:"endpoint"`
-	ApiKey       string    `json:"api_key"`
-	ModelName    string    `json:"model_name"`
-	MaxTokens    int64     `json:"max_tokens"`
-	Tags         string    `json:"tags"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ModelID         string    `json:"model_id"`
+	DisplayName     string    `json:"display_name"`
+	ProviderType    string    `json:"provider_type"`
+	Endpoint        string    `json:"endpoint"`
+	ApiKey          string    `json:"api_key"`
+	ModelName       string    `json:"model_name"`
+	MaxTokens       int64     `json:"max_tokens"`
+	Tags            string    `json:"tags"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	ReasoningEffort string    `json:"reasoning_effort"`
 }
 
 type NotificationChannel struct {
@@ -77,10 +75,4 @@ type NotificationChannel struct {
 	Config      string    `json:"config"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
-}
-
-type Setting struct {
-	Key       string    `json:"key"`
-	Value     string    `json:"value"`
-	UpdatedAt time.Time `json:"updated_at"`
 }

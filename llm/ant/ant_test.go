@@ -91,6 +91,14 @@ func TestMaxImageDimension(t *testing.T) {
 	}
 }
 
+func TestMaxImageBytes(t *testing.T) {
+	s := &Service{}
+	want := 5 * 1024 * 1024
+	if got := s.MaxImageBytes(); got != want {
+		t.Errorf("MaxImageBytes() = %v, want %v", got, want)
+	}
+}
+
 func TestToLLMUsage(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2097,9 +2105,9 @@ func TestDoFailsAfterMaxRetriesOnTruncatedStream(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed after") {
 		t.Errorf("error = %q, want to contain 'failed after'", err.Error())
 	}
-	// Should have made 11 attempts (0-10, then fails at attempts > 10)
-	if transport.calls != 11 {
-		t.Errorf("expected 11 attempts, got %d", transport.calls)
+	// Should have made 16 attempts (0-15, then fails at attempts > 15)
+	if transport.calls != 16 {
+		t.Errorf("expected 16 attempts, got %d", transport.calls)
 	}
 }
 

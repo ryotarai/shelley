@@ -2,9 +2,9 @@ import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMe
 import {
   Message,
   Conversation,
+  ConversationListPatchEvent,
   StreamResponse,
   LLMContent,
-  ConversationListUpdate,
   ToolProgress,
   isDistillStatusMessage,
   isToolApprovalRequestMessage,
@@ -14,6 +14,7 @@ import { api } from "../services/api";
 import { conversationCache } from "../services/conversationCache";
 import { ThemeMode, getStoredTheme, setStoredTheme, applyTheme } from "../services/theme";
 import { useMarkdown } from "../contexts/MarkdownContext";
+import MarkdownContent from "./MarkdownContent";
 import { useI18n, type Locale, type TranslationKeys } from "../i18n";
 import { setFaviconStatus } from "../services/favicon";
 import {
@@ -24,8 +25,15 @@ import {
   requestBrowserNotificationPermission,
 } from "../services/notifications";
 import MessageComponent from "./Message";
+import ConversationTOC from "./ConversationTOC";
+import MessageTimestamp, { formatDay } from "./MessageTimestamp";
 import MessageInput from "./MessageInput";
 import DiffViewer from "./DiffViewer";
+import { focusMessageInputIfUnfocused } from "../utils/focusMessageInput";
+import MessageSelectionToolbar from "./MessageSelectionToolbar";
+import { buildMessageQuote } from "../utils/messageQuote";
+import { tildifyPath } from "../utils/tildify";
+import GitGraphViewer from "./GitGraphViewer";
 import AgentsMdEditorModal from "./AgentsMdEditorModal";
 import BashTool from "./BashTool";
 import PatchTool from "./PatchTool";
@@ -58,8 +66,8 @@ interface ContextUsageBarProps {
   maxContextTokens: number;
   conversationId?: string | null;
   modelName?: string;
-  onDistillConversation?: () => void;
-  onDistillReplaceConversation?: () => void;
+  onDistillNewGeneration?: () => void;
+  onStartNewGeneration?: () => void;
   agentWorking?: boolean;
 }
 
@@ -68,14 +76,14 @@ function ContextUsageBar({
   maxContextTokens,
   conversationId,
   modelName,
-  onDistillConversation,
-  onDistillReplaceConversation,
+  onDistillNewGeneration,
+  onStartNewGeneration,
   agentWorking,
 }: ContextUsageBarProps) {
   const [showPopup, setShowPopup] = useState(false);
   const [distilling, setDistilling] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
-  const hasAutoOpenedRef = useRef<string | null>(null);
+  const hasAutoOpenedRef = useRef<boolean>(false);
 
   const percentage = maxContextTokens > 0 ? (contextWindowSize / maxContextTokens) * 100 : 0;
   const clampedPercentage = Math.min(percentage, 100);
@@ -97,7 +105,9 @@ function ContextUsageBar({
     setShowPopup(!showPopup);
   };
 
-  // Auto-open popup when hitting 100k tokens (once per conversation).
+  // Auto-open popup when hitting the long-conversation threshold, but only
+  // ever once per browser (tracked via localStorage). After that, the user
+  // can still open the popup manually by clicking the warning indicator.
   // Only auto-open at end of turn (when agent is not working) so we don't
   // interrupt the user while the agent is plugging away.
   // Skip auto-open on mobile where the popup is too intrusive.
@@ -108,9 +118,11 @@ function ContextUsageBar({
       !agentWorking &&
       !isMobile &&
       conversationId &&
-      hasAutoOpenedRef.current !== conversationId
+      !hasAutoOpenedRef.current &&
+      localStorage.getItem("shelley_long_convo_popup_shown") !== "1"
     ) {
-      hasAutoOpenedRef.current = conversationId;
+      hasAutoOpenedRef.current = true;
+      localStorage.setItem("shelley_long_convo_popup_shown", "1");
       setShowPopup(true);
     }
   }, [showLongConversationWarning, agentWorking, conversationId]);
@@ -144,22 +156,22 @@ function ContextUsageBar({
     }
   }, [showPopup]);
 
-  const handleDistill = async () => {
-    if (distilling || !onDistillConversation) return;
+  const handleDistillNewGeneration = async () => {
+    if (distilling || !onDistillNewGeneration) return;
     setDistilling(true);
     try {
-      await onDistillConversation();
+      await onDistillNewGeneration();
       setShowPopup(false);
     } finally {
       setDistilling(false);
     }
   };
 
-  const handleDistillReplace = async () => {
-    if (distilling || !onDistillReplaceConversation) return;
+  const handleStartNewGeneration = async () => {
+    if (distilling || !onStartNewGeneration) return;
     setDistilling(true);
     try {
-      await onDistillReplaceConversation();
+      await onStartNewGeneration();
       setShowPopup(false);
     } finally {
       setDistilling(false);
@@ -187,20 +199,32 @@ function ContextUsageBar({
               For best results, start a new conversation.
             </div>
           )}
-          {onDistillConversation && conversationId && (
+          {conversationId && (onDistillNewGeneration || onStartNewGeneration) && (
             <div className="chat-distill-container">
-              <button onClick={handleDistill} disabled={distilling} className="chat-distill-button">
-                {distilling ? "Distilling..." : "Distill & Continue in New Conversation"}
-              </button>
-              {onDistillReplaceConversation && (
+              {onDistillNewGeneration && (
                 <button
-                  onClick={handleDistillReplace}
+                  onClick={handleDistillNewGeneration}
                   disabled={distilling}
-                  className="chat-distill-button chat-distill-replace-button"
+                  className="chat-distill-button chat-distill-generation-button"
                 >
-                  {distilling ? "Distilling..." : "Distill & Replace in Place"}
+                  {distilling ? "Distilling..." : "Distill in New Generation"}
                 </button>
               )}
+              {onStartNewGeneration && (
+                <button
+                  onClick={handleStartNewGeneration}
+                  disabled={distilling}
+                  className="chat-distill-button chat-distill-generation-button"
+                >
+                  Start New Generation
+                </button>
+              )}
+              <div
+                className="chat-distill-info"
+                title="Yeah, we're trying some stuff. Come to discord and talk about it with us!"
+              >
+                ⓘ Yeah, we're trying some stuff. Come to discord and talk about it with us!
+              </div>
             </div>
           )}
         </div>
@@ -234,6 +258,7 @@ function ContextUsageBar({
 
 interface CoalescedItem {
   type: "message" | "tool";
+  generation: number;
   message?: Message;
   toolUseId?: string;
   toolName?: string;
@@ -265,6 +290,7 @@ interface CoalescedToolCallProps {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const TOOL_COMPONENTS: Record<string, React.ComponentType<any>> = {
   bash: BashTool,
+  shell: BashTool,
   patch: PatchTool,
   browser: BrowserTool,
   screenshot: ScreenshotTool,
@@ -456,17 +482,31 @@ const CoalescedToolCall = React.memo(function CoalescedToolCall({
   );
 });
 
-// Animated "Agent working..." with letter-by-letter bold animation
+// Animated "Agent working..." with letter-by-letter bold animation.
+// On narrow viewports drop the "Agent " prefix so it fits on one line.
 function AnimatedWorkingStatus() {
-  const text = "Agent working...";
+  const [isNarrow, setIsNarrow] = useState(() =>
+    typeof window !== "undefined" ? window.matchMedia("(max-width: 600px)").matches : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(max-width: 600px)");
+    const handler = (e: MediaQueryListEvent) => setIsNarrow(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  const text = isNarrow ? "working..." : "Agent working...";
   const [boldIndex, setBoldIndex] = useState(0);
 
   useEffect(() => {
+    setBoldIndex(0);
     const interval = setInterval(() => {
       setBoldIndex((prev) => (prev + 1) % text.length);
     }, 100); // 100ms per letter
     return () => clearInterval(interval);
-  }, []);
+  }, [text]);
 
   return (
     <span className="status-message animated-working">
@@ -479,13 +519,6 @@ function AnimatedWorkingStatus() {
   );
 }
 
-interface ConversationStateUpdate {
-  conversation_id: string;
-  working: boolean;
-  model?: string;
-  pending_approval?: boolean;
-}
-
 interface ChatInterfaceProps {
   conversationId: string | null;
   onOpenDrawer: () => void;
@@ -493,21 +526,17 @@ interface ChatInterfaceProps {
   onArchiveConversation?: (conversationId: string) => Promise<void>;
   currentConversation?: Conversation;
   onConversationUpdate?: (conversation: Conversation) => void;
-  onConversationListUpdate?: (update: ConversationListUpdate) => void;
-  onConversationStateUpdate?: (state: ConversationStateUpdate) => void;
+  conversationListHash?: string | null;
+  onConversationListPatch?: (event: ConversationListPatchEvent) => void;
   onFirstMessage?: (
     message: string,
     model: string,
     cwd?: string,
     conversationType?: "normal" | "orchestrator",
     subagentBackend?: "shelley" | "claude-cli" | "codex-cli",
+    toolOverrides?: Record<string, "on" | "off">,
   ) => Promise<void>;
-  onDistillConversation?: (
-    sourceConversationId: string,
-    model: string,
-    cwd?: string,
-  ) => Promise<void>;
-  onDistillReplaceConversation?: (
+  onDistillNewGeneration?: (
     sourceConversationId: string,
     model: string,
     cwd?: string,
@@ -516,11 +545,17 @@ interface ChatInterfaceProps {
   isDrawerCollapsed?: boolean;
   onToggleDrawerCollapse?: () => void;
   openDiffViewerTrigger?: number; // increment to trigger opening diff viewer
+  openGitGraphTrigger?: number; // increment to trigger opening git graph viewer
   modelsRefreshTrigger?: number; // increment to trigger models list refresh
+  /** Increment to force re-reading the cwd from localStorage. Used when a
+   *  quick action (command palette) changes the cwd while we're already on
+   *  the new-conversation view. */
+  cwdSyncTrigger?: number;
   onOpenModelsModal?: () => void;
-  onReconnect?: () => void;
   ephemeralTerminals: EphemeralTerminal[];
   setEphemeralTerminals: React.Dispatch<React.SetStateAction<EphemeralTerminal[]>>;
+  onTerminalAttached?: (id: string, termId: string) => void;
+  onTerminalClose?: (id: string) => void;
   navigateUserMessageTrigger?: number; // positive = next, negative = previous
   onConversationUnarchived?: (conversation: Conversation) => void;
 }
@@ -533,6 +568,7 @@ const LANGUAGE_OPTIONS: { locale: Locale; flag: string; label: string }[] = [
   { locale: "es", flag: "🇪🇸", label: "Español" },
   { locale: "zh-CN", flag: "🇨🇳", label: "简体中文" },
   { locale: "zh-TW", flag: "🇹🇼", label: "繁體中文" },
+  { locale: "vi", flag: "🇻🇳", label: "Tiếng Việt" },
   { locale: "upgoer5", flag: "🚀", label: "Up-Goer Five" },
 ];
 
@@ -636,20 +672,22 @@ function ChatInterface({
   onArchiveConversation,
   currentConversation,
   onConversationUpdate,
-  onConversationListUpdate,
-  onConversationStateUpdate,
+  conversationListHash,
+  onConversationListPatch,
   onFirstMessage,
-  onDistillConversation,
-  onDistillReplaceConversation,
+  onDistillNewGeneration,
   mostRecentCwd,
   isDrawerCollapsed,
   onToggleDrawerCollapse,
   openDiffViewerTrigger,
+  openGitGraphTrigger,
   modelsRefreshTrigger,
+  cwdSyncTrigger,
   onOpenModelsModal,
-  onReconnect,
   ephemeralTerminals,
   setEphemeralTerminals,
+  onTerminalAttached,
+  onTerminalClose,
   navigateUserMessageTrigger,
   onConversationUnarchived,
 }: ChatInterfaceProps) {
@@ -712,15 +750,33 @@ function ChatInterface({
     }
   }, [currentConversation?.conversation_id]);
 
-  // Reset cwdInitialized and orchestrator mode when switching to a new conversation
+  // Track the most recently observed generation per conversation so we can
+  // detect generation bumps (e.g. distill-into-new-generation) and reset the
+  // token-bar state immediately. The reset effect lives next to the
+  // contextWindowSize state, below.
+  const lastGenerationRef = useRef<{ id: string | null; gen: number } | null>(null);
+
+  // Reset cwdInitialized and subagent backend when switching to a new conversation.
+  // Tool overrides are intentionally NOT reset — they persist across conversations
+  // via localStorage so the user's choices stick.
   useEffect(() => {
     if (conversationId === null) {
       setCwdInitialized(false);
-      setOrchestratorMode(false);
       setSubagentBackend("shelley");
       setShowAdvancedSettings(false);
     }
   }, [conversationId]);
+
+  // Re-read cwd from localStorage when a quick action bumps the sync trigger
+  // (e.g. command palette "change dir to git root" while we're already on /new).
+  useEffect(() => {
+    if (!cwdSyncTrigger) return;
+    const stored = localStorage.getItem("shelley_selected_cwd");
+    if (stored) {
+      setSelectedCwdState(stored);
+      setCwdInitialized(true);
+    }
+  }, [cwdSyncTrigger]);
 
   // Initialize CWD with priority: localStorage > mostRecentCwd > server default
   useEffect(() => {
@@ -787,12 +843,19 @@ function ChatInterface({
     isChannelEnabled("browser"),
   );
   const [showDiffViewer, setShowDiffViewer] = useState(false);
+  const [showGitGraph, setShowGitGraph] = useState(false);
   const [showAgentsMdEditor, setShowAgentsMdEditor] = useState(false);
   const [diffViewerInitialCommit, setDiffViewerInitialCommit] = useState<string | undefined>(
     undefined,
   );
   const [diffViewerCwd, setDiffViewerCwd] = useState<string | undefined>(undefined);
   const [diffCommentText, setDiffCommentText] = useState("");
+
+  // Inject a markdown comment block referencing a chat message into the composer.
+  // Uses a multi-line blockquote so the full selection is preserved.
+  const handleMessageComment = useCallback((messageId: string, snippet: string) => {
+    setDiffCommentText(buildMessageQuote(messageId, snippet));
+  }, []);
   const [agentWorking, setAgentWorking] = useState(false);
   const [cancelling, setCancelling] = useState(false);
 
@@ -810,17 +873,92 @@ function ChatInterface({
   }, [messages]);
 
   const [contextWindowSize, setContextWindowSize] = useState(0);
+
+  // When a new generation starts (e.g. distill-into-new-generation), the
+  // previous generation's token usage no longer reflects what will be sent to
+  // the LLM. Reset the local context window state so the token bar shrinks
+  // immediately; the next agent message will populate it with the new
+  // generation's actual usage.
+  useEffect(() => {
+    const gen = currentConversation?.current_generation;
+    const id = currentConversation?.conversation_id ?? null;
+    if (gen === undefined || id === null) {
+      lastGenerationRef.current = null;
+      return;
+    }
+    const prev = lastGenerationRef.current;
+    lastGenerationRef.current = { id, gen };
+    // Only reset on a generation bump within the same conversation.
+    if (prev && prev.id === id && gen > prev.gen) {
+      setContextWindowSize(0);
+      if (conversationId) {
+        conversationCache.updateContextWindowSize(conversationId, 0);
+      }
+    }
+  }, [
+    currentConversation?.current_generation,
+    currentConversation?.conversation_id,
+    conversationId,
+  ]);
+
   // Tool progress: maps tool_use_id -> partial output
   const [toolProgress, setToolProgress] = useState<Record<string, ToolProgress>>({});
   // Streaming LLM text: accumulated text from stream deltas
   const [streamingText, setStreamingText] = useState("");
-  const [orchestratorMode, setOrchestratorMode] = useState(false);
   const [subagentBackend, setSubagentBackend] = useState<"shelley" | "claude-cli" | "codex-cli">(
     "shelley",
   );
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const advancedSettingsRef = useRef<HTMLDivElement>(null);
   const cliAgents = window.__SHELLEY_INIT__?.cli_agents || [];
+
+  // Tool registry (fetched from server) and user overrides (persisted to localStorage).
+  // Value "on"/"off" = explicit override. Absent = use the registry's default_on.
+  // Special pseudo-tool name "orchestrator" maps to conversationType.
+  const [availableTools, setAvailableTools] = useState<
+    Array<{ name: string; summary: string; default_on: boolean }>
+  >([]);
+  const TOOL_OVERRIDES_KEY = "shelley.toolOverrides";
+  const [toolOverrides, setToolOverridesState] = useState<Record<string, "on" | "off">>(() => {
+    try {
+      const raw = localStorage.getItem(TOOL_OVERRIDES_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        const clean: Record<string, "on" | "off"> = {};
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (v === "on" || v === "off") clean[k] = v;
+        }
+        return clean;
+      }
+    } catch {
+      /* ignore */
+    }
+    return {};
+  });
+  const setToolOverride = (name: string, value: "default" | "on" | "off") => {
+    setToolOverridesState((prev) => {
+      const next = { ...prev };
+      if (value === "default") delete next[name];
+      else next[name] = value;
+      try {
+        if (Object.keys(next).length === 0) {
+          localStorage.removeItem(TOOL_OVERRIDES_KEY);
+        } else {
+          localStorage.setItem(TOOL_OVERRIDES_KEY, JSON.stringify(next));
+        }
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  };
+  useEffect(() => {
+    api
+      .getTools()
+      .then((r) => setAvailableTools(r.tools))
+      .catch(() => {});
+  }, []);
 
   // Close advanced settings popover on click outside
   useEffect(() => {
@@ -891,6 +1029,27 @@ function ChatInterface({
     setDiffViewerInitialCommit(commit);
     setDiffViewerCwd(cwd);
     setShowDiffViewer(true);
+  }, []);
+
+  // If the URL contains `?diff=<hash>` (e.g. from cmd+clicking "Open diff"
+  // in the git graph in a new tab), open the diff viewer for that commit
+  // once on mount and strip the params from the URL.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const commit = params.get("diff");
+    if (!commit) return;
+    const cwdParam = params.get("cwd") || undefined;
+    setDiffViewerInitialCommit(commit);
+    setDiffViewerCwd(cwdParam);
+    setShowDiffViewer(true);
+    params.delete("diff");
+    params.delete("cwd");
+    const qs = params.toString();
+    window.history.replaceState(
+      {},
+      "",
+      `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`,
+    );
   }, []);
 
   // Navigate to next/previous user message when trigger changes
@@ -1254,7 +1413,7 @@ function ChatInterface({
       // Always update context window size when loading a conversation.
       // If omitted from response (due to omitempty when 0), default to 0.
       setContextWindowSize(response.context_window_size ?? 0);
-      if (onConversationUpdate) {
+      if (onConversationUpdate && response.conversation) {
         onConversationUpdate(response.conversation);
       }
       // Populate cache with the fetched data.
@@ -1308,10 +1467,11 @@ function ChatInterface({
 
     // Use last_sequence_id to resume from where we left off (avoids resending all messages)
     const lastSeqId = lastSequenceIdRef.current;
-    const eventSource = api.createMessageStream(
+    const eventSource = api.createStream({
       conversationId,
-      lastSeqId >= 0 ? lastSeqId : undefined,
-    );
+      lastSequenceId: lastSeqId >= 0 ? lastSeqId : undefined,
+      conversationListHash: conversationListHash ?? undefined,
+    });
     eventSourceRef.current = eventSource;
 
     eventSource.onmessage = (event) => {
@@ -1404,24 +1564,20 @@ function ChatInterface({
           conversationCache.updateConversation(conversationId, streamResponse.conversation);
         }
 
-        // Handle conversation list updates (for other conversations)
-        if (onConversationListUpdate && streamResponse.conversation_list_update) {
-          onConversationListUpdate(streamResponse.conversation_list_update);
+        if (onConversationListPatch && streamResponse.conversation_list_patch) {
+          onConversationListPatch(streamResponse.conversation_list_patch);
         }
 
-        // Handle conversation state updates (explicit from server)
-        if (streamResponse.conversation_state) {
-          // Update the conversations list with new working state
-          if (onConversationStateUpdate) {
-            onConversationStateUpdate(streamResponse.conversation_state);
-          }
-          // Update local state if this is for our conversation
-          if (streamResponse.conversation_state.conversation_id === conversationId) {
-            setAgentWorking(streamResponse.conversation_state.working);
-            // Update selected model from conversation (ensures consistency across sessions)
-            if (streamResponse.conversation_state.model) {
-              setSelectedModel(streamResponse.conversation_state.model);
-            }
+        // Handle conversation state updates for the focused conversation. The
+        // working state of other conversations (and subagents) is delivered via
+        // the conversation list patch stream and applied by App.
+        if (
+          streamResponse.conversation_state &&
+          streamResponse.conversation_state.conversation_id === conversationId
+        ) {
+          setAgentWorking(streamResponse.conversation_state.working);
+          if (streamResponse.conversation_state.model) {
+            setSelectedModel(streamResponse.conversation_state.model);
           }
         }
 
@@ -1514,10 +1670,6 @@ function ChatInterface({
 
     eventSource.onopen = () => {
       console.log("Message stream connected");
-      // Refresh conversations list on reconnect (may have missed updates while disconnected)
-      if (hasConnectedRef.current) {
-        onReconnect?.();
-      }
       hasConnectedRef.current = true;
       // Reset reconnect attempts and clear periodic retry on successful connection
       setReconnectAttempts(0);
@@ -1530,7 +1682,7 @@ function ChatInterface({
       // Start heartbeat timeout monitoring
       resetHeartbeatTimeout();
     };
-  }, [conversationId, onConversationUpdate, onConversationListUpdate, onConversationStateUpdate]);
+  }, [conversationId, conversationListHash, onConversationUpdate, onConversationListPatch]);
 
   // Force-reconnect: close existing connection and reconnect to get missed messages
   const forceReconnect = useCallback(() => {
@@ -1639,11 +1791,72 @@ function ChatInterface({
     }
   }, [conversationId]);
 
+  // Send the first message of a brand-new conversation. Validates the cwd,
+  // resolves orchestrator/tool-override settings, and delegates to the
+  // onFirstMessage prop (which creates the conversation on the server).
+  const sendFirstMessage = async (prompt: string) => {
+    if (!onFirstMessage) return;
+    if (selectedCwd) {
+      const validation = await api.validateCwd(selectedCwd);
+      if (!validation.valid) {
+        throw new Error(`Invalid working directory: ${validation.error}`);
+      }
+    }
+    const orchestratorOn = toolOverrides["orchestrator"] === "on";
+    // Filter to only real tool overrides (exclude the "orchestrator" pseudo-tool).
+    const realOverrides: Record<string, "on" | "off"> = {};
+    for (const [k, v] of Object.entries(toolOverrides)) {
+      if (k === "orchestrator") continue;
+      realOverrides[k] = v;
+    }
+    await onFirstMessage(
+      prompt,
+      selectedModel,
+      selectedCwd || undefined,
+      orchestratorOn ? "orchestrator" : undefined,
+      orchestratorOn ? subagentBackend : undefined,
+      Object.keys(realOverrides).length > 0 ? realOverrides : undefined,
+    );
+  };
+
   const sendMessage = async (message: string) => {
     if (!message.trim() || sending) return;
 
-    // Check if this is a shell command (starts with "!")
     const trimmedMessage = message.trim();
+
+    // Slash commands.
+    // "/diff" opens the diff viewer (mirroring the command palette action).
+    // "/new <prompt>" starts a new conversation and sends <prompt> as the
+    // first message; "/new" with no prompt just clears the conversation.
+    if (trimmedMessage === "/diff") {
+      setShowDiffViewer(true);
+      return;
+    }
+    if (trimmedMessage === "/new" || trimmedMessage.startsWith("/new ")) {
+      const prompt = trimmedMessage.slice("/new".length).trim();
+      // Clear current conversation (carries cwd over via localStorage).
+      onNewConversation();
+      if (!prompt || !onFirstMessage) return;
+      try {
+        setSending(true);
+        setError(null);
+        setAgentWorking(true);
+        setStreamingText("");
+        await sendFirstMessage(prompt);
+      } catch (err) {
+        console.error("Failed to send /new message:", err);
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        setError(msg);
+        setAgentWorking(false);
+        // Don't rethrow: the conversation has already been reset, so there's
+        // nothing useful for MessageInput to restore the text into.
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+
+    // Check if this is a shell command (starts with "!")
     if (trimmedMessage.startsWith("!")) {
       const shellCommand = trimmedMessage.slice(1).trim();
       if (shellCommand) {
@@ -1675,22 +1888,9 @@ function ChatInterface({
       setAgentWorking(true);
       setStreamingText("");
 
-      // If no conversation ID, this is the first message - validate cwd first
+      // If no conversation ID, this is the first message.
       if (!conversationId && onFirstMessage) {
-        // Validate cwd if provided
-        if (selectedCwd) {
-          const validation = await api.validateCwd(selectedCwd);
-          if (!validation.valid) {
-            throw new Error(`Invalid working directory: ${validation.error}`);
-          }
-        }
-        await onFirstMessage(
-          message.trim(),
-          selectedModel,
-          selectedCwd || undefined,
-          orchestratorMode ? "orchestrator" : undefined,
-          orchestratorMode ? subagentBackend : undefined,
-        );
+        await sendFirstMessage(message.trim());
       } else if (conversationId) {
         await api.sendMessage(conversationId, {
           message: message.trim(),
@@ -1710,11 +1910,30 @@ function ChatInterface({
 
   const scrollToBottom = () => {
     const container = messagesContainerRef.current;
-    if (container) {
-      container.scrollTop = container.scrollHeight;
-    }
+    if (!container) return;
     userScrolledRef.current = false;
     setShowScrollToBottom(false);
+    // Content below the viewport often lays out lazily (markdown, code
+    // highlighting, images, tool outputs). A single scrollTop assignment
+    // can land short of the real bottom because scrollHeight grows
+    // after layout settles. Re-pin to the bottom across a few frames
+    // and stop early once it's stable.
+    let lastHeight = -1;
+    let stableCount = 0;
+    let frames = 0;
+    const step = () => {
+      if (!messagesContainerRef.current) return;
+      const el = messagesContainerRef.current;
+      el.scrollTop = el.scrollHeight;
+      if (el.scrollHeight === lastHeight) {
+        if (++stableCount >= 3) return; // height stable for 3 frames -> done
+      } else {
+        stableCount = 0;
+        lastHeight = el.scrollHeight;
+      }
+      if (++frames < 60) requestAnimationFrame(step); // ~1s budget
+    };
+    requestAnimationFrame(step);
   };
 
   // Callback for terminals to insert text into the message input
@@ -1728,6 +1947,13 @@ function ChatInterface({
       setShowDiffViewer(true);
     }
   }, [openDiffViewerTrigger]);
+
+  // Handle external trigger to open git graph viewer
+  useEffect(() => {
+    if (openGitGraphTrigger && openGitGraphTrigger > 0) {
+      setShowGitGraph(true);
+    }
+  }, [openGitGraphTrigger]);
 
   const handleCancel = async () => {
     if (!conversationId || cancelling) return;
@@ -1744,24 +1970,19 @@ function ChatInterface({
     }
   };
 
-  // Handler to distill and continue conversation
-  const handleDistillConversation = async () => {
-    if (!conversationId || !onDistillConversation) return;
-    await onDistillConversation(
+  const handleDistillNewGeneration = async () => {
+    if (!conversationId || !onDistillNewGeneration) return;
+    await onDistillNewGeneration(
       conversationId,
       selectedModel,
       currentConversation?.cwd || selectedCwd || undefined,
     );
   };
 
-  // Handler to distill and replace conversation in place
-  const handleDistillReplaceConversation = async () => {
-    if (!conversationId || !onDistillReplaceConversation) return;
-    await onDistillReplaceConversation(
-      conversationId,
-      selectedModel,
-      currentConversation?.cwd || selectedCwd || undefined,
-    );
+  const handleStartNewGeneration = async () => {
+    if (!conversationId) return;
+    const conversation = await api.startNewGeneration(conversationId);
+    onConversationUpdate?.(conversation);
   };
 
   // Get the display name for the selected model
@@ -1841,12 +2062,12 @@ function ChatInterface({
         if (!isDistillStatusMessage(message) && !isToolApprovalRequestMessage(message)) {
           return;
         }
-        items.push({ type: "message", message });
+        items.push({ type: "message", generation: message.generation, message });
         return;
       }
 
       if (message.type === "error") {
-        items.push({ type: "message", message });
+        items.push({ type: "message", generation: message.generation, message });
         return;
       }
 
@@ -1866,7 +2087,7 @@ function ChatInterface({
 
       // If it's a user message without tool results, show it
       if (message.type === "user" && !hasToolResult) {
-        items.push({ type: "message", message });
+        items.push({ type: "message", generation: message.generation, message });
         return;
       }
 
@@ -1900,7 +2121,7 @@ function ChatInterface({
               .join("")
               .trim();
             if (textString) {
-              items.push({ type: "message", message });
+              items.push({ type: "message", generation: message.generation, message });
             }
 
             // Check if this message was truncated (tool calls lost)
@@ -1912,6 +2133,7 @@ function ChatInterface({
               const displayData = toolUse.ID ? displayDataMap[toolUse.ID] : undefined;
               items.push({
                 type: "tool",
+                generation: message.generation,
                 toolUseId: toolUse.ID,
                 toolName: toolUse.ToolName,
                 toolInput: toolUse.ToolInput,
@@ -1928,15 +2150,23 @@ function ChatInterface({
           }
         } catch (err) {
           console.error("Failed to parse message LLM data:", err);
-          items.push({ type: "message", message });
+          items.push({ type: "message", generation: message.generation, message });
         }
       } else {
-        items.push({ type: "message", message });
+        items.push({ type: "message", generation: message.generation, message });
       }
     });
 
     return items;
   }, [messages]);
+
+  const generationDivider = (from: number, to: number) => (
+    <div key={`generation-divider-${from}-${to}`} className="generation-divider">
+      <span>
+        New generation started — older messages are retained here but no longer sent to the LLM.
+      </span>
+    </div>
+  );
 
   const renderMessages = () => {
     if (messages.length === 0) {
@@ -1988,61 +2218,178 @@ function ChatInterface({
       );
     }
 
-    const rendered = coalescedItems.map((item, index) => {
-      if (item.type === "message" && item.message) {
-        return (
-          <MessageComponent
-            key={item.message.message_id}
-            message={item.message}
-            conversationId={conversationId ?? undefined}
-            onOpenDiffViewer={handleOpenDiffViewer}
-            onCommentTextChange={setDiffCommentText}
-            onCancelQueued={isQueuedMessage(item.message) ? cancelQueuedMessages : undefined}
-            toolProgress={toolProgress}
-          />
-        );
-      } else if (item.type === "tool") {
-        return (
-          <CoalescedToolCall
-            key={item.toolUseId || `tool-${index}`}
-            toolName={item.toolName || "Unknown Tool"}
-            toolInput={item.toolInput}
-            toolResult={item.toolResult}
-            toolError={item.toolError}
-            toolStartTime={item.toolStartTime}
-            toolEndTime={item.toolEndTime}
-            hasResult={item.hasResult}
-            display={item.display}
-            onCommentTextChange={setDiffCommentText}
-            streamingOutput={item.toolUseId ? toolProgress[item.toolUseId]?.output : undefined}
-          />
-        );
+    const currentGeneration = currentConversation?.current_generation || 1;
+    const systemMessagesByGeneration = new Map<number, Message[]>();
+    const modelsByGeneration = new Map<number, string>();
+    const itemsByGeneration = new Map<number, CoalescedItem[]>();
+    const generationSet = new Set<number>();
+
+    messages.forEach((message) => {
+      generationSet.add(message.generation);
+      if (message.type === "system" && !isDistillStatusMessage(message)) {
+        const existing = systemMessagesByGeneration.get(message.generation) || [];
+        existing.push(message);
+        systemMessagesByGeneration.set(message.generation, existing);
       }
-      return null;
+      if (!modelsByGeneration.has(message.generation) && message.usage_data) {
+        try {
+          const usage =
+            typeof message.usage_data === "string"
+              ? JSON.parse(message.usage_data)
+              : message.usage_data;
+          if (usage?.model) {
+            modelsByGeneration.set(message.generation, usage.model);
+          }
+        } catch {
+          // ignore malformed usage data
+        }
+      }
     });
 
-    // Find system prompt message to render at the top (exclude distill status messages)
-    const systemMessage = messages.find((m) => m.type === "system" && !isDistillStatusMessage(m));
+    coalescedItems.forEach((item) => {
+      generationSet.add(item.generation);
+      const existing = itemsByGeneration.get(item.generation) || [];
+      existing.push(item);
+      itemsByGeneration.set(item.generation, existing);
+    });
 
-    // Streaming text preview: show when agent is generating text
+    // Always include the current generation so the divider/section appears
+    // immediately when a new generation is started, even before any new
+    // messages exist for it.
+    generationSet.add(currentGeneration);
+
+    const generations = Array.from(generationSet).sort((a, b) => a - b);
+
+    // Track the most recent timestamp we've shown so we only emit a new one
+    // when the wall-clock minute (or day) advances. State is mutated as we
+    // walk through items in order.
+    const tsState: { lastMin: number | null; lastDay: string | null; now: Date } = {
+      lastMin: null,
+      lastDay: null,
+      now: new Date(),
+    };
+
+    const itemTime = (item: CoalescedItem): string | null => {
+      if (item.type === "tool") return item.toolStartTime || null;
+      return item.message?.created_at || null;
+    };
+
+    const maybeTimestamp = (iso: string | null, keyPrefix: string): React.ReactNode | null => {
+      if (!iso) return null;
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return null;
+      const minBucket = Math.floor(d.getTime() / 60_000);
+      const dayKey = d.toDateString();
+      if (tsState.lastMin === minBucket && tsState.lastDay === dayKey) return null;
+      const showDay = tsState.lastDay !== dayKey;
+      tsState.lastMin = minBucket;
+      tsState.lastDay = dayKey;
+      return (
+        <React.Fragment key={`ts-${keyPrefix}`}>
+          {showDay && (
+            <div className="message-day-separator" data-testid="message-day-separator">
+              <span>{formatDay(d, tsState.now)}</span>
+            </div>
+          )}
+          <MessageTimestamp createdAt={iso} />
+        </React.Fragment>
+      );
+    };
+
+    const rendered = generations.flatMap((generation, generationIndex) => {
+      const items = itemsByGeneration.get(generation) || [];
+      const sectionItems: React.ReactNode[] = [
+        <ModelBar
+          key={`model-bar-${generation}`}
+          model={modelsByGeneration.get(generation) || currentConversation?.model}
+          models={models}
+        />,
+      ];
+      const systemMessages = systemMessagesByGeneration.get(generation) || [];
+      systemMessages.forEach((systemMessage) => {
+        sectionItems.push(
+          <SystemPromptView
+            key={`system-prompt-${systemMessage.message_id}`}
+            message={systemMessage}
+          />,
+        );
+      });
+
+      items.forEach((item, index) => {
+        const tsNode = maybeTimestamp(
+          itemTime(item),
+          item.message?.message_id || item.toolUseId || `g${generation}-i${index}`,
+        );
+        if (tsNode) sectionItems.push(tsNode);
+        if (item.type === "message" && item.message) {
+          sectionItems.push(
+            <MessageComponent
+              key={item.message.message_id}
+              message={item.message}
+              conversationId={conversationId ?? undefined}
+              onOpenDiffViewer={handleOpenDiffViewer}
+              onCommentTextChange={setDiffCommentText}
+              onCancelQueued={isQueuedMessage(item.message) ? cancelQueuedMessages : undefined}
+              toolProgress={toolProgress}
+            />,
+          );
+        } else if (item.type === "tool") {
+          sectionItems.push(
+            <CoalescedToolCall
+              key={item.toolUseId || `tool-${generation}-${item.toolName || "unknown"}-${index}`}
+              toolName={item.toolName || "Unknown Tool"}
+              toolInput={item.toolInput}
+              toolResult={item.toolResult}
+              toolError={item.toolError}
+              toolStartTime={item.toolStartTime}
+              toolEndTime={item.toolEndTime}
+              hasResult={item.hasResult}
+              display={item.display}
+              onCommentTextChange={setDiffCommentText}
+              streamingOutput={item.toolUseId ? toolProgress[item.toolUseId]?.output : undefined}
+            />,
+          );
+        }
+      });
+
+      const nodes: React.ReactNode[] = [];
+      if (generationIndex > 0) {
+        nodes.push(generationDivider(generations[generationIndex - 1], generation));
+      }
+      nodes.push(
+        <div
+          key={`generation-section-${generation}`}
+          className={`generation-section${generation < currentGeneration ? " generation-section-previous" : ""}`}
+        >
+          {sectionItems}
+        </div>,
+      );
+      return nodes;
+    });
+
+    // Streaming text preview: show when agent is generating text.
+    // Render markdown the same way as completed agent messages so the
+    // transition from streaming to final isn't visually jarring.
     const streamingPreview =
       streamingText && agentWorking ? (
         <div key="streaming-preview" className="message message-agent streaming-message">
           <div className="message-content" data-testid="message-content">
-            <div className="whitespace-pre-wrap break-words">
-              {streamingText}
-              <span className="streaming-cursor">▊</span>
-            </div>
+            {markdownMode === "off" ? (
+              <div className="whitespace-pre-wrap break-words">
+                {streamingText}
+                <span className="streaming-cursor">▊</span>
+              </div>
+            ) : (
+              <div className="streaming-markdown">
+                <MarkdownContent text={streamingText} />
+                <span className="streaming-cursor">▊</span>
+              </div>
+            )}
           </div>
         </div>
       ) : null;
 
-    return [
-      <ModelBar key="model-bar" model={currentConversation?.model} models={models} />,
-      systemMessage && <SystemPromptView key="system-prompt" message={systemMessage} />,
-      ...rendered,
-      streamingPreview,
-    ];
+    return [...rendered, streamingPreview];
   };
 
   // Status bar content — rendered in the standalone status bar (desktop) and
@@ -2104,6 +2451,14 @@ function ChatInterface({
             <span className="status-stop-label">{cancelling ? "Cancelling..." : "Stop"}</span>
           </button>
         </div>
+        {(currentConversation?.cwd || selectedCwd) && (
+          <span
+            className="status-cwd-readonly hide-on-mobile"
+            title={currentConversation?.cwd || selectedCwd}
+          >
+            {tildifyPath(currentConversation?.cwd || selectedCwd)}
+          </span>
+        )}
         <ContextUsageBar
           contextWindowSize={contextWindowSize}
           maxContextTokens={
@@ -2111,10 +2466,8 @@ function ChatInterface({
           }
           conversationId={conversationId}
           modelName={selectedModelDisplayName}
-          onDistillConversation={onDistillConversation ? handleDistillConversation : undefined}
-          onDistillReplaceConversation={
-            onDistillReplaceConversation ? handleDistillReplaceConversation : undefined
-          }
+          onDistillNewGeneration={onDistillNewGeneration ? handleDistillNewGeneration : undefined}
+          onStartNewGeneration={handleStartNewGeneration}
           agentWorking={agentWorking}
         />
       </div>
@@ -2135,7 +2488,9 @@ function ChatInterface({
           />
           <div className="advanced-settings-wrapper" ref={advancedSettingsRef}>
             <button
-              className={`advanced-settings-trigger${orchestratorMode ? " active" : ""}`}
+              className={`advanced-settings-trigger${
+                Object.keys(toolOverrides).length > 0 ? " active" : ""
+              }`}
               onClick={() => setShowAdvancedSettings(!showAdvancedSettings)}
               title="Advanced settings"
               disabled={sending}
@@ -2156,59 +2511,101 @@ function ChatInterface({
             </button>
             {showAdvancedSettings && (
               <div className="advanced-settings-popover">
-                <div className="advanced-settings-header">Advanced Settings</div>
-                <label className="orchestrator-toggle">
-                  <input
-                    type="checkbox"
-                    checked={orchestratorMode}
-                    onChange={(e) => {
-                      setOrchestratorMode(e.target.checked);
-                      if (!e.target.checked) setSubagentBackend("shelley");
-                    }}
-                    disabled={sending}
-                  />
-                  <span className="orchestrator-toggle-label">
-                    <svg
-                      width="14"
-                      height="14"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <circle cx="12" cy="5" r="3" />
-                      <circle cx="5" cy="19" r="3" />
-                      <circle cx="19" cy="19" r="3" />
-                      <line x1="12" y1="8" x2="5" y2="16" />
-                      <line x1="12" y1="8" x2="19" y2="16" />
-                    </svg>
-                    Orchestrator
-                    <span className="experimental-badge">experimental</span>
-                  </span>
-                </label>
-                {orchestratorMode && (
-                  <div className="orchestrator-backend-select">
-                    <label className="orchestrator-backend-label">Subagent backend</label>
-                    <select
-                      className="orchestrator-backend-dropdown"
-                      value={subagentBackend}
-                      onChange={(e) =>
-                        setSubagentBackend(e.target.value as "shelley" | "claude-cli" | "codex-cli")
+                <div className="advanced-settings-header">
+                  <span>Tools</span>
+                  <button
+                    type="button"
+                    className="advanced-settings-reset"
+                    onClick={() => {
+                      setToolOverridesState({});
+                      try {
+                        localStorage.removeItem(TOOL_OVERRIDES_KEY);
+                      } catch {
+                        /* ignore */
                       }
-                      disabled={sending}
-                    >
-                      <option value="shelley">Shelley (native)</option>
-                      {cliAgents.includes("claude-cli") && (
-                        <option value="claude-cli">Claude CLI</option>
-                      )}
-                      {cliAgents.includes("codex-cli") && (
-                        <option value="codex-cli">Codex CLI</option>
-                      )}
-                    </select>
-                  </div>
-                )}
+                    }}
+                    disabled={Object.keys(toolOverrides).length === 0}
+                    title="Clear all overrides"
+                  >
+                    Reset to defaults
+                  </button>
+                </div>
+                <div className="tool-override-list">
+                  {[
+                    {
+                      name: "orchestrator",
+                      summary: "Shelley orchestrator mode (delegates to subagents).",
+                      default_on: false,
+                    },
+                    ...availableTools,
+                  ].map((tool) => {
+                    const override = toolOverrides[tool.name];
+                    const current: "default" | "on" | "off" = override || "default";
+                    return (
+                      <React.Fragment key={tool.name}>
+                        <div className="tool-override-row">
+                          <div className="tool-override-info">
+                            <span className="tool-override-name">{tool.name}</span>
+                            {tool.name === "orchestrator" && (
+                              <span className="experimental-badge">experimental</span>
+                            )}
+                            <span className="tool-override-summary">{tool.summary}</span>
+                          </div>
+                          <div className="tool-override-choices" role="radiogroup">
+                            {(
+                              [
+                                ["default", `Default (${tool.default_on ? "on" : "off"})`],
+                                ["on", "On"],
+                                ["off", "Off"],
+                              ] as const
+                            ).map(([val, label]) => (
+                              <button
+                                key={val}
+                                type="button"
+                                role="radio"
+                                aria-checked={current === val}
+                                className={`tool-override-choice${current === val ? " active" : ""}`}
+                                onClick={() => setToolOverride(tool.name, val)}
+                                disabled={sending}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        {tool.name === "orchestrator" && toolOverrides["orchestrator"] === "on" && (
+                          <div className="tool-override-row tool-override-suboption">
+                            <label
+                              className="tool-override-suboption-label"
+                              htmlFor="subagent-backend-select"
+                            >
+                              Subagent backend
+                            </label>
+                            <select
+                              id="subagent-backend-select"
+                              className="orchestrator-backend-dropdown"
+                              value={subagentBackend}
+                              onChange={(e) =>
+                                setSubagentBackend(
+                                  e.target.value as "shelley" | "claude-cli" | "codex-cli",
+                                )
+                              }
+                              disabled={sending}
+                            >
+                              <option value="shelley">Shelley (native)</option>
+                              {cliAgents.includes("claude-cli") && (
+                                <option value="claude-cli">Claude CLI</option>
+                              )}
+                              {cliAgents.includes("codex-cli") && (
+                                <option value="codex-cli">Codex CLI</option>
+                              )}
+                            </select>
+                          </div>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>
@@ -2234,6 +2631,14 @@ function ChatInterface({
           <span className="hide-on-mobile">Ready on </span>
           {hostname}
         </span>
+        {(currentConversation?.cwd || selectedCwd) && (
+          <span
+            className="status-cwd-readonly hide-on-mobile"
+            title={currentConversation?.cwd || selectedCwd}
+          >
+            {tildifyPath(currentConversation?.cwd || selectedCwd)}
+          </span>
+        )}
         <ContextUsageBar
           contextWindowSize={contextWindowSize}
           maxContextTokens={
@@ -2241,10 +2646,8 @@ function ChatInterface({
           }
           conversationId={conversationId}
           modelName={selectedModelDisplayName}
-          onDistillConversation={onDistillConversation ? handleDistillConversation : undefined}
-          onDistillReplaceConversation={
-            onDistillReplaceConversation ? handleDistillReplaceConversation : undefined
-          }
+          onDistillNewGeneration={onDistillNewGeneration ? handleDistillNewGeneration : undefined}
+          onStartNewGeneration={handleStartNewGeneration}
           agentWorking={agentWorking}
         />
       </div>
@@ -2351,6 +2754,33 @@ function ChatInterface({
                       />
                     </svg>
                     {t("diffs")}
+                  </button>
+                )}
+                {(currentConversation?.cwd || selectedCwd) && (
+                  <button
+                    onClick={() => {
+                      setShowOverflowMenu(false);
+                      setShowGitGraph(true);
+                    }}
+                    className="overflow-menu-item"
+                  >
+                    <svg
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                      className="chat-menu-icon"
+                    >
+                      <circle cx="6" cy="6" r="2" strokeWidth={2} />
+                      <circle cx="6" cy="18" r="2" strokeWidth={2} />
+                      <circle cx="18" cy="12" r="2" strokeWidth={2} />
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M6 8v8M8 6h2a4 4 0 014 4v0M8 18h2a4 4 0 004-4v0"
+                      />
+                    </svg>
+                    {t("gitGraph")}
                   </button>
                 )}
                 {terminalURL && (
@@ -2708,37 +3138,56 @@ function ChatInterface({
           )}
         </div>
 
-        {/* Scroll to bottom button - outside scrollable area */}
-        {showScrollToBottom && (
-          <button
-            className="scroll-to-bottom-button"
-            onClick={scrollToBottom}
-            aria-label="Scroll to bottom"
-          >
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" className="chat-scroll-icon">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M19 14l-7 7m0 0l-7-7m7 7V3"
-              />
-            </svg>
-          </button>
+        {/* Floating nav cluster: TOC + scroll-to-bottom */}
+        {conversationId && messages.length > 0 && (
+          <div className="chat-nav-cluster">
+            <ConversationTOC
+              messages={messages}
+              containerRef={messagesContainerRef}
+              conversationSlug={currentConversation?.slug}
+            />
+            {showScrollToBottom && (
+              <button
+                className="scroll-to-bottom-button"
+                onClick={scrollToBottom}
+                aria-label="Scroll to bottom"
+                title="Scroll to bottom"
+              >
+                <svg
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  className="chat-scroll-icon"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M19 14l-7 7m0 0l-7-7m7 7V3"
+                  />
+                </svg>
+              </button>
+            )}
+          </div>
         )}
       </div>
 
       {/* Terminal Panel - between messages and status bar */}
       <TerminalPanel
         terminals={ephemeralTerminals}
-        onClose={(id) => setEphemeralTerminals((prev) => prev.filter((t) => t.id !== id))}
+        onAttached={onTerminalAttached}
+        onClose={(id) => {
+          if (onTerminalClose) {
+            onTerminalClose(id);
+          } else {
+            setEphemeralTerminals((prev) => prev.filter((t) => t.id !== id));
+          }
+        }}
         onInsertIntoInput={handleInsertFromTerminal}
         autoFocusId={terminalAutoFocusId}
         onAutoFocusConsumed={() => setTerminalAutoFocusId(null)}
         onActiveTerminalExited={() => {
-          const input = document.querySelector<HTMLTextAreaElement>(
-            '[data-testid="message-input"]',
-          );
-          input?.focus();
+          focusMessageInputIfUnfocused();
         }}
       />
 
@@ -2785,6 +3234,27 @@ function ChatInterface({
         initialPath={selectedCwd}
       />
 
+      <MessageSelectionToolbar onComment={handleMessageComment} />
+
+      {/* Git Graph Viewer */}
+      <GitGraphViewer
+        cwd={(diffViewerCwd || currentConversation?.cwd || selectedCwd) as string}
+        isOpen={showGitGraph}
+        covered={showDiffViewer}
+        onClose={() => {
+          setShowGitGraph(false);
+          focusMessageInputIfUnfocused();
+        }}
+        onOpenDiff={(commit, cwd) => {
+          // Leave the graph mounted underneath so closing the diff returns
+          // here. ChatInterface keeps both `showGitGraph` and `showDiffViewer`
+          // true; DiffViewer renders last so it stacks on top.
+          setDiffViewerInitialCommit(commit);
+          setDiffViewerCwd(cwd);
+          setShowDiffViewer(true);
+        }}
+      />
+
       {/* Diff Viewer */}
       <DiffViewer
         cwd={diffViewerCwd || currentConversation?.cwd || selectedCwd}
@@ -2793,6 +3263,9 @@ function ChatInterface({
           setShowDiffViewer(false);
           setDiffViewerInitialCommit(undefined);
           setDiffViewerCwd(undefined);
+          // If the git graph is still mounted underneath, let it reclaim
+          // focus; otherwise return focus to the chat input.
+          if (!showGitGraph) focusMessageInputIfUnfocused();
         }}
         onCommentTextChange={setDiffCommentText}
         initialCommit={diffViewerInitialCommit}

@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 )
 
 func TestUploadEndpoint(t *testing.T) {
+	t.Parallel()
 	server, _, _ := newTestServer(t)
 
 	// Create a multipart form with a file
@@ -55,9 +57,9 @@ func TestUploadEndpoint(t *testing.T) {
 		t.Fatal("response missing 'path' field")
 	}
 
-	// Verify the path is in the screenshot directory
-	if !strings.HasPrefix(path, browse.ScreenshotDir) {
-		t.Errorf("expected path to start with %s, got %s", browse.ScreenshotDir, path)
+	// Verify the path is in the upload directory
+	if !strings.HasPrefix(path, browse.UploadDir) {
+		t.Errorf("expected path to start with %s, got %s", browse.UploadDir, path)
 	}
 
 	// Verify the file has the correct extension
@@ -80,6 +82,7 @@ func TestUploadEndpoint(t *testing.T) {
 }
 
 func TestUploadEndpointMethodNotAllowed(t *testing.T) {
+	t.Parallel()
 	server, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest("GET", "/api/upload", nil)
@@ -93,6 +96,7 @@ func TestUploadEndpointMethodNotAllowed(t *testing.T) {
 }
 
 func TestUploadEndpointNoFile(t *testing.T) {
+	t.Parallel()
 	server, _, _ := newTestServer(t)
 
 	// Create an empty multipart form
@@ -111,7 +115,205 @@ func TestUploadEndpointNoFile(t *testing.T) {
 	}
 }
 
+func TestUploadRawEndpoint(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	body := []byte("raw video bytes")
+	req := httptest.NewRequest("POST", "/api/upload/raw?filename=clip.mp4", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	server.handleUploadRaw(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	path := response["path"]
+	defer os.Remove(path)
+
+	if !strings.HasPrefix(path, browse.UploadDir) {
+		t.Errorf("expected path to start with %s, got %s", browse.UploadDir, path)
+	}
+	if filepath.Ext(path) != ".mp4" {
+		t.Errorf("expected .mp4 extension, got %q", filepath.Ext(path))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read uploaded file: %v", err)
+	}
+	if !bytes.Equal(data, body) {
+		t.Errorf("uploaded file content mismatch")
+	}
+}
+
+func TestUploadRawPreservesFilenameWhenSafe(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	unique := "raw-keep-" + filepath.Base(t.TempDir()) + ".bin"
+	body := []byte("preserved-name body")
+	req := httptest.NewRequest("POST", "/api/upload/raw?filename="+unique, bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	server.handleUploadRaw(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	path := response["path"]
+	defer os.Remove(path)
+	if got := filepath.Base(path); got != unique {
+		t.Errorf("expected basename %q, got %q", unique, got)
+	}
+}
+
+func TestUploadRawStripsPathTraversal(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	unique := "traversal-" + filepath.Base(t.TempDir()) + ".bin"
+	hostile := "../../../" + unique
+	req := httptest.NewRequest(
+		"POST",
+		"/api/upload/raw?filename="+url.QueryEscape(hostile),
+		bytes.NewReader([]byte("ok")),
+	)
+	w := httptest.NewRecorder()
+
+	server.handleUploadRaw(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	path := response["path"]
+	defer os.Remove(path)
+	if !strings.HasPrefix(path, browse.UploadDir+"/") {
+		t.Errorf("upload escaped %s: %s", browse.UploadDir, path)
+	}
+	if filepath.Base(path) != unique {
+		t.Errorf("expected basename %q, got %q", unique, filepath.Base(path))
+	}
+}
+
+func TestUploadRawCollisionSuffix(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	name := "collide-" + filepath.Base(t.TempDir()) + ".bin"
+
+	first := bytes.NewReader([]byte("first"))
+	req1 := httptest.NewRequest("POST", "/api/upload/raw?filename="+name, first)
+	w1 := httptest.NewRecorder()
+	server.handleUploadRaw(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first upload failed: %s", w1.Body.String())
+	}
+	var resp1 map[string]string
+	_ = json.Unmarshal(w1.Body.Bytes(), &resp1)
+	defer os.Remove(resp1["path"])
+
+	second := bytes.NewReader([]byte("second"))
+	req2 := httptest.NewRequest("POST", "/api/upload/raw?filename="+name, second)
+	w2 := httptest.NewRecorder()
+	server.handleUploadRaw(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second upload failed: %s", w2.Body.String())
+	}
+	var resp2 map[string]string
+	_ = json.Unmarshal(w2.Body.Bytes(), &resp2)
+	defer os.Remove(resp2["path"])
+
+	if resp1["path"] == resp2["path"] {
+		t.Fatalf("collision should produce distinct paths; both got %q", resp1["path"])
+	}
+	if filepath.Ext(resp2["path"]) != filepath.Ext(name) {
+		t.Errorf("expected extension %q preserved, got %q", filepath.Ext(name), filepath.Ext(resp2["path"]))
+	}
+	got, err := os.ReadFile(resp1["path"])
+	if err != nil || string(got) != "first" {
+		t.Errorf("first file content mismatch: %q, err %v", got, err)
+	}
+}
+
+func TestUploadRawEndpointRequiresFilename(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/upload/raw", strings.NewReader("raw bytes"))
+	w := httptest.NewRecorder()
+
+	server.handleUploadRaw(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var response uploadErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if response.Error != "filename_required" || response.Message != "filename required" {
+		t.Fatalf("unexpected error response: %+v", response)
+	}
+}
+
+func TestUploadRoutesRawEndpoint(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	body := []byte("raw route bytes")
+	req := httptest.NewRequest("POST", "/api/upload/raw?filename=route.bin", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	defer os.Remove(response["path"])
+}
+
+func TestUploadRawProbeRespondsToGET(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest("GET", "/api/upload/raw", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if body := w.Body.Bytes(); len(body) != 0 {
+		t.Fatalf("expected empty body, got %q", body)
+	}
+}
+
 func TestUploadedFileCanBeReadViaReadEndpoint(t *testing.T) {
+	t.Parallel()
 	server, _, _ := newTestServer(t)
 
 	// First, upload a file
@@ -178,6 +380,7 @@ func TestUploadedFileCanBeReadViaReadEndpoint(t *testing.T) {
 }
 
 func TestUploadPreservesFileExtension(t *testing.T) {
+	t.Parallel()
 	server, _, _ := newTestServer(t)
 
 	testCases := []struct {
@@ -228,4 +431,41 @@ func TestUploadPreservesFileExtension(t *testing.T) {
 			os.Remove(path)
 		})
 	}
+}
+
+func TestUploadLargeFile(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newTestServer(t)
+
+	// 64 MiB — larger than the old 10 MiB cap, well under the 1 GiB cap.
+	// This used to spill to a temp file via ParseMultipartForm and would have
+	// been rejected with 400 "http: request body too large".
+	const size = 64 * 1024 * 1024
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "clip.mp4")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	chunk := make([]byte, 64*1024)
+	for written := 0; written < size; written += len(chunk) {
+		if _, err := part.Write(chunk); err != nil {
+			t.Fatalf("write chunk: %v", err)
+		}
+	}
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	server.handleUpload(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	os.Remove(response["path"])
 }

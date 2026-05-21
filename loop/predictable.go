@@ -59,6 +59,11 @@ func (s *PredictableService) MaxImageDimension() int {
 	return 2000
 }
 
+// MaxImageBytes returns the maximum allowed encoded image size in bytes.
+func (s *PredictableService) MaxImageBytes() int {
+	return 5 * 1024 * 1024
+}
+
 // Do processes a request and returns a predictable response based on the input text
 func (s *PredictableService) Do(ctx context.Context, req *llm.Request) (*llm.Response, error) {
 	// Store request for testing inspection
@@ -757,6 +762,15 @@ func (s *PredictableService) makeToolSmorgasbordResponse(inputTokens uint64) *ll
 		Type:      llm.ContentTypeToolUse,
 		ToolName:  "browser",
 		ToolInput: json.RawMessage(screencastInput),
+	})
+
+	// shell tool (yielding successor to bash; should reuse BashTool widget)
+	shellInput, _ := json.Marshal(map[string]string{"command": "echo 'hello from shell'"})
+	content = append(content, llm.Content{
+		ID:        fmt.Sprintf("tool_shell_%d", (baseNano+15)%1000),
+		Type:      llm.ContentTypeToolUse,
+		ToolName:  "shell",
+		ToolInput: json.RawMessage(shellInput),
 	})
 
 	return &llm.Response{

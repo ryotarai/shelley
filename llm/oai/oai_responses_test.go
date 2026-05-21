@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"shelley.exe.dev/llm"
@@ -122,6 +123,123 @@ func TestFromLLMMessageResponses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFromLLMMessageResponsesWithImage(t *testing.T) {
+	items := fromLLMMessageResponses(llm.Message{
+		Role: llm.MessageRoleUser,
+		Content: []llm.Content{
+			{Type: llm.ContentTypeText, Text: "What is in this image?"},
+			{Type: llm.ContentTypeText, MediaType: "image/png", Data: "abc123"},
+		},
+	})
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if len(items[0].Content) != 2 {
+		t.Fatalf("expected 2 content parts, got %d", len(items[0].Content))
+	}
+	if items[0].Content[0].Type != "input_text" || items[0].Content[0].Text != "What is in this image?" {
+		t.Errorf("unexpected text content: %+v", items[0].Content[0])
+	}
+	if items[0].Content[1].Type != "input_image" || items[0].Content[1].ImageURL != "data:image/png;base64,abc123" {
+		t.Errorf("unexpected image content: %+v", items[0].Content[1])
+	}
+}
+
+func TestFromLLMMessageResponsesWithImageOnlyAndMultipleImages(t *testing.T) {
+	items := fromLLMMessageResponses(llm.Message{
+		Role: llm.MessageRoleUser,
+		Content: []llm.Content{
+			{Type: llm.ContentTypeText, MediaType: "image/png", Data: "first"},
+			{Type: llm.ContentTypeText, Text: "between"},
+			{Type: llm.ContentTypeText, MediaType: "image/jpeg", Data: "second"},
+		},
+	})
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if len(items[0].Content) != 3 {
+		t.Fatalf("expected 3 content parts, got %d", len(items[0].Content))
+	}
+	if items[0].Content[0].ImageURL != "data:image/png;base64,first" || items[0].Content[1].Text != "between" || items[0].Content[2].ImageURL != "data:image/jpeg;base64,second" {
+		t.Errorf("content order not preserved: %+v", items[0].Content)
+	}
+}
+
+func TestResponsesImageContentJSON(t *testing.T) {
+	got, err := json.Marshal(responsesImageContent(llm.Content{Type: llm.ContentTypeText, MediaType: "image/png", Data: "abc123"}))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	want := `{"type":"input_image","image_url":"data:image/png;base64,abc123","detail":"auto"}`
+	if string(got) != want {
+		t.Fatalf("image content JSON = %s, want %s", got, want)
+	}
+}
+
+func TestFromLLMMessageResponsesWithToolResultImage(t *testing.T) {
+	items := fromLLMMessageResponses(llm.Message{
+		Role: llm.MessageRoleUser,
+		Content: []llm.Content{{
+			Type:      llm.ContentTypeToolResult,
+			ToolUseID: "call_img",
+			ToolResult: []llm.Content{
+				{Type: llm.ContentTypeText, Text: "Screenshot captured"},
+				{Type: llm.ContentTypeText, MediaType: "image/jpeg", Data: "xyz789"},
+			},
+		}},
+	})
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].Type != "function_call_output" || items[0].Output != "Screenshot captured" {
+		t.Errorf("unexpected function output: %+v", items[0])
+	}
+	if items[1].Type != "message" || items[1].Role != "user" || len(items[1].Content) != 2 {
+		t.Fatalf("unexpected image message: %+v", items[1])
+	}
+	if items[1].Content[1].Type != "input_image" || items[1].Content[1].ImageURL != "data:image/jpeg;base64,xyz789" {
+		t.Errorf("unexpected tool image content: %+v", items[1].Content[1])
+	}
+}
+
+func TestFromLLMMessageResponsesWithImageOnlyToolResultAndRegularContent(t *testing.T) {
+	items := fromLLMMessageResponses(llm.Message{
+		Role: llm.MessageRoleUser,
+		Content: []llm.Content{
+			{
+				Type:      llm.ContentTypeToolResult,
+				ToolUseID: "call_img_only",
+				ToolResult: []llm.Content{
+					{Type: llm.ContentTypeText, MediaType: "image/png", Data: "onlyimage"},
+				},
+			},
+			{Type: llm.ContentTypeText, Text: "regular text"},
+		},
+	})
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d: %+v", len(items), items)
+	}
+	if items[0].Type != "function_call_output" || items[0].Output != " " {
+		t.Errorf("unexpected image-only function output: %+v", items[0])
+	}
+	if items[1].Type != "message" || items[1].Role != "user" || len(items[1].Content) != 2 || items[1].Content[1].ImageURL != "data:image/png;base64,onlyimage" {
+		t.Errorf("unexpected adjacent image message: %+v", items[1])
+	}
+	if items[2].Type != "message" || items[2].Content[0].Text != "regular text" {
+		t.Errorf("regular content should follow tool image message: %+v", items[2])
+	}
+}
+
+func TestResponsesContentOmitsEmptyTextForImages(t *testing.T) {
+	got, err := json.Marshal(responsesImageContent(llm.Content{Type: llm.ContentTypeText, MediaType: "image/png", Data: "abc123"}))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(got), `"text"`) {
+		t.Fatalf("image content should not include empty text field: %s", got)
 	}
 }
 
@@ -242,8 +360,11 @@ func TestToLLMResponseFromResponses(t *testing.T) {
 				Model: "gpt-5.1-codex",
 				Output: []responsesOutputItem{
 					{
-						Type:    "reasoning",
-						Summary: []string{"Let me think", "about this"},
+						Type: "reasoning",
+						Summary: []responsesSummary{
+							{Type: "summary_text", Text: "Let me think"},
+							{Type: "summary_text", Text: "about this"},
+						},
 					},
 					{
 						Type: "message",
@@ -279,11 +400,72 @@ func TestToLLMResponseFromResponses(t *testing.T) {
 	}
 }
 
+// TestResponsesReasoningSummaryUnmarshal verifies that a reasoning output item
+// with a structured summary array (objects, not bare strings) unmarshals
+// successfully. Regression test for issue #192.
+func TestResponsesReasoningSummaryUnmarshal(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp_1",
+		"object": "response",
+		"status": "completed",
+		"model": "gpt-5.1-codex",
+		"output": [
+			{
+				"id": "rs_1",
+				"type": "reasoning",
+				"summary": [
+					{"type": "summary_text", "text": "First thought."},
+					{"type": "summary_text", "text": "Second thought."}
+				]
+			},
+			{
+				"id": "msg_1",
+				"type": "message",
+				"role": "assistant",
+				"content": [{"type": "output_text", "text": "Hello."}]
+			}
+		],
+		"usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+	}`)
+	var resp responsesResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(resp.Output))
+	}
+	rs := resp.Output[0]
+	if len(rs.Summary) != 2 || rs.Summary[0].Text != "First thought." || rs.Summary[1].Text != "Second thought." {
+		t.Fatalf("unexpected summary: %+v", rs.Summary)
+	}
+	svc := &ResponsesService{}
+	llmResp := svc.toLLMResponseFromResponses(&resp, nil)
+	var gotThinking, gotText string
+	for _, c := range llmResp.Content {
+		switch c.Type {
+		case llm.ContentTypeThinking:
+			gotThinking = c.Text
+		case llm.ContentTypeText:
+			gotText = c.Text
+		}
+	}
+	if gotThinking != "First thought.\nSecond thought." {
+		t.Errorf("thinking: got %q", gotThinking)
+	}
+	if gotText != "Hello." {
+		t.Errorf("text: got %q", gotText)
+	}
+}
+
 func TestResponsesServiceTokenContextWindow(t *testing.T) {
 	tests := []struct {
 		model    Model
 		expected int
 	}{
+		{model: GPT55, expected: 272000},
+		{model: GPT55Pro, expected: 272000},
+		{model: Model{UserName: "gpt-5.5-2026-04-23", ModelName: "gpt-5.5-2026-04-23"}, expected: 272000},
+		{model: Model{UserName: "gpt-5.5-pro-2026-04-23", ModelName: "gpt-5.5-pro-2026-04-23"}, expected: 272000},
 		{model: GPT53Codex, expected: 288000},
 		{model: GPT52Codex, expected: 272000},
 		{model: GPT5Codex, expected: 256000},
@@ -534,6 +716,67 @@ func TestResponsesServiceDo(t *testing.T) {
 	}
 }
 
+func TestResponsesServiceRetriesEmptyJSONResponse(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		json.NewEncoder(w).Encode(responsesResponse{
+			ID:     "retry-ok",
+			Status: "completed",
+			Output: []responsesOutputItem{{Type: "message", Role: "assistant", Content: []responsesContent{{Type: "output_text", Text: "ok"}}}},
+			Usage:  responsesUsage{InputTokens: 1, OutputTokens: 1},
+		})
+	}))
+	defer server.Close()
+
+	svc := &ResponsesService{APIKey: "test-api-key", Model: GPT41, ModelURL: server.URL}
+	resp, err := svc.Do(context.Background(), &llm.Request{
+		Messages: []llm.Message{{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if got := resp.Content[0].Text; got != "ok" {
+		t.Fatalf("response text = %q, want ok", got)
+	}
+}
+
+func TestShouldRetryResponsesDecodeError(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{name: "empty", body: nil, want: true},
+		{name: "whitespace", body: []byte(" \n\t"), want: true},
+		{name: "truncated object", body: []byte(`{"id":"r"`), want: true},
+		{name: "truncated string", body: []byte(`{"id":"r`), want: true},
+		{name: "bad complete json", body: []byte(`{"id":}`), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp responsesResponse
+			err := json.Unmarshal(tt.body, &resp)
+			if err == nil {
+				t.Fatal("json.Unmarshal succeeded, want error")
+			}
+			if got := shouldRetryResponsesDecodeError(err, tt.body); got != tt.want {
+				t.Fatalf("shouldRetryResponsesDecodeError() = %v, want %v (err=%v)", got, tt.want, err)
+			}
+		})
+	}
+}
+
 func TestResponsesServiceDoWithCaching(t *testing.T) {
 	// Test that cached tokens are correctly mapped to Usage fields
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -601,5 +844,69 @@ func TestResponsesServiceDoWithCaching(t *testing.T) {
 	// ContextWindowUsed = 100 + 50 = 150
 	if resp.Usage.ContextWindowUsed() != 150 {
 		t.Errorf("resp.Usage.ContextWindowUsed() = %d, expected 150", resp.Usage.ContextWindowUsed())
+	}
+}
+
+func TestResponsesServiceReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name            string
+		thinkingLevel   llm.ThinkingLevel
+		reasoningEffort string
+		wantEffort      string // "" means reasoning field should be absent
+	}{
+		{name: "thinking off, no override", thinkingLevel: llm.ThinkingLevelOff, reasoningEffort: "", wantEffort: ""},
+		{name: "thinking medium maps to medium", thinkingLevel: llm.ThinkingLevelMedium, reasoningEffort: "", wantEffort: "medium"},
+		{name: "thinking high maps to high", thinkingLevel: llm.ThinkingLevelHigh, reasoningEffort: "", wantEffort: "high"},
+		{name: "override beats thinking level", thinkingLevel: llm.ThinkingLevelMedium, reasoningEffort: "xhigh", wantEffort: "xhigh"},
+		{name: "override none disables reasoning", thinkingLevel: llm.ThinkingLevelMedium, reasoningEffort: "none", wantEffort: "none"},
+		{name: "override when thinking off", thinkingLevel: llm.ThinkingLevelOff, reasoningEffort: "high", wantEffort: "high"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotReasoning *responsesReasoning
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req responsesRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatalf("decode req: %v", err)
+				}
+				gotReasoning = req.Reasoning
+				resp := responsesResponse{
+					ID:     "r",
+					Status: "completed",
+					Output: []responsesOutputItem{{Type: "message", Role: "assistant", Content: []responsesContent{{Type: "output_text", Text: "ok"}}}},
+					Usage:  responsesUsage{InputTokens: 1, OutputTokens: 1},
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+			}))
+			defer server.Close()
+
+			svc := &ResponsesService{
+				APIKey:          "k",
+				Model:           GPT41,
+				ModelURL:        server.URL,
+				ThinkingLevel:   tt.thinkingLevel,
+				ReasoningEffort: tt.reasoningEffort,
+			}
+			_, err := svc.Do(context.Background(), &llm.Request{
+				Messages: []llm.Message{{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hi"}}}},
+			})
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			if tt.wantEffort == "" {
+				if gotReasoning != nil {
+					t.Fatalf("expected no reasoning, got %+v", gotReasoning)
+				}
+				return
+			}
+			if gotReasoning == nil {
+				t.Fatalf("expected reasoning.effort=%q, got nil", tt.wantEffort)
+			}
+			if gotReasoning.Effort != tt.wantEffort {
+				t.Errorf("effort = %q, want %q", gotReasoning.Effort, tt.wantEffort)
+			}
+		})
 	}
 }

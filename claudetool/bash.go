@@ -3,7 +3,6 @@ package claudetool
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -84,7 +83,7 @@ func (b *BashTool) Tool() *llm.Tool {
 		Name:        bashName,
 		Description: strings.TrimSpace(bashDescription),
 		InputSchema: llm.MustSchema(bashInputSchema),
-		Run:         b.Run,
+		Run:         llm.RunJSON(b.run),
 	}
 }
 
@@ -94,7 +93,7 @@ func (b *BashTool) getWorkingDir() string {
 }
 
 // isNoTrailerSet checks if user has disabled co-author trailer via git config.
-func (b *BashTool) isNoTrailerSet() bool {
+func isNoTrailerSet() bool {
 	out, err := exec.Command("git", "config", "--get", "shelley.no-trailer").Output()
 	if err != nil {
 		return false
@@ -117,7 +116,7 @@ Avoid overly destructive cleanup commands. Commands that could delete .git
 directories, home directories, or use broad wildcards require explicit paths.
 Confirm with the user before running destructive operations.
 
-To change the working directory persistently, use the change_dir tool.
+Use the change_dir tool instead of 'cd <path> && ...'; 'cd' does not persist across calls.
 
 IMPORTANT: Keep commands concise. The command input must be less than 60k tokens.
 For complex scripts, write them to a file first and then execute the file.
@@ -158,12 +157,7 @@ func (i *bashInput) timeout(t *Timeouts) time.Duration {
 	return t.fast()
 }
 
-func (b *BashTool) Run(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var req bashInput
-	if err := json.Unmarshal(m, &req); err != nil {
-		return llm.ErrorfToolOut("failed to unmarshal bash command input: %w", err)
-	}
-
+func (b *BashTool) run(ctx context.Context, req bashInput) llm.ToolOut {
 	// Check that the working directory exists
 	wd := b.getWorkingDir()
 	if _, err := os.Stat(wd); err != nil {
@@ -195,7 +189,7 @@ func (b *BashTool) Run(ctx context.Context, m json.RawMessage) llm.ToolOut {
 	}
 
 	// Add co-author trailer to git commits unless user has disabled it
-	if !b.isNoTrailerSet() {
+	if !isNoTrailerSet() {
 		req.Command = bashkit.AddCoauthorTrailer(req.Command, "Co-authored-by: Shelley <shelley@exe.dev>")
 	}
 
@@ -206,6 +200,10 @@ func (b *BashTool) Run(ctx context.Context, m json.RawMessage) llm.ToolOut {
 	out, execErr := b.executeBash(ctx, req, timeout)
 	if execErr != nil {
 		return llm.ErrorToolOut(execErr)
+	}
+	if bashkit.ChainsCdWithCommand(req.Command) {
+		hint := "[shelley hint: this command chained `cd <path>` with another command. `cd` inside a bash invocation does not persist across tool calls. Prefer calling the change_dir tool once, then running subsequent commands directly.]"
+		out = strings.TrimRight(out, "\n") + "\n\n" + hint + "\n"
 	}
 	return llm.ToolOut{LLMContent: llm.TextContent(out), Display: display}
 }
@@ -356,7 +354,7 @@ func (b *BashTool) executeBash(ctx context.Context, req bashInput, timeout time.
 
 	// Check if there's a progress callback for streaming output
 	progressFn := GetToolProgress(ctx)
-	toolID, _ := ctx.Value(toolUseIDCtxKey).(string)
+	toolID := ToolUseID(ctx)
 
 	var output io.Writer
 	var getOutput func() string

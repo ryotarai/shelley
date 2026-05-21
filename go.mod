@@ -1,6 +1,6 @@
 module shelley.exe.dev
 
-go 1.26.2
+go 1.26.3
 
 require (
 	github.com/chromedp/cdproto v0.0.0-20260328224638-b7b298a31867
@@ -9,6 +9,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/fynelabs/selfupdate v0.2.1
 	github.com/google/uuid v1.6.0
+	github.com/klauspost/compress v1.18.5
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/pkg/diff v0.0.0-20241224192749-4e6772a4315c
 	github.com/richardlehane/crock32 v1.0.1
@@ -90,7 +91,7 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.4.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/term v0.40.0 // indirect
+	golang.org/x/term v0.40.0
 	modernc.org/sqlite v1.48.0
 )
 

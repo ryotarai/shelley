@@ -105,6 +105,13 @@ func (s *Service) MaxImageDimension() int {
 	return 2000
 }
 
+// MaxImageBytes returns the maximum allowed encoded size in bytes for a single image.
+// Anthropic enforces a 5 MB per-image limit on the API.
+// See https://platform.claude.com/docs/en/build-with-claude/vision.
+func (s *Service) MaxImageBytes() int {
+	return 5 * 1024 * 1024
+}
+
 // Service provides Claude completions.
 // Fields should not be altered concurrently with calling any method on Service.
 type Service struct {
@@ -929,16 +936,30 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 
 	backoff := s.Backoff
 	if backoff == nil {
-		backoff = []time.Duration{15 * time.Second, 30 * time.Second, time.Minute}
+		// Long tail: many model providers have multi-hour incidents, and it is
+		// a much worse UX to return after a few minutes than to keep waiting.
+		backoff = []time.Duration{
+			15 * time.Second,
+			30 * time.Second,
+			60 * time.Second,
+			2 * time.Minute,
+			5 * time.Minute,
+			10 * time.Minute,
+			20 * time.Minute,
+			30 * time.Minute,
+		}
 	}
 
 	url := cmp.Or(s.URL, DefaultURL)
 	httpc := cmp.Or(s.HTTPC, http.DefaultClient)
 
 	// retry loop
-	var errs error // accumulated errors across all attempts
+	retryStart := time.Now()
+	var errs error               // accumulated errors across all attempts
+	var lastErrSummary string    // short description of the most recent attempt failure
+	var retryAfter time.Duration // hint from upstream Retry-After header, reset each attempt
 	for attempts := 0; ; attempts++ {
-		if attempts > 10 {
+		if attempts > 15 {
 			return nil, fmt.Errorf("anthropic request failed after %d attempts: %w", attempts, errs)
 		}
 		if attempts > 0 {
@@ -950,7 +971,11 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			base := backoff[min(attempts-1, len(backoff)-1)]
 			jitter := time.Duration(rand.Int64N(max(min(int64(base), int64(time.Second)), 1)))
 			sleep := base + jitter
-			slog.WarnContext(ctx, "anthropic request sleep before retry", "sleep", sleep, "attempts", attempts)
+			if retryAfter > sleep {
+				sleep = retryAfter
+			}
+			retryAfter = 0
+			slog.WarnContext(ctx, "anthropic request sleep before retry", "sleep", sleep, "attempts", attempts, "elapsed", time.Since(retryStart).Round(time.Second), "last_error", lastErrSummary)
 			select {
 			case <-time.After(sleep):
 			case <-ctx.Done():
@@ -972,6 +997,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			if strings.Contains(err.Error(), "cached HTTP response not found") {
 				return nil, err
 			}
+			lastErrSummary = "transport: " + llm.Truncate(err.Error(), 160)
 			errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: %w", attempts+1, time.Now().Format(time.DateTime), err))
 			continue
 		}
@@ -982,6 +1008,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			resp.Body.Close()
 			if err != nil {
 				// Stream parse errors might be transient (connection reset, etc.)
+				lastErrSummary = "stream: " + llm.Truncate(err.Error(), 160)
 				errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: %w", attempts+1, time.Now().Format(time.DateTime), err))
 				continue
 			}
@@ -995,17 +1022,22 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			return result, nil
 		default:
 			buf, _ := io.ReadAll(resp.Body)
+			retryAfterHdr := resp.Header.Get("Retry-After")
 			resp.Body.Close()
 
 			switch {
 			case resp.StatusCode >= 500 && resp.StatusCode < 600:
 				// server error, retry
-				slog.WarnContext(ctx, "anthropic_request_failed", "response", string(buf), "status_code", resp.StatusCode, "url", url, "model", s.Model)
+				retryAfter = llm.ParseRetryAfter(retryAfterHdr)
+				lastErrSummary = fmt.Sprintf("status %d: %s", resp.StatusCode, llm.Truncate(string(buf), 160))
+				slog.WarnContext(ctx, "anthropic_request_failed", "response", string(buf), "status_code", resp.StatusCode, "url", url, "model", s.Model, "retry_after", retryAfter)
 				errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %v (url=%s, model=%s): %s", attempts+1, time.Now().Format(time.DateTime), resp.Status, url, cmp.Or(s.Model, DefaultModel), buf))
 				continue
 			case resp.StatusCode == 429:
 				// rate limited, retry
-				slog.WarnContext(ctx, "anthropic_request_rate_limited", "response", string(buf), "url", url, "model", s.Model)
+				retryAfter = llm.ParseRetryAfter(retryAfterHdr)
+				lastErrSummary = fmt.Sprintf("status 429 rate limited: %s", llm.Truncate(string(buf), 160))
+				slog.WarnContext(ctx, "anthropic_request_rate_limited", "response", string(buf), "url", url, "model", s.Model, "retry_after", retryAfter)
 				errs = errors.Join(errs, fmt.Errorf("attempt %d at %s: status %v (url=%s, model=%s): %s", attempts+1, time.Now().Format(time.DateTime), resp.Status, url, cmp.Or(s.Model, DefaultModel), buf))
 				continue
 			case resp.StatusCode >= 400 && resp.StatusCode < 500:

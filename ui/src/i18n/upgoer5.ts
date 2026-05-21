@@ -13,6 +13,7 @@ export const upgoer5: TranslationKeys = {
 
   // Overflow Menu
   diffs: "Changes",
+  gitGraph: "Story Tree",
   terminal: "Computer Window",
   archiveConversation: "Put Away Talk",
   checkForNewVersion: "Look for a newer one",
@@ -38,6 +39,9 @@ export const upgoer5: TranslationKeys = {
   searchPlaceholder: "Look for talks or things to do...",
   searching: "Looking...",
   noResults: "Nothing found",
+  searchConversations: "Look for talks...",
+  noSearchResults: "No talks match",
+  clearSearch: "Forget what I asked",
   toNavigate: "to move around",
   toSelect: "to pick",
   toClose: "to close",
@@ -56,6 +60,7 @@ export const upgoer5: TranslationKeys = {
   jumpToPreviousMessage: "Jump to the thing you said before",
   viewDiffs: "See Changes",
   openGitDiffViewer: "Open the thing that shows what changed",
+  openGitGraphViewer: "Open the picture of branches in time",
   addRemoveModelsKeys: "Set Up Brains and Keys",
   configureModels: "Pick which brains to use and give them keys",
   notificationSettings: "How to Tell You Things",
@@ -90,6 +95,7 @@ export const upgoer5: TranslationKeys = {
   hideSubagents: "Hide little helpers",
   showSubagents: "Show little helpers",
   groupConversations: "Put talks in groups",
+  resortNow: "Put in order now",
   noGrouping: "No groups",
   directory: "Place",
   gitRepo: "Where Your Work Lives",
@@ -131,6 +137,10 @@ export const upgoer5: TranslationKeys = {
   tagsPlaceholder: "put a small low mark between each one, like: fast, big",
   tagsTooltip:
     "Marks for this brain, each one after the other with a small low mark between. You can use a mark to make this brain be the one that writes short names for your talks. If you do not put that mark on any brain, the brain you are using right now will make the name all on its own.",
+  reasoningEffort: "Reasoning Effort",
+  reasoningEffortPlaceholder: "e.g., medium, high, xhigh, none — leave blank for default",
+  reasoningEffortHint:
+    "Sent as reasoning.effort to the OpenAI Responses API. Free-form: providers add new tiers periodically.",
   testButton: "Try It",
   testingButton: "Trying...",
   save: "Save",
@@ -215,4 +225,5 @@ export const upgoer5: TranslationKeys = {
   upgoerFive: "Up-Goer Five",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
+  vietnamese: "Tiếng Việt",
 };

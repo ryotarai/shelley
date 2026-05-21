@@ -31,6 +31,11 @@ import (
 // ScreenshotDir is the directory where screenshots are stored
 const ScreenshotDir = "/tmp/shelley-screenshots"
 
+// UploadDir is the directory where files uploaded via /api/upload are stored.
+// Kept distinct from ScreenshotDir so that browser-tool screenshots and
+// user-uploaded files don't get mixed up in one bucket.
+const UploadDir = "/tmp/shelley-uploads"
+
 // DownloadDir is the directory where downloads are stored
 const DownloadDir = "/tmp/shelley-downloads"
 
@@ -71,8 +76,6 @@ type BrowseTools struct {
 	// Idle timeout management
 	idleTimeout time.Duration
 	idleTimer   *time.Timer
-	// Max image dimension for resizing (0 means use default)
-	maxImageDimension int
 	// Download tracking
 	downloads      map[string]*DownloadInfo // keyed by GUID
 	downloadsMutex sync.Mutex
@@ -90,29 +93,30 @@ type BrowseTools struct {
 	traceMutex      sync.Mutex
 	// Screencast state
 	screencast screencastState
+	// browserCmd is the headless-shell *exec.Cmd, captured via
+	// chromedp.ModifyCmdFunc so we can kill its process group on shutdown.
+	browserCmd *exec.Cmd
 }
 
 // NewBrowseTools creates a new set of browser automation tools.
 // idleTimeout is how long to wait before shutting down an idle browser (0 uses default).
-// maxImageDimension is the max pixel dimension for images (0 means unlimited).
-func NewBrowseTools(ctx context.Context, idleTimeout time.Duration, maxImageDimension int) *BrowseTools {
+func NewBrowseTools(ctx context.Context, idleTimeout time.Duration) *BrowseTools {
 	if idleTimeout <= 0 {
 		idleTimeout = DefaultIdleTimeout
 	}
-	for _, dir := range []string{ScreenshotDir, DownloadDir, ConsoleLogsDir} {
+	for _, dir := range []string{ScreenshotDir, UploadDir, DownloadDir, ConsoleLogsDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			log.Printf("Failed to create directory %s: %v", dir, err)
 		}
 	}
 
 	bt := &BrowseTools{
-		ctx:               ctx,
-		screenshots:       make(map[string]time.Time),
-		consoleLogs:       make([]*runtime.EventConsoleAPICalled, 0),
-		maxConsoleLogs:    100,
-		maxImageDimension: maxImageDimension,
-		idleTimeout:       idleTimeout,
-		downloads:         make(map[string]*DownloadInfo),
+		ctx:            ctx,
+		screenshots:    make(map[string]time.Time),
+		consoleLogs:    make([]*runtime.EventConsoleAPICalled, 0),
+		maxConsoleLogs: 100,
+		idleTimeout:    idleTimeout,
+		downloads:      make(map[string]*DownloadInfo),
 	}
 	bt.downloadCond = sync.NewCond(&bt.downloadsMutex)
 	return bt
@@ -147,6 +151,30 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 	opts = append(opts, chromedp.Flag("disable-features",
 		"site-per-process,Translate,BlinkGenPropertyTrees,WebAuthentication"))
 
+	// Capture the *exec.Cmd headless-shell is launched with so closeBrowserLocked
+	// can kill the whole process group. headless-shell forks zygote, renderers,
+	// GPU and utility processes; chromedp's default cancel only SIGKILLs the
+	// direct child, leaving descendants orphaned to PID 1. ModifyCmdFunc also
+	// replaces chromedp's default cmd setup, so configureBrowserCmd re-applies
+	// Pdeathsig and adds Setpgid for clean group kill.
+	// ModifyCmdFunc runs synchronously on the chromedp.Run goroutine before
+	// cmd.Start, so a plain pointer assignment is enough — Run returns after
+	// the browser is up, so by the time we read capturedCmd below the function
+	// has already finished.
+	var capturedCmd *exec.Cmd
+	opts = append(opts, chromedp.ModifyCmdFunc(func(cmd *exec.Cmd) {
+		configureBrowserCmd(cmd)
+		capturedCmd = cmd
+	}))
+
+	// killCapturedGroup is shared between error paths and the success path so
+	// every exit from this function reaps the headless-shell process group.
+	killCapturedGroup := func() {
+		if capturedCmd != nil && capturedCmd.Process != nil {
+			killBrowserProcessGroup(capturedCmd.Process.Pid)
+		}
+	}
+
 	allocCtx, allocCancel := chromedp.NewExecAllocator(b.ctx, opts...)
 	browserCtx, browserCancel := chromedp.NewContext(
 		allocCtx,
@@ -162,6 +190,7 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 	// Start the browser
 	if err := chromedp.Run(browserCtx); err != nil {
 		allocCancel()
+		killCapturedGroup()
 		return nil, fmt.Errorf("failed to start browser (please apt get chromium or equivalent): %w", err)
 	}
 
@@ -169,17 +198,20 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 	if err := chromedp.Run(browserCtx, chromedp.EmulateViewport(1280, 720)); err != nil {
 		browserCancel()
 		allocCancel()
+		killCapturedGroup()
 		return nil, fmt.Errorf("failed to set default viewport: %w", err)
 	}
 
 	// Configure download behavior to allow downloads and emit events
-	if err := chromedp.Run(browserCtx,
+	if err := chromedp.Run(
+		browserCtx,
 		browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllowAndName).
 			WithDownloadPath(DownloadDir).
 			WithEventsEnabled(true),
 	); err != nil {
 		browserCancel()
 		allocCancel()
+		killCapturedGroup()
 		return nil, fmt.Errorf("failed to configure download behavior: %w", err)
 	}
 
@@ -187,6 +219,7 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 	b.allocCancel = allocCancel
 	b.browserCtx = browserCtx
 	b.browserCtxCancel = browserCancel
+	b.browserCmd = capturedCmd
 
 	b.resetIdleTimerLocked()
 
@@ -265,10 +298,12 @@ func (b *BrowseTools) closeBrowserLocked() {
 
 	browserCancel := b.browserCtxCancel
 	allocCancel := b.allocCancel
+	browserCmd := b.browserCmd
 	b.browserCtxCancel = nil
 	b.allocCancel = nil
 	b.browserCtx = nil
 	b.allocCtx = nil
+	b.browserCmd = nil
 
 	// Release the lock before calling cancel functions. allocCancel in
 	// particular can block waiting for the chrome process to exit, and
@@ -282,6 +317,14 @@ func (b *BrowseTools) closeBrowserLocked() {
 	}
 	if allocCancel != nil {
 		allocCancel()
+	}
+	// chromedp's allocCancel relies on context cancellation propagating SIGKILL
+	// only to headless-shell's direct process. Renderers, GPU, utility, and
+	// zygote children get reparented to PID 1 and continue running. Since we
+	// launched headless-shell in its own process group (Setpgid), we can
+	// SIGKILL the entire group to guarantee no leaks.
+	if browserCmd != nil && browserCmd.Process != nil {
+		killBrowserProcessGroup(browserCmd.Process.Pid)
 	}
 }
 
@@ -360,12 +403,7 @@ func isPort80(urlStr string) bool {
 	return port == "80" || (port == "" && parsedURL.Scheme == "http")
 }
 
-func (b *BrowseTools) navigateRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input navigateInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) navigateRun(ctx context.Context, input navigateInput) llm.ToolOut {
 	if isPort80(input.URL) {
 		return llm.ErrorToolOut(fmt.Errorf("port 80 is not the port you're looking for--port 80 is the main sketch server"))
 	}
@@ -379,7 +417,8 @@ func (b *BrowseTools) navigateRun(ctx context.Context, m json.RawMessage) llm.To
 	timeoutCtx, cancel := context.WithTimeout(browserCtx, parseTimeout(input.Timeout))
 	defer cancel()
 
-	err = chromedp.Run(timeoutCtx,
+	err = chromedp.Run(
+		timeoutCtx,
 		chromedp.Navigate(input.URL),
 		chromedp.WaitReady("body"),
 	)
@@ -415,12 +454,7 @@ type resizeInput struct {
 	Timeout string `json:"timeout,omitempty"`
 }
 
-func (b *BrowseTools) resizeRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input resizeInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) resizeRun(ctx context.Context, input resizeInput) llm.ToolOut {
 	if input.Width <= 0 || input.Height <= 0 {
 		return llm.ErrorToolOut(fmt.Errorf("invalid dimensions: width and height must be positive"))
 	}
@@ -433,7 +467,8 @@ func (b *BrowseTools) resizeRun(ctx context.Context, m json.RawMessage) llm.Tool
 	timeoutCtx, cancel := context.WithTimeout(browserCtx, parseTimeout(input.Timeout))
 	defer cancel()
 
-	err = chromedp.Run(timeoutCtx,
+	err = chromedp.Run(
+		timeoutCtx,
 		chromedp.EmulateViewport(int64(input.Width), int64(input.Height)),
 	)
 	if err != nil {
@@ -449,12 +484,7 @@ type evalInput struct {
 	Await      *bool  `json:"await,omitempty"`
 }
 
-func (b *BrowseTools) evalRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input evalInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) evalRun(ctx context.Context, input evalInput) llm.ToolOut {
 	browserCtx, err := b.GetBrowserContext()
 	if err != nil {
 		return llm.ErrorToolOut(err)
@@ -499,7 +529,8 @@ func (b *BrowseTools) evalRun(ctx context.Context, m json.RawMessage) llm.ToolOu
 		}
 		return b.toolOutWithDownloads(fmt.Sprintf(
 			"JavaScript result (%d bytes) written to: %s\nUse `cat %s` to view the full content.",
-			len(response), filePath, filePath))
+			len(response), filePath, filePath,
+		))
 	}
 
 	return b.toolOutWithDownloads("<javascript_result>" + string(response) + "</javascript_result>")
@@ -510,12 +541,7 @@ type screenshotInput struct {
 	Timeout  string `json:"timeout,omitempty"`
 }
 
-func (b *BrowseTools) screenshotRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input screenshotInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) screenshotRun(ctx context.Context, input screenshotInput) llm.ToolOut {
 	// Try to get a browser context; if unavailable, return an error
 	browserCtx, err := b.GetBrowserContext()
 	if err != nil {
@@ -531,7 +557,8 @@ func (b *BrowseTools) screenshotRun(ctx context.Context, m json.RawMessage) llm.
 
 	if input.Selector != "" {
 		// Take screenshot of specific element
-		actions = append(actions,
+		actions = append(
+			actions,
 			chromedp.WaitReady(input.Selector),
 			chromedp.Screenshot(input.Selector, &buf, chromedp.NodeVisible),
 		)
@@ -554,20 +581,19 @@ func (b *BrowseTools) screenshotRun(ctx context.Context, m json.RawMessage) llm.
 	// Get the full path to the screenshot
 	screenshotPath := GetScreenshotPath(id)
 
-	// Resize image if needed to fit within model's image dimension limits
-	imageData := buf
-	format := "png"
-	resized := false
-	if b.maxImageDimension > 0 {
-		var err error
-		imageData, format, resized, err = imageutil.ResizeImage(buf, b.maxImageDimension)
-		if err != nil {
-			return llm.ErrorToolOut(fmt.Errorf("failed to resize screenshot: %w", err))
-		}
+	// Fit the screenshot inside the model's per-image limits. The full-size
+	// PNG stays on disk at screenshotPath; only the LLM-facing copy is
+	// (potentially) downscaled. A byte-overflow that can't be fixed by
+	// downscaling produces an error so we never send a request the API will
+	// reject.
+	imageData, format, resized, err := prepareImageForModel(ctx, buf, "png", screenshotPath)
+	if err != nil {
+		return llm.ErrorToolOut(err)
 	}
 
 	base64Data := base64.StdEncoding.EncodeToString(imageData)
 	mediaType := "image/" + format
+	widthPx, heightPx, _ := imageutil.DecodeDimensions(imageData)
 
 	display := map[string]any{
 		"type":     "screenshot",
@@ -579,7 +605,7 @@ func (b *BrowseTools) screenshotRun(ctx context.Context, m json.RawMessage) llm.
 
 	description := fmt.Sprintf("Screenshot taken (saved as %s)", screenshotPath)
 	if resized {
-		description += " [resized]"
+		description += " [resized to fit model limits]"
 	}
 
 	return llm.ToolOut{LLMContent: []llm.Content{
@@ -588,9 +614,11 @@ func (b *BrowseTools) screenshotRun(ctx context.Context, m json.RawMessage) llm.
 			Text: description,
 		},
 		{
-			Type:      llm.ContentTypeText,
-			MediaType: mediaType,
-			Data:      base64Data,
+			Type:          llm.ContentTypeText,
+			MediaType:     mediaType,
+			Data:          base64Data,
+			DisplayWidth:  widthPx,
+			DisplayHeight: heightPx,
 		},
 	}, Display: display}
 }
@@ -716,7 +744,7 @@ func (b *BrowseTools) CombinedTool() *llm.Tool {
 		Name:        "browser",
 		Description: description,
 		InputSchema: json.RawMessage(schema),
-		Run:         b.combinedRun(),
+		Run:         llm.RunJSON(b.runCombined),
 	}
 }
 
@@ -739,7 +767,7 @@ func (b *BrowseTools) ReadImageTool() *llm.Tool {
 			},
 			"required": ["path"]
 		}`),
-		Run: b.readImageRun,
+		Run: llm.RunJSON(b.readImageRun),
 	}
 }
 
@@ -761,64 +789,60 @@ type combinedInput struct {
 	EveryNthFrame int64  `json:"every_nth_frame,omitempty"`
 }
 
-func (b *BrowseTools) combinedRun() func(context.Context, json.RawMessage) llm.ToolOut {
-	return func(ctx context.Context, m json.RawMessage) llm.ToolOut {
-		var input combinedInput
-		if err := json.Unmarshal(m, &input); err != nil {
-			return llm.ErrorfToolOut("invalid input: %w", err)
+func (b *BrowseTools) runCombined(ctx context.Context, input combinedInput) llm.ToolOut {
+	switch input.Action {
+	case "navigate":
+		return b.navigateRun(ctx, navigateInput{URL: input.URL, Timeout: input.Timeout})
+	case "eval":
+		return b.evalRun(ctx, evalInput{Expression: input.Expression, Timeout: input.Timeout, Await: input.Await})
+	case "resize":
+		return b.resizeRun(ctx, resizeInput{Width: input.Width, Height: input.Height, Timeout: input.Timeout})
+	case "screenshot":
+		return b.screenshotRun(ctx, screenshotInput{Selector: input.Selector, Timeout: input.Timeout})
+	case "console_logs":
+		return b.recentConsoleLogsRun(ctx, recentConsoleLogsInput{Limit: input.Limit})
+	case "clear_console_logs":
+		return b.clearConsoleLogsRun(ctx, clearConsoleLogsInput{})
+	case "screencast_start":
+		sessionID, err := b.screencastStart(input.Format, input.Quality, input.MaxWidth, input.MaxHeight, input.EveryNthFrame)
+		if err != nil {
+			return llm.ErrorToolOut(err)
 		}
-
-		switch input.Action {
-		case "navigate":
-			return b.navigateRun(ctx, m)
-		case "eval":
-			return b.evalRun(ctx, m)
-		case "resize":
-			return b.resizeRun(ctx, m)
-		case "screenshot":
-			return b.screenshotRun(ctx, m)
-		case "console_logs":
-			return b.recentConsoleLogsRun(ctx, m)
-		case "clear_console_logs":
-			return b.clearConsoleLogsRun(ctx, m)
-		case "screencast_start":
-			sessionID, err := b.screencastStart(input.Format, input.Quality, input.MaxWidth, input.MaxHeight, input.EveryNthFrame)
-			if err != nil {
-				return llm.ErrorToolOut(err)
-			}
-			return llm.ToolOut{LLMContent: llm.TextContent(fmt.Sprintf(
-				"Screencast recording to %s (session %s).\nAuto-stops after %v or %d frames. Use screencast_stop to finish.",
-				filepath.Join(ScreencastDir, sessionID+".mp4"), sessionID, ScreencastMaxDuration, ScreencastMaxFrames))}
-		case "screencast_stop":
-			sessionID, outputPath, frameCount, duration, err := b.screencastStop()
-			if err != nil {
-				return llm.ErrorToolOut(err)
-			}
-			display := map[string]any{
-				"type":        "screencast",
-				"session_id":  sessionID,
-				"url":         "/api/read?path=" + url.QueryEscape(outputPath),
-				"path":        outputPath,
-				"frame_count": frameCount,
-				"duration":    duration.Round(time.Millisecond).String(),
-			}
-			return llm.ToolOut{
-				LLMContent: llm.TextContent(fmt.Sprintf(
-					"Screencast stopped (session %s). %d frames captured over %v.\nMP4 saved to: %s",
-					sessionID, frameCount, duration.Round(time.Millisecond), outputPath)),
-				Display: display,
-			}
-		case "screencast_status":
-			active, sessionID, frameCount, elapsed := b.screencastStatus()
-			if !active {
-				return llm.ToolOut{LLMContent: llm.TextContent("No active screencast.")}
-			}
-			return llm.ToolOut{LLMContent: llm.TextContent(fmt.Sprintf(
-				"Screencast active (session %s): %d frames captured, running for %v",
-				sessionID, frameCount, elapsed.Round(time.Millisecond)))}
-		default:
-			return llm.ErrorfToolOut("unknown action: %q", input.Action)
+		return llm.ToolOut{LLMContent: llm.TextContent(fmt.Sprintf(
+			"Screencast recording to %s (session %s).\nAuto-stops after %v or %d frames. Use screencast_stop to finish.",
+			filepath.Join(ScreencastDir, sessionID+".mp4"), sessionID, ScreencastMaxDuration, ScreencastMaxFrames,
+		))}
+	case "screencast_stop":
+		sessionID, outputPath, frameCount, duration, err := b.screencastStop()
+		if err != nil {
+			return llm.ErrorToolOut(err)
 		}
+		display := map[string]any{
+			"type":        "screencast",
+			"session_id":  sessionID,
+			"url":         "/api/read?path=" + url.QueryEscape(outputPath),
+			"path":        outputPath,
+			"frame_count": frameCount,
+			"duration":    duration.Round(time.Millisecond).String(),
+		}
+		return llm.ToolOut{
+			LLMContent: llm.TextContent(fmt.Sprintf(
+				"Screencast stopped (session %s). %d frames captured over %v.\nMP4 saved to: %s",
+				sessionID, frameCount, duration.Round(time.Millisecond), outputPath,
+			)),
+			Display: display,
+		}
+	case "screencast_status":
+		active, sessionID, frameCount, elapsed := b.screencastStatus()
+		if !active {
+			return llm.ToolOut{LLMContent: llm.TextContent("No active screencast.")}
+		}
+		return llm.ToolOut{LLMContent: llm.TextContent(fmt.Sprintf(
+			"Screencast active (session %s): %d frames captured, running for %v",
+			sessionID, frameCount, elapsed.Round(time.Millisecond),
+		))}
+	default:
+		return llm.ErrorfToolOut("unknown action: %q", input.Action)
 	}
 }
 
@@ -852,12 +876,7 @@ type readImageInput struct {
 	Timeout string `json:"timeout,omitempty"`
 }
 
-func (b *BrowseTools) readImageRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input readImageInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) readImageRun(ctx context.Context, input readImageInput) llm.ToolOut {
 	// Check if the path exists
 	if _, err := os.Stat(input.Path); os.IsNotExist(err) {
 		return llm.ErrorfToolOut("image file not found: %s", input.Path)
@@ -884,26 +903,26 @@ func (b *BrowseTools) readImageRun(ctx context.Context, m json.RawMessage) llm.T
 		return llm.ErrorfToolOut("file is not an image: %s", detectedType)
 	}
 
-	// Resize image if needed to fit within model's image dimension limits
-	resized := false
+	// Fit the image inside the model's per-image limits. Dimension overflow
+	// is fixed transparently by downscaling; byte overflow that can't be
+	// fixed by downscaling becomes a tool error so we never send a request
+	// the API will reject.
 	format := strings.TrimPrefix(detectedType, "image/")
-	if b.maxImageDimension > 0 {
-		var err error
-		imageData, format, resized, err = imageutil.ResizeImage(imageData, b.maxImageDimension)
-		if err != nil {
-			return llm.ErrorToolOut(fmt.Errorf("failed to resize image: %w", err))
-		}
+	imageData, format, resized, err := prepareImageForModel(ctx, imageData, format, input.Path)
+	if err != nil {
+		return llm.ErrorToolOut(err)
 	}
 
 	base64Data := base64.StdEncoding.EncodeToString(imageData)
 	mediaType := "image/" + format
+	widthPx, heightPx, _ := imageutil.DecodeDimensions(imageData)
 
 	description := fmt.Sprintf("Image from %s (type: %s)", input.Path, mediaType)
 	if converted {
 		description += " [converted from HEIC]"
 	}
 	if resized {
-		description += " [resized]"
+		description += " [resized to fit model limits]"
 	}
 
 	return llm.ToolOut{LLMContent: []llm.Content{
@@ -912,11 +931,52 @@ func (b *BrowseTools) readImageRun(ctx context.Context, m json.RawMessage) llm.T
 			Text: description,
 		},
 		{
-			Type:      llm.ContentTypeText,
-			MediaType: mediaType,
-			Data:      base64Data,
+			Type:          llm.ContentTypeText,
+			MediaType:     mediaType,
+			Data:          base64Data,
+			DisplayWidth:  widthPx,
+			DisplayHeight: heightPx,
 		},
 	}}
+}
+
+// prepareImageForModel fits imageData inside the limits advertised by the
+// llm.Service in ctx. Dimension overflow is fixed transparently by
+// downscaling so the user (and the model) don't have to care, since the
+// caller never asked for a specific size. Byte overflow that we can't fix
+// by downscaling produces an error so the agent can recompress or pick a
+// smaller source rather than having the API reject the whole request.
+//
+// Returns the (possibly resized) bytes, the resulting format, whether a
+// resize happened, and any error. source is included in error messages so
+// the agent knows what to fix. If no service is attached to ctx (e.g.
+// tests, ad-hoc callers) the data is returned unchanged.
+func prepareImageForModel(ctx context.Context, imageData []byte, detectedFormat, source string) (out []byte, format string, resized bool, err error) {
+	svc := llm.ServiceFromContext(ctx)
+	if svc == nil {
+		return imageData, detectedFormat, false, nil
+	}
+
+	if maxDim := svc.MaxImageDimension(); maxDim > 0 {
+		// imageutil.ResizeImage no-ops when the image already fits and
+		// returns the original bytes (and format) unchanged. DecodeConfig
+		// failure (e.g. webp without a Go decoder) is treated as "can't
+		// resize"; we fall through to the byte-size check.
+		resizedData, resizedFormat, didResize, rerr := imageutil.ResizeImage(imageData, maxDim)
+		if rerr == nil {
+			imageData = resizedData
+			detectedFormat = resizedFormat
+			resized = didResize
+		}
+	}
+
+	if maxBytes := svc.MaxImageBytes(); maxBytes > 0 && len(imageData) > maxBytes {
+		return nil, "", false, fmt.Errorf(
+			"image too large for model: %s is %d bytes (after any auto-resize), model limit is %d bytes; recompress the image (e.g. lower JPEG quality) and try again",
+			source, len(imageData), maxBytes,
+		)
+	}
+	return imageData, detectedFormat, resized, nil
 }
 
 // parseTimeout parses a timeout string and returns a time.Duration
@@ -1051,12 +1111,7 @@ type recentConsoleLogsInput struct {
 	Limit int `json:"limit,omitempty"`
 }
 
-func (b *BrowseTools) recentConsoleLogsRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input recentConsoleLogsInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) recentConsoleLogsRun(ctx context.Context, input recentConsoleLogsInput) llm.ToolOut {
 	// Ensure browser is initialized
 	_, err := b.GetBrowserContext()
 	if err != nil {
@@ -1094,7 +1149,8 @@ func (b *BrowseTools) recentConsoleLogsRun(ctx context.Context, m json.RawMessag
 		}
 		return llm.ToolOut{LLMContent: llm.TextContent(fmt.Sprintf(
 			"Retrieved %d console log entries (%d bytes).\nOutput written to: %s\nUse `cat %s` to view the full content.",
-			len(logs), len(logData), filePath, filePath))}
+			len(logs), len(logData), filePath, filePath,
+		))}
 	}
 
 	// Format the logs
@@ -1113,12 +1169,7 @@ func (b *BrowseTools) recentConsoleLogsRun(ctx context.Context, m json.RawMessag
 
 type clearConsoleLogsInput struct{}
 
-func (b *BrowseTools) clearConsoleLogsRun(ctx context.Context, m json.RawMessage) llm.ToolOut {
-	var input clearConsoleLogsInput
-	if err := json.Unmarshal(m, &input); err != nil {
-		return llm.ErrorfToolOut("invalid input: %w", err)
-	}
-
+func (b *BrowseTools) clearConsoleLogsRun(ctx context.Context, input clearConsoleLogsInput) llm.ToolOut {
 	// Ensure browser is initialized
 	_, err := b.GetBrowserContext()
 	if err != nil {

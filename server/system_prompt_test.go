@@ -1,6 +1,9 @@
 package server
 
 import (
+	"context"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +14,7 @@ import (
 // TestSystemPromptIncludesCwdGuidanceFiles verifies that AGENTS.md from the working directory
 // is included in the generated system prompt.
 func TestSystemPromptIncludesCwdGuidanceFiles(t *testing.T) {
+	t.Parallel()
 	// Create a temp directory to serve as our "context directory"
 	tmpDir, err := os.MkdirTemp("", "shelley_test")
 	if err != nil {
@@ -47,6 +51,7 @@ func TestSystemPromptIncludesCwdGuidanceFiles(t *testing.T) {
 // TestSystemPromptEmptyCwdFallsBackToCurrentDir verifies that an empty workingDir
 // causes GenerateSystemPrompt to use the current directory.
 func TestSystemPromptEmptyCwdFallsBackToCurrentDir(t *testing.T) {
+	t.Parallel()
 	// Get current directory for comparison
 	currentDir, err := os.Getwd()
 	if err != nil {
@@ -69,6 +74,7 @@ func TestSystemPromptEmptyCwdFallsBackToCurrentDir(t *testing.T) {
 // correctly detects a git repo in the specified working directory, not the
 // process's cwd. Regression test for https://github.com/boldsoftware/shelley/issues/71
 func TestSystemPromptDetectsGitInWorkingDir(t *testing.T) {
+	t.Parallel()
 	// Create a temp dir with a git repo
 	tmpDir, err := os.MkdirTemp("", "shelley_git_test")
 	if err != nil {
@@ -128,9 +134,7 @@ func TestSystemPromptIncludesSkillsFromAnyWorkingDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+	t.Setenv("HOME", tmpHome)
 
 	// Generate system prompt from a directory completely unrelated to home
 	unrelatedDir := t.TempDir()
@@ -148,6 +152,7 @@ func TestSystemPromptIncludesSkillsFromAnyWorkingDir(t *testing.T) {
 }
 
 func TestSystemPromptIncludesUserEmail(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Without email, no email line in prompt
@@ -248,4 +253,706 @@ func TestSystemPromptDeduplicatesSymlinkedGuidanceFiles(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected SYMLINK_DEDUP_MARKER to appear exactly 1 time, got %d", count)
 	}
+}
+
+func TestRunHookNoHook(t *testing.T) {
+	// With no hook file, runHook returns the prompt unchanged.
+	t.Setenv("HOME", t.TempDir())
+	result, err := runHook("system-prompt", "original prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "original prompt" {
+		t.Errorf("expected original prompt, got %q", result)
+	}
+}
+
+func TestRunHookModifiesPrompt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that prepends "HOOKED: " to the first line
+	hookPath := filepath.Join(hookDir, "system-prompt")
+	script := "#!/bin/sh\nread input\necho \"HOOKED: $input\"\n"
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runHook("system-prompt", "hello world")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "HOOKED: hello world\n" {
+		t.Errorf("expected hooked output, got %q", result)
+	}
+}
+
+func TestRunHookNonExecutable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook file but make it non-executable
+	hookPath := filepath.Join(hookDir, "system-prompt")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho modified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runHook("system-prompt", "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "original" {
+		t.Errorf("non-executable hook should be ignored, got %q", result)
+	}
+}
+
+func TestRunHookFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that exits non-zero
+	hookPath := filepath.Join(hookDir, "system-prompt")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runHook("system-prompt", "original")
+	if err == nil {
+		t.Fatal("expected error from failing hook")
+	}
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("error should mention failure, got: %v", err)
+	}
+}
+
+func TestRunHookEmptyOutput(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that outputs nothing
+	hookPath := filepath.Join(hookDir, "system-prompt")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runHook("system-prompt", "original")
+	if err == nil {
+		t.Fatal("expected error from empty-output hook")
+	}
+	if !strings.Contains(err.Error(), "empty output") {
+		t.Errorf("error should mention empty output, got: %v", err)
+	}
+}
+
+func TestRunHookInvalidName(t *testing.T) {
+	_, err := runHook("../evil", "prompt")
+	if err == nil {
+		t.Fatal("expected error for path-traversal hook name")
+	}
+}
+
+func TestRunHookReceivesFullPrompt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that passes stdin through to stdout (cat)
+	hookPath := filepath.Join(hookDir, "system-prompt")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\ncat\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	multiline := "line1\nline2\nline3\n"
+	result, err := runHook("system-prompt", multiline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != multiline {
+		t.Errorf("cat hook should pass through input unchanged\ngot:  %q\nwant: %q", result, multiline)
+	}
+}
+
+func TestRunNewConversationHookNoHook(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "hello",
+		Model:  "test-model",
+		Cwd:    "/original/dir",
+		Readonly: NewConversationReadonly{
+			ConversationID: "conv-123",
+		},
+	})
+	if result.Cwd != "/original/dir" {
+		t.Errorf("expected /original/dir, got %q", result.Cwd)
+	}
+	if result.Prompt != "hello" {
+		t.Errorf("expected hello, got %q", result.Prompt)
+	}
+	if result.Model != "test-model" {
+		t.Errorf("expected test-model, got %q", result.Model)
+	}
+}
+
+func TestRunNewConversationHookOverridesCwd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that returns a new cwd
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	script := `#!/bin/sh
+echo '{"cwd": "/new/worktree"}'`
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "hello",
+		Model:  "test-model",
+		Cwd:    "/original/dir",
+	})
+	if result.Cwd != "/new/worktree" {
+		t.Errorf("expected /new/worktree, got %q", result.Cwd)
+	}
+	if result.Prompt != "hello" {
+		t.Errorf("prompt should be unchanged, got %q", result.Prompt)
+	}
+}
+
+func TestRunNewConversationHookOverridesAllMutableFields(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	script := `#!/bin/sh
+echo '{"prompt": "modified prompt", "model": "new-model", "cwd": "/new/dir", "slug": "hook-slug"}'`
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "original prompt",
+		Model:  "original-model",
+		Cwd:    "/original/dir",
+	})
+	if result.Prompt != "modified prompt" {
+		t.Errorf("expected modified prompt, got %q", result.Prompt)
+	}
+	if result.Model != "new-model" {
+		t.Errorf("expected new-model, got %q", result.Model)
+	}
+	if result.Cwd != "/new/dir" {
+		t.Errorf("expected /new/dir, got %q", result.Cwd)
+	}
+	if result.Slug != "hook-slug" {
+		t.Errorf("expected hook-slug, got %q", result.Slug)
+	}
+}
+
+func TestRunNewConversationHookSlugOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	script := `#!/bin/sh
+echo '{"slug": "my-slug"}'`
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "original prompt",
+		Model:  "original-model",
+		Cwd:    "/original/dir",
+	})
+	if result.Slug != "my-slug" {
+		t.Errorf("expected my-slug, got %q", result.Slug)
+	}
+	// Other fields should be unchanged.
+	if result.Prompt != "original prompt" {
+		t.Errorf("expected original prompt, got %q", result.Prompt)
+	}
+	if result.Model != "original-model" {
+		t.Errorf("expected original-model, got %q", result.Model)
+	}
+	if result.Cwd != "/original/dir" {
+		t.Errorf("expected /original/dir, got %q", result.Cwd)
+	}
+}
+
+func TestRunNewConversationHookEmptyOutput(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that outputs nothing (no-op)
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "hello",
+		Model:  "test-model",
+		Cwd:    "/original/dir",
+	})
+	if result.Cwd != "/original/dir" {
+		t.Errorf("expected /original/dir, got %q", result.Cwd)
+	}
+}
+
+func TestRunNewConversationHookReceivesJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that saves stdin to a file so we can inspect it
+	dumpFile := filepath.Join(home, "hook-input.json")
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	script := "#!/bin/sh\ncat > " + dumpFile + "\n"
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	RunNewConversationHook(NewConversationHookInput{
+		Prompt: "build me a thing",
+		Model:  "claude-sonnet",
+		Cwd:    "/home/user/project",
+		Readonly: NewConversationReadonly{
+			ConversationID: "conv-456",
+			IsSubagent:     true,
+			ParentID:       "conv-parent",
+			IsOrchestrator: true,
+		},
+	})
+
+	// Read and verify the JSON that was passed to the hook
+	data, err := os.ReadFile(dumpFile)
+	if err != nil {
+		t.Fatalf("failed to read hook input: %v", err)
+	}
+
+	input := string(data)
+	// Mutable fields at top level
+	for _, expected := range []string{
+		`"prompt":"build me a thing"`,
+		`"model":"claude-sonnet"`,
+		`"cwd":"/home/user/project"`,
+	} {
+		if !strings.Contains(input, expected) {
+			t.Errorf("hook input missing %q\ngot: %s", expected, input)
+		}
+	}
+	// Readonly fields nested under "readonly"
+	for _, expected := range []string{
+		`"conversation_id":"conv-456"`,
+		`"is_subagent":true`,
+		`"parent_id":"conv-parent"`,
+		`"is_orchestrator":true`,
+	} {
+		if !strings.Contains(input, expected) {
+			t.Errorf("hook input missing %q\ngot: %s", expected, input)
+		}
+	}
+	// Verify the readonly block exists
+	if !strings.Contains(input, `"readonly":{`) {
+		t.Errorf("hook input should have a 'readonly' block\ngot: %s", input)
+	}
+}
+
+func TestRunNewConversationHookFailureReturnsOriginals(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that fails
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "hello",
+		Model:  "my-model",
+		Cwd:    "/original/dir",
+	})
+	if result.Cwd != "/original/dir" {
+		t.Errorf("expected /original/dir on failure, got %q", result.Cwd)
+	}
+	if result.Prompt != "hello" {
+		t.Errorf("expected hello on failure, got %q", result.Prompt)
+	}
+	if result.Model != "my-model" {
+		t.Errorf("expected my-model on failure, got %q", result.Model)
+	}
+}
+
+func TestRunNewConversationHookInvalidJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook that returns invalid JSON
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho 'not json'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Cwd: "/original/dir",
+	})
+	if result.Cwd != "/original/dir" {
+		t.Errorf("expected /original/dir on invalid JSON, got %q", result.Cwd)
+	}
+}
+
+func TestRunNewConversationHookNonExecutable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a hook file but make it non-executable
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho modified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Cwd: "/original/dir",
+	})
+	if result.Cwd != "/original/dir" {
+		t.Errorf("expected /original/dir for non-executable hook, got %q", result.Cwd)
+	}
+}
+
+func TestRunNewConversationHookPartialOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hook only overrides model, leaving prompt and cwd unchanged
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	script := `#!/bin/sh
+echo '{"model": "better-model"}'`
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := RunNewConversationHook(NewConversationHookInput{
+		Prompt: "keep this",
+		Model:  "original-model",
+		Cwd:    "/keep/this/too",
+	})
+	if result.Prompt != "keep this" {
+		t.Errorf("prompt should be unchanged, got %q", result.Prompt)
+	}
+	if result.Model != "better-model" {
+		t.Errorf("expected better-model, got %q", result.Model)
+	}
+	if result.Cwd != "/keep/this/too" {
+		t.Errorf("cwd should be unchanged, got %q", result.Cwd)
+	}
+}
+
+// TestSubagentSystemPromptIncludesSkills verifies that skills are included
+// in subagent system prompts.
+func TestSubagentSystemPromptIncludesSkills(t *testing.T) {
+	t.Parallel()
+	// Create a temp directory with a .skills directory
+	tmpDir, err := os.MkdirTemp("", "shelley_subagent_skills_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize a git repo (skills discovery works better in git repos)
+	cmd := exec.Command("git", "init")
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+
+	// Create a .skills directory with a test skill
+	skillsDir := filepath.Join(tmpDir, ".skills")
+	if err = os.Mkdir(skillsDir, 0o755); err != nil {
+		t.Fatalf("failed to create .skills dir: %v", err)
+	}
+
+	// Create a test skill directory and file
+	testSkillDir := filepath.Join(skillsDir, "test-skill")
+	if err := os.Mkdir(testSkillDir, 0o755); err != nil {
+		t.Fatalf("failed to create test-skill dir: %v", err)
+	}
+
+	skillContent := `---
+name: test-skill
+description: A test skill for verification
+---
+This is a test skill.
+`
+	skillFile := filepath.Join(testSkillDir, "SKILL.md")
+	if err := os.WriteFile(skillFile, []byte(skillContent), 0o644); err != nil {
+		t.Fatalf("failed to write skill file: %v", err)
+	}
+
+	// Generate subagent system prompt
+	prompt, err := GenerateSubagentSystemPrompt(tmpDir, "parent-conv-id")
+	if err != nil {
+		t.Fatalf("GenerateSubagentSystemPrompt failed: %v", err)
+	}
+
+	// Verify the skills section is present
+	if !strings.Contains(prompt, "<skills>") {
+		t.Errorf("subagent prompt should contain <skills> section")
+		t.Logf("Prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "test-skill") {
+		t.Errorf("subagent prompt should contain the test skill name")
+		t.Logf("Prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "A test skill for verification") {
+		t.Errorf("subagent prompt should contain the test skill description")
+	}
+	if !strings.Contains(prompt, "Skills extend your capabilities") {
+		t.Errorf("subagent prompt should contain skills introduction text")
+	}
+}
+
+// TestOrchestratorSubagentSystemPromptIncludesSkills verifies that skills are
+// included in orchestrator subagent system prompts.
+func TestOrchestratorSubagentSystemPromptIncludesSkills(t *testing.T) {
+	t.Parallel()
+	// Create a temp directory with a .skills directory
+	tmpDir, err := os.MkdirTemp("", "shelley_orch_subagent_skills_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize a git repo (skills discovery works better in git repos)
+	cmd := exec.Command("git", "init")
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+
+	// Create a .skills directory with a test skill
+	skillsDir := filepath.Join(tmpDir, ".skills")
+	if err := os.Mkdir(skillsDir, 0o755); err != nil {
+		t.Fatalf("failed to create .skills dir: %v", err)
+	}
+
+	// Create a test skill directory and file
+	orchSkillDir := filepath.Join(skillsDir, "orchestrator-test-skill")
+	if err := os.Mkdir(orchSkillDir, 0o755); err != nil {
+		t.Fatalf("failed to create orchestrator-test-skill dir: %v", err)
+	}
+
+	skillContent := `---
+name: orchestrator-test-skill
+description: An orchestrator test skill
+---
+This is a test skill for orchestrators.
+`
+	skillFile := filepath.Join(orchSkillDir, "SKILL.md")
+	if err := os.WriteFile(skillFile, []byte(skillContent), 0o644); err != nil {
+		t.Fatalf("failed to write skill file: %v", err)
+	}
+
+	// Generate orchestrator subagent system prompt
+	prompt, err := GenerateOrchestratorSubagentSystemPrompt(tmpDir, "parent-conv-id")
+	if err != nil {
+		t.Fatalf("GenerateOrchestratorSubagentSystemPrompt failed: %v", err)
+	}
+
+	// Verify the skills section is present
+	if !strings.Contains(prompt, "<skills>") {
+		t.Errorf("orchestrator subagent prompt should contain <skills> section")
+	}
+	if !strings.Contains(prompt, "orchestrator-test-skill") {
+		t.Errorf("orchestrator subagent prompt should contain the test skill name")
+	}
+	if !strings.Contains(prompt, "An orchestrator test skill") {
+		t.Errorf("orchestrator subagent prompt should contain the test skill description")
+	}
+}
+
+func TestNewConversationHookAppliesSlug(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hookDir := filepath.Join(home, ".config", "shelley", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hookPath := filepath.Join(hookDir, "new-conversation")
+	script := `#!/bin/sh
+echo '{"slug": "Hello World!"}'`
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewTestHarness(t)
+	h.NewConversation("first message", "")
+
+	// Read back the conversation; slug should have been applied + sanitized.
+	conv, err := h.db.GetConversationByID(context.Background(), h.convID)
+	if err != nil {
+		t.Fatalf("GetConversation: %v", err)
+	}
+	if conv.Slug == nil {
+		t.Fatalf("slug not set on conversation")
+	}
+	if *conv.Slug != "hello-world" {
+		t.Errorf("slug = %q, want %q", *conv.Slug, "hello-world")
+	}
+}
+
+func TestRunEndOfTurnHookNoHook(t *testing.T) {
+	// Should be a no-op and not panic.
+	RunEndOfTurnHookIn(t.TempDir(), EndOfTurnHookInput{ConversationID: "abc"})
+}
+
+func TestRunEndOfTurnHookReceivesJSON(t *testing.T) {
+	// Use an explicit per-test hooks dir rather than t.Setenv("HOME"):
+	// $HOME is process-wide and other tests in this package fire the
+	// end-of-turn hook in background goroutines (via RunEndOfTurnHook
+	// at end-of-turn in predictable-model conversations). Those would
+	// race with this test's hook script and clobber dumpFile.
+	hooksDir := t.TempDir()
+	dumpFile := filepath.Join(t.TempDir(), "end-of-turn.json")
+	hookPath := filepath.Join(hooksDir, "end-of-turn")
+	script := "#!/bin/sh\ncat > " + dumpFile + "\n"
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	RunEndOfTurnHookIn(hooksDir, EndOfTurnHookInput{
+		Type:            "end_of_turn",
+		ConversationID:  "conv-789",
+		Hostname:        "phil-dev",
+		Model:           "claude-sonnet",
+		Slug:            "my-slug",
+		ConversationURL: "https://phil-dev.exe.xyz/c/my-slug",
+		VMName:          "phil-dev",
+		FinalResponse:   "all done",
+	})
+
+	data, err := os.ReadFile(dumpFile)
+	if err != nil {
+		t.Fatalf("failed to read hook input: %v", err)
+	}
+	input := string(data)
+	for _, expected := range []string{
+		`"type":"end_of_turn"`,
+		`"conversation_id":"conv-789"`,
+		`"hostname":"phil-dev"`,
+		`"model":"claude-sonnet"`,
+		`"slug":"my-slug"`,
+		`"conversation_url":"https://phil-dev.exe.xyz/c/my-slug"`,
+		`"vm_name":"phil-dev"`,
+		`"final_response":"all done"`,
+	} {
+		if !strings.Contains(input, expected) {
+			t.Errorf("hook input missing %q\ngot: %s", expected, input)
+		}
+	}
+}
+
+func TestRunEndOfTurnHookFailureIsNonFatal(t *testing.T) {
+	hooksDir := t.TempDir()
+	hookPath := filepath.Join(hooksDir, "end-of-turn")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Just make sure it doesn't panic.
+	RunEndOfTurnHookIn(hooksDir, EndOfTurnHookInput{ConversationID: "abc"})
+}
+
+func TestExeDevDefaultPortUsesInjectableClient(t *testing.T) {
+	oldClient := exeDevDefaultPortHTTPClient
+	t.Cleanup(func() { exeDevDefaultPortHTTPClient = oldClient })
+
+	exeDevDefaultPortHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != "https://reflection.int.exe.xyz/default_port" {
+			t.Fatalf("unexpected URL %s", req.URL)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"default_port":8123}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	if got := exeDevDefaultPort(); got != 8123 {
+		t.Fatalf("exeDevDefaultPort() = %d, want 8123", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

@@ -25,6 +25,7 @@ interface CommandPaletteProps {
   onSelectConversation: (conversation: ConversationWithState) => void;
   onArchiveConversation: (conversationId: string) => void;
   onOpenDiffViewer: () => void;
+  onOpenGitGraph: () => void;
   onOpenModelsModal: () => void;
   onOpenNotificationsModal: () => void;
   onNextConversation: () => void;
@@ -79,6 +80,7 @@ function CommandPalette({
   onSelectConversation,
   onArchiveConversation,
   onOpenDiffViewer,
+  onOpenGitGraph,
   onOpenModelsModal,
   onOpenNotificationsModal,
   onNextConversation,
@@ -92,6 +94,11 @@ function CommandPalette({
   const [searchResults, setSearchResults] = useState<ConversationWithState[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isCreatingWorktree, setIsCreatingWorktree] = useState(false);
+  // Git roots for the current cwd in the new-conversation view (no
+  // currentConversation). Fetched on open from the directory picker API so we
+  // can offer "change dir to git root / worktree root" actions.
+  const [newConvGitRepoRoot, setNewConvGitRepoRoot] = useState<string | null>(null);
+  const [newConvGitWorktreeRoot, setNewConvGitWorktreeRoot] = useState<string | null>(null);
   const { markdownMode, setMarkdownMode } = useMarkdown();
   const { t, locale, setLocale } = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -139,6 +146,41 @@ function CommandPalette({
       }
     };
   }, [query, searchConversations]);
+
+  // When the palette opens, look up git roots for the locally-selected cwd
+  // (used to populate cwd for a new conversation) so we can offer quick
+  // "set new conversation dir to git root" actions. We do this even when a
+  // conversation is open — the actions set the cwd for the *next* new
+  // conversation, not the current one.
+  useEffect(() => {
+    if (!isOpen) {
+      setNewConvGitRepoRoot(null);
+      setNewConvGitWorktreeRoot(null);
+      return;
+    }
+    // Prefer current conversation's cwd, else the sticky stored cwd, else
+    // the server-provided default cwd. The default isn't written to
+    // localStorage until the user explicitly picks a dir, so without this
+    // fallback the git-root actions wouldn't appear on a fresh install.
+    const cwd =
+      currentConversation?.cwd ||
+      localStorage.getItem("shelley_selected_cwd") ||
+      window.__SHELLEY_INIT__?.default_cwd ||
+      null;
+    if (!cwd) return;
+    let cancelled = false;
+    api
+      .listDirectory(cwd)
+      .then((res) => {
+        if (cancelled) return;
+        setNewConvGitRepoRoot(res.git_repo_root ?? null);
+        setNewConvGitWorktreeRoot(res.git_worktree_root ?? null);
+      })
+      .catch((err) => console.error("Failed to list dir for git roots:", err));
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, currentConversation]);
 
   // Build action items (these are always available)
   const actionItems: CommandItem[] = useMemo(() => {
@@ -275,6 +317,28 @@ function CommandPalette({
         },
         keywords: ["diff", "git", "changes", "view", "compare"],
       });
+
+      items.push({
+        id: "open-git-graph",
+        type: "action",
+        title: t("gitGraph"),
+        subtitle: t("openGitGraphViewer"),
+        icon: (
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="16" height="16">
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M6 3v12m0 0a3 3 0 103 3 3 3 0 00-3-3zm0-12a3 3 0 100 6 3 3 0 000-6zm12 0a3 3 0 100 6 3 3 0 000-6zm0 6c0 4-6 4-6 9"
+            />
+          </svg>
+        ),
+        action: () => {
+          onOpenGitGraph();
+          onClose();
+        },
+        keywords: ["git", "graph", "log", "commits", "history", "branch", "tree"],
+      });
     }
 
     items.push({
@@ -401,6 +465,80 @@ function CommandPalette({
       });
     }
 
+    // "Set new conversation dir to git root / workspace root" actions.
+    // These set the cwd for a *new* conversation (the current conversation's
+    // cwd is immutable). Available whenever we know the relevant root,
+    // whether from the current conversation or from the sticky cwd.
+    const cwdRepoRoot = currentConversation?.git_repo_root || newConvGitRepoRoot;
+    const cwdWorktreeRoot = currentConversation?.git_worktree_root || newConvGitWorktreeRoot;
+    const cwdNow =
+      currentConversation?.cwd ||
+      localStorage.getItem("shelley_selected_cwd") ||
+      window.__SHELLEY_INIT__?.default_cwd ||
+      null;
+    const folderIcon = (
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="16" height="16">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
+        />
+      </svg>
+    );
+    if (cwdRepoRoot && cwdRepoRoot !== cwdNow) {
+      items.push({
+        id: "set-dir-git-root",
+        type: "action",
+        title: "Set new conversation dir to Git root",
+        subtitle: cwdRepoRoot,
+        icon: folderIcon,
+        action: () => {
+          onNewConversationWithCwd(cwdRepoRoot);
+          onClose();
+        },
+        keywords: [
+          "cd",
+          "change",
+          "set",
+          "dir",
+          "directory",
+          "cwd",
+          "git",
+          "root",
+          "toplevel",
+          "repo",
+        ],
+      });
+    }
+    if (cwdWorktreeRoot && cwdWorktreeRoot !== cwdNow && cwdWorktreeRoot !== cwdRepoRoot) {
+      items.push({
+        id: "set-dir-git-workspace-root",
+        type: "action",
+        title: "Set new conversation dir to Git workspace root",
+        subtitle: cwdWorktreeRoot,
+        icon: folderIcon,
+        action: () => {
+          onNewConversationWithCwd(cwdWorktreeRoot);
+          onClose();
+        },
+        keywords: [
+          "cd",
+          "change",
+          "set",
+          "dir",
+          "directory",
+          "cwd",
+          "git",
+          "workspace",
+          "worktree",
+          "main",
+          "repo",
+          "root",
+        ],
+      });
+    }
+
     // New conversation in repo root (only when current cwd is a worktree)
     if (currentConversation?.git_worktree_root) {
       items.push({
@@ -474,6 +612,7 @@ function CommandPalette({
         | "spanish"
         | "simplifiedChinese"
         | "traditionalChinese"
+        | "vietnamese"
         | "upgoerFive";
       nativeName: string;
       keywords: string[];
@@ -528,6 +667,13 @@ function CommandPalette({
         keywords: ["chinese", "traditional", "zh", "zh-tw", "\u4e2d\u6587", "\u7e41\u9ad4"],
       },
       {
+        loc: "vi",
+        flag: "\ud83c\uddfb\ud83c\uddf3",
+        name: "vietnamese",
+        nativeName: "Tiếng Việt",
+        keywords: ["vietnamese", "vi", "tiếng việt", "tieng viet"],
+      },
+      {
         loc: "upgoer5",
         flag: "\ud83d\ude80",
         name: "upgoerFive",
@@ -572,6 +718,7 @@ function CommandPalette({
     onNextUserMessage,
     onPreviousUserMessage,
     onOpenDiffViewer,
+    onOpenGitGraph,
     onOpenModelsModal,
     onOpenNotificationsModal,
     onArchiveConversation,
@@ -582,6 +729,8 @@ function CommandPalette({
     isCreatingWorktree,
     markdownMode,
     setMarkdownMode,
+    newConvGitRepoRoot,
+    newConvGitWorktreeRoot,
   ]);
 
   // Convert conversations to command items

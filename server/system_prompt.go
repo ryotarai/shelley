@@ -1,14 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -38,6 +43,7 @@ type SystemPromptData struct {
 	IsExeDev         bool
 	IsSudoAvailable  bool
 	Hostname         string // For exe.dev, the public hostname (e.g., "vmname.exe.xyz")
+	DefaultPort      int    // For exe.dev, the auto-routed HTTP port, 0 if unknown
 	SkillsXML        string // XML block for available skills
 	UserEmail        string // The exe.dev auth email of the user, if known
 }
@@ -110,7 +116,8 @@ func GenerateSystemPrompt(workingDir string, opts ...SystemPromptOption) (string
 		return "", fmt.Errorf("failed to execute template: %w", err)
 	}
 
-	return collapseBlankLines(buf.String()), nil
+	prompt := collapseBlankLines(buf.String())
+	return runHook(hookSystemPrompt, prompt)
 }
 
 // collapseBlankLines reduces runs of 3+ newlines to 2 (one blank line)
@@ -121,6 +128,292 @@ func collapseBlankLines(s string) string {
 	s = strings.TrimSpace(s)
 	s = reBlankRun.ReplaceAllString(s, "\n\n")
 	return s + "\n"
+}
+
+const (
+	hookSystemPrompt    = "system-prompt"
+	hookNewConversation = "new-conversation"
+	hookEndOfTurn       = "end-of-turn"
+)
+
+// NewConversationHookInput is the JSON data passed to the new-conversation hook on stdin.
+// The JSON has mutable fields at the top level and a "readonly" block for context.
+//
+// Example JSON:
+//
+//	{
+//	  "prompt": "the user's message",
+//	  "model": "claude-sonnet-4.5",
+//	  "cwd": "/home/user/project",
+//	  "readonly": {
+//	    "conversation_id": "abc-123",
+//	    "is_subagent": false,
+//	    "parent_id": "",
+//	    "is_orchestrator": false
+//	  }
+//	}
+//
+// The hook should output the same top-level JSON shape (prompt, model, cwd, slug).
+// Only the mutable fields are read from the output; "readonly" is ignored.
+// Empty output means no changes. Unknown fields are ignored.
+//
+// If "slug" is set, it replaces Shelley's async LLM-generated slug for the new
+// conversation. The slug is sanitized via slug.Sanitize before use; if the
+// sanitized form is empty, or the slug collides with an existing one, Shelley
+// falls back to its normal async slug generation.
+type NewConversationHookInput struct {
+	// Mutable fields — the hook may change these.
+	Prompt string `json:"prompt"`
+	Model  string `json:"model"`
+	Cwd    string `json:"cwd"`
+
+	// Readonly context — visible to the hook but changes are ignored.
+	Readonly NewConversationReadonly `json:"readonly"`
+}
+
+// NewConversationReadonly contains context fields the hook can read but not change.
+type NewConversationReadonly struct {
+	ConversationID string `json:"conversation_id"`
+	IsSubagent     bool   `json:"is_subagent"`
+	ParentID       string `json:"parent_id,omitempty"`
+	IsOrchestrator bool   `json:"is_orchestrator"`
+}
+
+// NewConversationHookResult contains the (possibly modified) mutable fields
+// returned from the new-conversation hook.
+type NewConversationHookResult struct {
+	Prompt string
+	Model  string
+	Cwd    string
+	Slug   string
+}
+
+// RunNewConversationHook runs the new-conversation hook from the
+// default user hooks directory ($HOME/.config/shelley/hooks). Tests
+// that want to invoke a hook script from a temp directory should
+// call RunNewConversationHookIn directly, which avoids the
+// process-wide $HOME env var (concurrent tests that share a Server
+// would otherwise race on it).
+func RunNewConversationHook(input NewConversationHookInput) NewConversationHookResult {
+	return RunNewConversationHookIn(defaultHooksDir(), input)
+}
+
+// RunNewConversationHookIn is the dir-explicit variant of
+// RunNewConversationHook.
+func RunNewConversationHookIn(hooksDir string, input NewConversationHookInput) NewConversationHookResult {
+	original := NewConversationHookResult{
+		Prompt: input.Prompt,
+		Model:  input.Model,
+		Cwd:    input.Cwd,
+	}
+
+	hookPath, err := findHookIn(hooksDir, hookNewConversation)
+	if err != nil {
+		slog.Error("new-conversation hook: findHook failed", "error", err)
+		return original
+	}
+	if hookPath == "" {
+		return original
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		slog.Error("new-conversation hook: failed to marshal input", "error", err)
+		return original
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, hookPath)
+	cmd.Stdin = strings.NewReader(string(inputJSON))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		slog.Error("new-conversation hook failed", "hook", hookPath, "error", err, "stderr", stderr.String())
+		return original
+	}
+
+	output := strings.TrimSpace(stdout.String())
+	if output == "" {
+		// Empty output is fine — hook ran but has no overrides.
+		return original
+	}
+
+	// Parse only the mutable fields from the output.
+	var hookOut struct {
+		Prompt string `json:"prompt"`
+		Model  string `json:"model"`
+		Cwd    string `json:"cwd"`
+		Slug   string `json:"slug"`
+	}
+	if err := json.Unmarshal([]byte(output), &hookOut); err != nil {
+		slog.Error("new-conversation hook: invalid JSON output", "error", err, "output", output)
+		return original
+	}
+
+	result := original
+	if hookOut.Cwd != "" {
+		result.Cwd = hookOut.Cwd
+	}
+	if hookOut.Prompt != "" {
+		result.Prompt = hookOut.Prompt
+	}
+	if hookOut.Model != "" {
+		result.Model = hookOut.Model
+	}
+	if hookOut.Slug != "" {
+		result.Slug = hookOut.Slug
+	}
+
+	if result != original {
+		slog.Info("new-conversation hook applied overrides",
+			"cwdChanged", result.Cwd != original.Cwd,
+			"promptChanged", result.Prompt != original.Prompt,
+			"modelChanged", result.Model != original.Model,
+			"slugChanged", result.Slug != original.Slug,
+		)
+	}
+
+	return result
+}
+
+// EndOfTurnHookInput is the JSON data passed to the end-of-turn hook on stdin.
+// It mirrors the notifications.Event shape that drives end-of-turn notifications
+// (notification channels, push notifications, conversation-hook webhooks), so a
+// local hook can react to the same signal.
+type EndOfTurnHookInput struct {
+	Type           string    `json:"type"`
+	ConversationID string    `json:"conversation_id"`
+	Timestamp      time.Time `json:"timestamp"`
+
+	// Payload fields, flattened from notifications.AgentDonePayload.
+	Hostname        string `json:"hostname,omitempty"`
+	Model           string `json:"model,omitempty"`
+	Slug            string `json:"slug,omitempty"`
+	ConversationURL string `json:"conversation_url,omitempty"`
+	VMName          string `json:"vm_name,omitempty"`
+	FinalResponse   string `json:"final_response,omitempty"`
+}
+
+// RunEndOfTurnHook fires the end-of-turn hook from the default user
+// hooks directory ($HOME/.config/shelley/hooks). See RunEndOfTurnHookIn
+// for the dir-explicit variant used by tests.
+func RunEndOfTurnHook(input EndOfTurnHookInput) {
+	RunEndOfTurnHookIn(defaultHooksDir(), input)
+}
+
+// RunEndOfTurnHookIn runs the end-of-turn hook from an explicit
+// hooks directory. It runs the hook with the event JSON on stdin
+// and ignores stdout. Failures are logged and non-fatal: the hook
+// is purely a side-channel for local automation (sound, desktop
+// notification, etc).
+func RunEndOfTurnHookIn(hooksDir string, input EndOfTurnHookInput) {
+	hookPath, err := findHookIn(hooksDir, hookEndOfTurn)
+	if err != nil {
+		slog.Error("end-of-turn hook: findHook failed", "error", err)
+		return
+	}
+	if hookPath == "" {
+		return
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		slog.Error("end-of-turn hook: failed to marshal input", "error", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, hookPath)
+	cmd.Stdin = strings.NewReader(string(inputJSON))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		slog.Error("end-of-turn hook failed", "hook", hookPath, "error", err, "stderr", stderr.String())
+		return
+	}
+	slog.Info("end-of-turn hook applied", "hook", hookPath, "conversationID", input.ConversationID)
+}
+
+// defaultHooksDir is $HOME/.config/shelley/hooks, or "" if $HOME is
+// not set. Resolved on each call so that, e.g., a test that swaps
+// $HOME locally still sees its change.
+func defaultHooksDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "shelley", "hooks")
+}
+
+// findHook is a thin wrapper around findHookIn for the default hooks dir.
+func findHook(name string) (string, error) {
+	return findHookIn(defaultHooksDir(), name)
+}
+
+// findHookIn returns the path to the named hook inside dir if it
+// exists and is executable, or "" if not found.
+func findHookIn(dir, name string) (string, error) {
+	if filepath.Base(name) != name {
+		return "", fmt.Errorf("invalid hook name: %q", name)
+	}
+	if dir == "" {
+		return "", nil
+	}
+	hookPath := filepath.Join(dir, name)
+	info, err := os.Stat(hookPath)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() || info.Mode()&0o111 == 0 {
+		return "", nil
+	}
+	return hookPath, nil
+}
+
+// runHook checks for an executable hook at ~/.config/shelley/hooks/<name> and,
+// if found, runs it with the prompt on stdin. The hook's stdout replaces the
+// prompt. If the hook doesn't exist, the prompt is returned unchanged. If the
+// hook exists but fails, an error is returned.
+func runHook(name, prompt string) (string, error) {
+	hookPath, err := findHook(name)
+	if err != nil {
+		return "", fmt.Errorf("hook %s: %w", name, err)
+	}
+	if hookPath == "" {
+		return prompt, nil // no hook
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, hookPath)
+	cmd.Stdin = strings.NewReader(prompt)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("hook %s failed: %w (stderr: %s)", hookPath, err, stderr.String())
+	}
+
+	result := stdout.String()
+	if result == "" {
+		return "", fmt.Errorf("hook %s returned empty output", hookPath)
+	}
+
+	slog.Info("hook applied", "name", name, "hook", hookPath, "originalLen", len(prompt), "newLen", len(result))
+	return result, nil
 }
 
 func collectSystemData(workingDir string) (*SystemPromptData, error) {
@@ -137,25 +430,44 @@ func collectSystemData(workingDir string) (*SystemPromptData, error) {
 		WorkingDirectory: wd,
 	}
 
-	// Try to collect git info
+	// collectGitInfo shells out to `git rev-parse`; resolve it first so the
+	// codebase and skill walks below can scope to the git root.
 	gitInfo, err := collectGitInfo(wd)
 	if err == nil {
 		data.GitInfo = gitInfo
 	}
-
-	// Collect codebase info
-	codebaseInfo, err := collectCodebaseInfo(wd, gitInfo)
-	if err == nil {
-		data.Codebase = codebaseInfo
+	var gitRoot string
+	if gitInfo != nil {
+		gitRoot = gitInfo.Root
 	}
 
-	// Check if running on exe.dev
+	// Check if running on exe.dev (cheap stat).
 	data.IsExeDev = isExeDev()
 
-	// Check sudo availability
-	data.IsSudoAvailable = isSudoAvailable()
+	// The codebase-info and skill walks each traverse the project tree,
+	// stat'ing every directory and (for codebase info) reading guidance files.
+	// They are independent and dominate Hydrate's wall time — measured ~50ms
+	// each under -race on a moderately sized repo, more on loaded CI workers.
+	// Run them concurrently; the slowest of the two becomes the floor instead
+	// of their sum.
+	var (
+		codebaseInfo *CodebaseInfo
+		codebaseErr  error
+		skillsXML    string
+		wg           sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		codebaseInfo, codebaseErr = collectCodebaseInfo(wd, gitInfo)
+	}()
+	go func() {
+		defer wg.Done()
+		skillsXML = collectSkills(wd, gitRoot, skills.Env{ExeDev: data.IsExeDev})
+	}()
 
-	// Get hostname for exe.dev
+	// Run the remaining cheap synchronous probes while the walks are in flight.
+	data.IsSudoAvailable = isSudoAvailable()
 	if data.IsExeDev {
 		if hostname, err := os.Hostname(); err == nil {
 			// If hostname doesn't contain dots, add .exe.xyz suffix
@@ -164,14 +476,14 @@ func collectSystemData(workingDir string) (*SystemPromptData, error) {
 			}
 			data.Hostname = hostname
 		}
+		data.DefaultPort = exeDevDefaultPort()
 	}
 
-	// Discover and load skills
-	var gitRoot string
-	if gitInfo != nil {
-		gitRoot = gitInfo.Root
+	wg.Wait()
+	if codebaseErr == nil {
+		data.Codebase = codebaseInfo
 	}
-	data.SkillsXML = collectSkills(wd, gitRoot)
+	data.SkillsXML = skillsXML
 
 	return data, nil
 }
@@ -357,10 +669,40 @@ func isExeDev() bool {
 	return err == nil
 }
 
+// exeDevDefaultPort returns the live HTTP proxy port for this VM, fetched
+// via the default "reflection" integration. Returns 0 if unavailable
+// (integration disabled/detached, network error, etc.).
+var exeDevDefaultPortHTTPClient = http.DefaultClient
+
+func exeDevDefaultPort() int {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://reflection.int.exe.xyz/default_port", nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := exeDevDefaultPortHTTPClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+	var body struct {
+		DefaultPort int `json:"default_port"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0
+	}
+	return body.DefaultPort
+}
+
 // collectSkills discovers skills from default directories, project .skills dirs,
 // the project tree, and built-in skills. See skills.ListAll for precedence rules.
-func collectSkills(workingDir, gitRoot string) string {
-	return skills.ToPromptXML(skills.ListAll(workingDir, gitRoot))
+// Skills with a `when:` clause are filtered against env.
+func collectSkills(workingDir, gitRoot string, env skills.Env) string {
+	return skills.ToPromptXML(skills.Filter(skills.ListAll(workingDir, gitRoot), env))
 }
 
 // resolveAndNormalize returns a canonical lowercase path for dedup.
@@ -390,6 +732,7 @@ type SubagentSystemPromptData struct {
 	ShelleyDBPath      string
 	ConversationID     string // Parent conversation ID for querying user messages
 	OperationalContext string // Rendered operational context (orchestrator subagents only)
+	SkillsXML          string // XML block for available skills
 }
 
 // OrchestratorSystemPromptData contains data for orchestrator system prompts.
@@ -426,6 +769,13 @@ func GenerateSubagentSystemPrompt(workingDir, parentConversationID string) (stri
 		data.GitInfo = gitInfo
 	}
 
+	// Collect skills
+	gitRoot := ""
+	if gitInfo != nil {
+		gitRoot = gitInfo.Root
+	}
+	data.SkillsXML = collectSkills(wd, gitRoot, skills.Env{ExeDev: isExeDev()})
+
 	tmpl, err := template.New("subagent_system_prompt").Parse(subagentSystemPromptTemplate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse subagent template: %w", err)
@@ -437,7 +787,8 @@ func GenerateSubagentSystemPrompt(workingDir, parentConversationID string) (stri
 		return "", fmt.Errorf("failed to execute subagent template: %w", err)
 	}
 
-	return collapseBlankLines(buf.String()), nil
+	prompt := collapseBlankLines(buf.String())
+	return runHook(hookSystemPrompt, prompt)
 }
 
 // renderOperationalContext renders the operational context template for the given working directory
@@ -514,19 +865,37 @@ func GenerateOrchestratorSystemPrompt(workingDir, contextDir, conversationID str
 		return "", err
 	}
 
-	return collapseBlankLines(buf.String() + "\n\n" + operationalCtx), nil
+	prompt := collapseBlankLines(buf.String() + "\n\n" + operationalCtx)
+	return runHook(hookSystemPrompt, prompt)
 }
 
 // GenerateOrchestratorSubagentSystemPrompt generates the system prompt for
 // subagents spawned by an orchestrator conversation.
 func GenerateOrchestratorSubagentSystemPrompt(workingDir, parentConversationID string) (string, error) {
-	operationalCtx, err := renderOperationalContext(workingDir, parentConversationID, true)
+	wd := workingDir
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get working directory: %w", err)
+		}
+	}
+
+	operationalCtx, err := renderOperationalContext(wd, parentConversationID, true)
 	if err != nil {
 		return "", err
 	}
 
+	// Collect git info for skills
+	gitInfo, _ := collectGitInfo(wd)
+	gitRoot := ""
+	if gitInfo != nil {
+		gitRoot = gitInfo.Root
+	}
+
 	data := &SubagentSystemPromptData{
 		OperationalContext: operationalCtx,
+		SkillsXML:          collectSkills(wd, gitRoot, skills.Env{ExeDev: isExeDev()}),
 	}
 
 	tmpl, err := template.New("orchestrator_subagent_system_prompt").Parse(orchestratorSubagentSystemPromptTemplate)
@@ -539,5 +908,6 @@ func GenerateOrchestratorSubagentSystemPrompt(workingDir, parentConversationID s
 		return "", fmt.Errorf("failed to execute orchestrator subagent template: %w", err)
 	}
 
-	return collapseBlankLines(buf.String()), nil
+	prompt := collapseBlankLines(buf.String())
+	return runHook(hookSystemPrompt, prompt)
 }

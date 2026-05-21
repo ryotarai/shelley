@@ -261,17 +261,68 @@ func All() []Model {
 			},
 		},
 		{
-			ID:              "glm-4.7-fireworks",
+			ID:              "deepseek-v4-pro-fireworks",
 			Provider:        ProviderFireworks,
-			Description:     "GLM-4.7 on Fireworks",
+			Description:     "DeepSeek V4 Pro on Fireworks",
 			RequiredEnvVars: []string{"FIREWORKS_API_KEY"},
 			GatewayEnabled:  true,
 			Factory: func(config *Config, httpc *http.Client) (llm.Service, error) {
 				if config.FireworksAPIKey == "" {
-					return nil, fmt.Errorf("glm-4.7-fireworks requires FIREWORKS_API_KEY")
+					return nil, fmt.Errorf("deepseek-v4-pro-fireworks requires FIREWORKS_API_KEY")
 				}
-				svc := &oai.Service{Model: oai.GLM47Fireworks, APIKey: config.FireworksAPIKey, HTTPC: httpc}
+				svc := &oai.Service{Model: oai.DeepseekV4ProFireworks, APIKey: config.FireworksAPIKey, HTTPC: httpc}
 				if url := config.getFireworksURL(); url != "" {
+					svc.ModelURL = url
+				}
+				return svc, nil
+			},
+		},
+		{
+			ID:              "glm-5.1-fireworks",
+			Provider:        ProviderFireworks,
+			Description:     "GLM-5.1 on Fireworks",
+			RequiredEnvVars: []string{"FIREWORKS_API_KEY"},
+			GatewayEnabled:  true,
+			Factory: func(config *Config, httpc *http.Client) (llm.Service, error) {
+				if config.FireworksAPIKey == "" {
+					return nil, fmt.Errorf("glm-5.1-fireworks requires FIREWORKS_API_KEY")
+				}
+				svc := &oai.Service{Model: oai.GLM51Fireworks, APIKey: config.FireworksAPIKey, HTTPC: httpc}
+				if url := config.getFireworksURL(); url != "" {
+					svc.ModelURL = url
+				}
+				return svc, nil
+			},
+		},
+		{
+			ID:              "kimi-k2.6-fireworks",
+			Provider:        ProviderFireworks,
+			Description:     "Kimi K2.6 on Fireworks",
+			RequiredEnvVars: []string{"FIREWORKS_API_KEY"},
+			GatewayEnabled:  true,
+			Factory: func(config *Config, httpc *http.Client) (llm.Service, error) {
+				if config.FireworksAPIKey == "" {
+					return nil, fmt.Errorf("kimi-k2.6-fireworks requires FIREWORKS_API_KEY")
+				}
+				svc := &oai.Service{Model: oai.KimiK26Fireworks, APIKey: config.FireworksAPIKey, HTTPC: httpc}
+				if url := config.getFireworksURL(); url != "" {
+					svc.ModelURL = url
+				}
+				return svc, nil
+			},
+		},
+		{
+			ID:              "gpt-5.5",
+			Provider:        ProviderOpenAI,
+			Description:     "GPT-5.5",
+			RequiredEnvVars: []string{"OPENAI_API_KEY"},
+			GatewayEnabled:  true,
+			Factory: func(config *Config, httpc *http.Client) (llm.Service, error) {
+				if config.OpenAIAPIKey == "" {
+					return nil, fmt.Errorf("gpt-5.5 requires OPENAI_API_KEY")
+				}
+				svc := &oai.ResponsesService{Model: oai.GPT55, APIKey: config.OpenAIAPIKey, HTTPC: httpc, ThinkingLevel: llm.ThinkingLevelMedium}
+				if url := config.getOpenAIURL(); url != "" {
 					svc.ModelURL = url
 				}
 				return svc, nil
@@ -518,6 +569,11 @@ func (l *loggingService) TokenContextWindow() int {
 // MaxImageDimension delegates to the underlying service
 func (l *loggingService) MaxImageDimension() int {
 	return l.service.MaxImageDimension()
+}
+
+// MaxImageBytes delegates to the underlying service
+func (l *loggingService) MaxImageBytes() int {
+	return l.service.MaxImageBytes()
 }
 
 // UseSimplifiedPatch delegates to the underlying service if it supports it
@@ -793,16 +849,18 @@ func (m *Manager) createServiceFromModel(model *generated.Model) llm.Service {
 				ModelName: model.ModelName,
 				URL:       model.Endpoint,
 			},
-			MaxTokens:     int(model.MaxTokens),
-			HTTPC:         m.httpc,
-			ThinkingLevel: llm.ThinkingLevelMedium,
+			MaxTokens:       int(model.MaxTokens),
+			HTTPC:           m.httpc,
+			ThinkingLevel:   llm.ThinkingLevelMedium,
+			ReasoningEffort: model.ReasoningEffort,
 		}
 	case "gemini":
 		return &gem.Service{
-			APIKey: model.ApiKey,
-			URL:    model.Endpoint,
-			Model:  model.ModelName,
-			HTTPC:  m.httpc,
+			APIKey:          model.ApiKey,
+			URL:             model.Endpoint,
+			Model:           model.ModelName,
+			HTTPC:           m.httpc,
+			ReasoningEffort: model.ReasoningEffort,
 		}
 	default:
 		if m.logger != nil {

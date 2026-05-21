@@ -235,9 +235,20 @@ func WithTxRes[T any](db *DB, ctx context.Context, fn func(*generated.Queries) (
 // Conversation methods (moved from ConversationService)
 
 // ConversationOptions holds extensible conversation settings stored as JSON.
+type ConversationHook struct {
+	URL string `json:"url"`
+}
+
 type ConversationOptions struct {
 	Type            string `json:"type,omitempty"`             // "normal" (default) or "orchestrator"
 	SubagentBackend string `json:"subagent_backend,omitempty"` // "shelley" (default), "claude-cli", "codex-cli"
+	// ToolOverrides maps tool name to "on" or "off". Tools not listed use their default.
+	ToolOverrides map[string]string `json:"tool_overrides,omitempty"`
+	// DisableAllTools disables every tool by default; ToolOverrides with "on" re-enable individual tools.
+	// Useful for API clients that can't enumerate the tool registry.
+	DisableAllTools bool `json:"disable_all_tools,omitempty"`
+	// EndOfTurnHooks are posted to whenever a top-level agent turn ends.
+	EndOfTurnHooks []ConversationHook `json:"end_of_turn_hooks,omitempty"`
 }
 
 // IsOrchestrator returns true if the conversation is in orchestrator mode.
@@ -253,6 +264,49 @@ func ParseConversationOptions(s string) ConversationOptions {
 		_ = json.Unmarshal([]byte(s), &opts)
 	}
 	return opts
+}
+
+// UpdateConversationOptions replaces a conversation's stored options JSON.
+func (db *DB) UpdateConversationOptions(ctx context.Context, conversationID string, opts ConversationOptions) error {
+	optsJSON, err := json.Marshal(opts)
+	if err != nil {
+		return fmt.Errorf("failed to marshal conversation options: %w", err)
+	}
+	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		return q.UpdateConversationOptions(ctx, generated.UpdateConversationOptionsParams{
+			ConversationID:      conversationID,
+			ConversationOptions: string(optsJSON),
+		})
+	})
+}
+
+// RegisterConversationHook atomically adds hook to conversation options if absent.
+func (db *DB) RegisterConversationHook(ctx context.Context, conversationID string, hook ConversationHook) (ConversationOptions, error) {
+	var opts ConversationOptions
+	err := db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		raw, err := q.GetConversationOptions(ctx, conversationID)
+		if err != nil {
+			return err
+		}
+		opts = ParseConversationOptions(raw)
+		for _, existing := range opts.EndOfTurnHooks {
+			if existing.URL == hook.URL {
+				return nil
+			}
+		}
+		opts.EndOfTurnHooks = append(append([]ConversationHook(nil), opts.EndOfTurnHooks...), hook)
+		optsJSON, err := json.Marshal(opts)
+		if err != nil {
+			return fmt.Errorf("failed to marshal conversation options: %w", err)
+		}
+		return q.UpdateConversationOptions(ctx, generated.UpdateConversationOptionsParams{
+			ConversationID:      conversationID,
+			ConversationOptions: string(optsJSON),
+		})
+	})
+	return opts, err
 }
 
 // CreateConversation creates a new conversation with an optional slug
@@ -326,6 +380,21 @@ func (db *DB) ListConversations(ctx context.Context, limit, offset int64) ([]gen
 	return conversations, err
 }
 
+// ListAllConversations retrieves all conversations (including subagents) with pagination.
+func (db *DB) ListAllConversations(ctx context.Context, limit, offset int64) ([]generated.Conversation, error) {
+	var conversations []generated.Conversation
+	err := db.pool.Rx(ctx, func(ctx context.Context, rx *Rx) error {
+		q := generated.New(rx.Conn())
+		var err error
+		conversations, err = q.ListAllConversations(ctx, generated.ListAllConversationsParams{
+			Limit:  limit,
+			Offset: offset,
+		})
+		return err
+	})
+	return conversations, err
+}
+
 // SearchConversations searches for conversations containing the given query in their slug
 func (db *DB) SearchConversations(ctx context.Context, query string, limit, offset int64) ([]generated.Conversation, error) {
 	queryPtr := &query
@@ -362,6 +431,122 @@ func (db *DB) SearchConversationsWithMessages(ctx context.Context, query string,
 	return conversations, err
 }
 
+// ConversationSearchResult is a conversation with an optional snippet showing
+// the matched text. Snippets use the sentinel markers "\x02" and "\x03"
+// around hit terms so callers can safely substitute spans without worrying
+// about HTML in message bodies.
+type ConversationSearchResult struct {
+	Conversation generated.Conversation
+	Snippet      string // empty if matched only by slug
+}
+
+// SnippetMarkStart and SnippetMarkEnd surround matched terms inside
+// Snippet strings produced by SearchConversationsFTS.
+const (
+	SnippetMarkStart = "\x02"
+	SnippetMarkEnd   = "\x03"
+)
+
+// SearchConversationsFTS performs a full-text search over user/agent message
+// content (via the messages_fts FTS5 virtual table) and slug substring across
+// ALL top-level conversations (active and archived). Active conversations are
+// returned first, then archived; both buckets are ordered by updated_at DESC.
+// Each FTS hit comes with a Snippet drawn from the best-ranking message;
+// slug-only matches have an empty snippet.
+// The query is the raw user input; this function handles tokenisation and
+// escaping for both the FTS5 MATCH branch and the LIKE branch.
+func (db *DB) SearchConversationsFTS(ctx context.Context, query string, limit, offset int64) ([]ConversationSearchResult, error) {
+	fields := strings.Fields(query)
+	if len(fields) == 0 {
+		return nil, nil
+	}
+
+	// Build an FTS5 MATCH expression: each token becomes a quoted prefix
+	// term, all AND'd together. Escape embedded double quotes by doubling.
+	ftsParts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		ftsParts = append(ftsParts, `"`+strings.ReplaceAll(f, `"`, `""`)+`"*`)
+	}
+	ftsMatch := strings.Join(ftsParts, " AND ")
+
+	// Escape LIKE wildcards (%, _) and the escape char itself in the slug
+	// pattern so typing a literal % doesn't match every conversation.
+	slugEscaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
+	slugLike := "%" + slugEscaped + "%"
+
+	var results []ConversationSearchResult
+	err := db.pool.Rx(ctx, func(ctx context.Context, rx *Rx) error {
+		q := generated.New(rx.Conn())
+		convs, err := q.SearchConversationsFTSList(ctx, generated.SearchConversationsFTSListParams{
+			SlugLike: &slugLike,
+			FtsMatch: &ftsMatch,
+			Limit:    limit,
+			Offset:   offset,
+		})
+		if err != nil {
+			return err
+		}
+		results = make([]ConversationSearchResult, len(convs))
+		convIDs := make([]string, len(convs))
+		for i, c := range convs {
+			results[i] = ConversationSearchResult{Conversation: c}
+			convIDs[i] = c.ConversationID
+		}
+		if len(convIDs) == 0 {
+			return nil
+		}
+		snipRows, err := q.SearchConversationsFTSSnippets(ctx, generated.SearchConversationsFTSSnippetsParams{
+			MarkStart: SnippetMarkStart,
+			MarkEnd:   SnippetMarkEnd,
+			FtsMatch:  &ftsMatch,
+			ConvIds:   convIDs,
+		})
+		if err != nil {
+			return err
+		}
+		snippets := make(map[string]string, len(convIDs))
+		for _, r := range snipRows {
+			if _, ok := snippets[r.ConversationID]; ok {
+				continue // first row per conv = best rank
+			}
+			snippets[r.ConversationID] = centerOnMark(r.Snippet, 120)
+		}
+		for i := range results {
+			results[i].Snippet = snippets[results[i].Conversation.ConversationID]
+		}
+		return nil
+	})
+	return results, err
+}
+
+// centerOnMark trims a snippet so the first SnippetMarkStart lands roughly
+// in the middle, keeping at most budget bytes total. FTS5's snippet() uses
+// a token budget, which collapses on long opaque runs (e.g. base64) and can
+// push the actual match off the visible end of the truncated UI line.
+// Centering on the mark guarantees the matched term is in the leading window
+// the UI displays. An ellipsis prefix marks a trimmed-left snippet.
+func centerOnMark(s string, budget int) string {
+	if len(s) <= budget {
+		return s
+	}
+	mark := strings.Index(s, SnippetMarkStart)
+	if mark < 0 {
+		return s
+	}
+	left := budget / 4
+	start := mark - left
+	if start <= 0 {
+		return s
+	}
+	// Snap to the next space so we don't slice through a word, but only if
+	// one is close by; long opaque runs (e.g. base64) have no spaces and we
+	// must just cut.
+	if sp := strings.IndexByte(s[start:], ' '); sp >= 0 && sp < 16 {
+		start += sp + 1
+	}
+	return "..." + s[start:]
+}
+
 // UpdateConversationSlug updates the slug of a conversation
 func (db *DB) UpdateConversationSlug(ctx context.Context, conversationID, slug string) (*generated.Conversation, error) {
 	var conversation generated.Conversation
@@ -392,6 +577,31 @@ func (db *DB) ClearConversationSlug(ctx context.Context, conversationID string) 
 	return &conversation, err
 }
 
+// SetConversationAgentWorking persists the in-memory agent_working flag for
+// a conversation. Writes are wrapped in a Tx so the conversation list patch
+// stream's Pool.OnCommit hook fires and SSE clients see the change. The
+// query intentionally does not bump updated_at — working state changes are
+// frequent and must not reorder the conversation list.
+func (db *DB) SetConversationAgentWorking(ctx context.Context, conversationID string, working bool) error {
+	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		return q.SetConversationAgentWorking(ctx, generated.SetConversationAgentWorkingParams{
+			AgentWorking:   working,
+			ConversationID: conversationID,
+		})
+	})
+}
+
+// ResetAllAgentWorking clears agent_working = TRUE for every conversation.
+// Called once during server startup to recover from a previous process that
+// exited mid-loop and left stale TRUE values in the table.
+func (db *DB) ResetAllAgentWorking(ctx context.Context) error {
+	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		return q.ResetAllAgentWorking(ctx)
+	})
+}
+
 // UpdateConversationCwd updates the working directory for a conversation
 func (db *DB) UpdateConversationCwd(ctx context.Context, conversationID, cwd string) error {
 	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
@@ -410,6 +620,17 @@ func (db *DB) UpdateConversationModel(ctx context.Context, conversationID, model
 	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
 		q := generated.New(tx.Conn())
 		return q.UpdateConversationModel(ctx, generated.UpdateConversationModelParams{
+			Model:          &model,
+			ConversationID: conversationID,
+		})
+	})
+}
+
+// ForceUpdateConversationModel updates the model on a conversation, even if already set.
+func (db *DB) ForceUpdateConversationModel(ctx context.Context, conversationID, model string) error {
+	return db.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		q := generated.New(tx.Conn())
+		return q.ForceUpdateConversationModel(ctx, generated.ForceUpdateConversationModelParams{
 			Model:          &model,
 			ConversationID: conversationID,
 		})
@@ -494,10 +715,16 @@ func (db *DB) CreateMessage(ctx context.Context, params CreateMessageParams) (*g
 			return fmt.Errorf("failed to get next sequence ID: %w", err)
 		}
 
+		conversation, err := q.GetConversation(ctx, params.ConversationID)
+		if err != nil {
+			return fmt.Errorf("failed to get conversation generation: %w", err)
+		}
+
 		message, err = q.CreateMessage(ctx, generated.CreateMessageParams{
 			MessageID:           messageID,
 			ConversationID:      params.ConversationID,
 			SequenceID:          sequenceID,
+			Generation:          conversation.CurrentGeneration,
 			Type:                string(params.Type),
 			LlmData:             llmDataJSON,
 			UserData:            userDataJSON,
@@ -574,6 +801,25 @@ func (db *DB) ListMessagesByType(ctx context.Context, conversationID string, mes
 		messages, err = q.ListMessagesByType(ctx, generated.ListMessagesByTypeParams{
 			ConversationID: conversationID,
 			Type:           string(messageType),
+		})
+		return err
+	})
+	return messages, err
+}
+
+// ListAgentMessagesSinceLastUser returns the agent messages produced since
+// the most recent user message in a conversation, newest first (or all
+// agent messages if there is no user message). Useful for picking a
+// notification body that walks back through a tail of tool-only turns up
+// to the previous user turn boundary.
+func (db *DB) ListAgentMessagesSinceLastUser(ctx context.Context, conversationID string) ([]generated.Message, error) {
+	var messages []generated.Message
+	err := db.pool.Rx(ctx, func(ctx context.Context, rx *Rx) error {
+		q := generated.New(rx.Conn())
+		var err error
+		messages, err = q.ListAgentMessagesSinceLastUser(ctx, generated.ListAgentMessagesSinceLastUserParams{
+			ConversationID:   conversationID,
+			ConversationID_2: conversationID,
 		})
 		return err
 	})
