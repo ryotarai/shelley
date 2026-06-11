@@ -24,6 +24,7 @@ import (
 	"github.com/chromedp/cdproto/tracing"
 	"github.com/chromedp/chromedp"
 	"github.com/google/uuid"
+	"golang.org/x/net/http/httpproxy"
 	"shelley.exe.dev/llm"
 	"shelley.exe.dev/llm/imageutil"
 )
@@ -150,6 +151,19 @@ func (b *BrowseTools) GetBrowserContext() (context.Context, error) {
 	// (chromedp v0.14.1 defaults: site-per-process,Translate,BlinkGenPropertyTrees)
 	opts = append(opts, chromedp.Flag("disable-features",
 		"site-per-process,Translate,BlinkGenPropertyTrees,WebAuthentication"))
+
+	// Route browser traffic through an HTTP proxy when standard proxy
+	// environment variables (HTTPS_PROXY/HTTP_PROXY, NO_PROXY) are set.
+	// headless-shell does not reliably honor these env vars on its own, so we
+	// translate them into explicit --proxy-server / --proxy-bypass-list flags.
+	for _, f := range proxyFlagsFromEnv(httpproxy.FromEnvironment()) {
+		logValue := f.Value
+		if f.Name == "proxy-server" {
+			logValue = redactProxyServerForLog(f.Value)
+		}
+		log.Printf("Browser proxy: --%s=%s", f.Name, logValue)
+		opts = append(opts, chromedp.Flag(f.Name, f.Value))
+	}
 
 	// Capture the *exec.Cmd headless-shell is launched with so closeBrowserLocked
 	// can kill the whole process group. headless-shell forks zygote, renderers,
